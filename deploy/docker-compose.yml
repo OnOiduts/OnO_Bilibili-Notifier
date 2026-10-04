@@ -1,0 +1,11 @@
+services:
+  bili-notify:
+    build: .
+    container_name: bili-notify
+    restart: always
+    ports:
+      - "8088:8088"      # 网页面板；不想暴露到公网就删掉这两行，改用 SSH 隧道
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./data.json:/app/data.json
+      - ./bot.log:/app/bot.log

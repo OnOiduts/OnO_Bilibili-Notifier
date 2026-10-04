@@ -1,0 +1,34 @@
+# ============================================================================
+#  换行符规则 —— 这条文件的存在意义只有一个：别让 .bat 变成 LF
+#
+#  Windows 的批处理在换行符是 LF 时会出各种怪毛病（闪退、"命令语法不正确"、
+#  中文提示变成乱码）。而 Linux/Mac 用户拿到 CRLF 的 .sh 又会报 ^M 错误。
+#  所以约定：仓库里统一存 LF，检出时按平台自动转。
+#  .bat / .cmd / .ps1 强制 CRLF，.sh 强制 LF —— 跟文件类型绑定，不看平台。
+# ============================================================================
+
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.sh  text eol=lf
+*.py  text eol=lf
+*.js  text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md  text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# 二进制文件：不要做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.db binary
+*.woff binary
+*.woff2 binary

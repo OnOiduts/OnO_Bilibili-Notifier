@@ -1,0 +1,86 @@
+# ============================================================================
+#  OnOBN —— Git 忽略清单
+#
+#  这份清单的唯一目的：确保**密钥和本机数据永远不会进仓库**。
+#  提交前请务必用 `git status --ignored` 抽查一遍。
+# ============================================================================
+
+# ---- 1. 密钥与凭据（最重要，绝不能提交）-----------------------------------
+.env
+.env.*
+!.env.example          # 模板本身要提交（里面只有占位符）
+config.yaml
+*.machine_key
+*.machine_key.prev
+.machine_key
+.machine_key.prev
+凭据备份*.json
+*credential*.json
+*secret*.json
+*.pem
+*.key
+*.p12
+
+# ---- 2. 运行数据与日志（含群号、订阅记录等隐私）---------------------------
+data/
+**/data/
+logs/
+**/logs/
+*.log
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+state.json
+backups/
+**/backups/
+cache/
+**/cache/
+images/
+**/images/
+run/
+**/run/
+
+# ---- 3. Python 构建产物与缓存----------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ---- 4. 虚拟环境-----------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ---- 5. 测试与覆盖率产物---------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# ---- 6. 编辑器与系统文件---------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 7. 混淆/打包临时产物--------------------------------------------------
+dist_obf/
+*.tmp-*.json
+_t_*.json

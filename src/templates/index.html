@@ -1,0 +1,2979 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>B站消息订阅工具 · 控制台</title>
+<link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+<!-- 布局样式：以确认过的最终版草稿为准，放在 style.css 之后以保证优先级 -->
+<style>
+  :root {
+    --pink:#FB7299; --blue:#00AEEC; --ok:#2BAE6B;
+    /* 心跳波形专用色：日间深绿（白底清晰），夜间在 dark 里改亮绿 */
+    --hb-c:#0E9F6E;
+    --warn:#E8A33D; --danger:#E5544B;
+    --r-lg:20px; --r-md:13px; --r-sm:9px;
+    /* ── 自适应尺寸 ──
+       主区横向内边距：跟着视口宽度平滑变化（14px→30px），
+       不用断点跳变。顶栏要"出血"到主区边缘，负 margin 必须引用同一个
+       变量，否则窄屏时顶栏会比内容宽/窄一截，出现错位。 */
+    --pad-x: clamp(14px, 2.2vw, 30px);
+    /* 主区最大宽度：宽屏放宽，避免两侧大片空白 */
+    --main-max: 1180px;
+    /* ⚠️ 这三个以前没定义：var() 解析失败会让**整条**声明失效，
+       于是所有 transition 没缓动、chip 开启态没有渐变背景。
+       别再删掉，删了动效会静默失效。 */
+    --ease: cubic-bezier(.22,1,.36,1);
+    /* ⚠️ 循环渐变：linear-gradient 有明确的起点和终点，
+       在窄元素（徽章、竖条、进度条）上两端色差直接相邻，
+       就会看到一条"生硬的边缘"。
+       解法：首尾**同色**（粉→蓝→粉），渐变走一圈回到起点，
+       任意位置都没有突变。比 conic-gradient 兼容性更好、
+       在细长元素上也不会出现中心放射的怪异感。 */
+    /* ⚠️ --grad 已改成**单色**。反馈："有的竖条是渐变、按钮也是渐变"。
+       原来 --grad 是粉→蓝→粉，被大量共用（按钮/竖条/标题字/品牌点/
+       指示条），结果到处都在渐变，视觉很乱。
+       现在 --grad 就是**纯粉（单色）**，深浅一律用 opacity 表达。
+       ⚠️ 例外：真正的**进度条**用 --grad-bar（保留双色渐变），
+       那是"进度"语义，用户明确允许。 */
+    --grad: var(--pink);
+    /* 唯一的双色渐变：只给进度条用 */
+    --grad-bar: linear-gradient(90deg, var(--pink), var(--blue));
+    /* 圆形/块状元素用真正的 360° 循环（conic），同样首尾相接无端点 */
+    --grad-loop: conic-gradient(from 180deg,
+              var(--pink), var(--blue), var(--pink));
+    --glass-2: rgba(255,255,255,.08);
+    /* 动效用的坐标量：JS 运行时写入。给默认值是为了
+       万一 JS 没跑起来（报错/被拦），光和倾斜也不会错位到左上角。 */
+    --gx:50%; --gy:28%; --mx:50%; --my:50%;
+    /* 主题切换扩散的圆心，JS 写入；默认屏幕中心 */
+    --wx:50%; --wy:50%;
+    /* 头像（UP 主 / 合集）：JS 运行时写入 */
+    --av:none;
+    /* 等级徽章底色/字色：默认灰（LV0/1），
+       具体每级在 .acc-lv.lvN 里覆盖为 B站官方色 */
+    --lv-bg:#C0C0C0; --lv-fg:#2B2B2B;
+    /* logo 底纹：**默认 none** —— 没有 logo.png 时 ::after 就是空的，
+       不会留白块或破图。bootLogo() 探测到图片后才设成 url(...) */
+    --logo:none;
+    /* 不透明度：夜间要压得更低，否则白色 logo 在暗底上很跳 */
+    --logo-op:.10;
+    /* 列表悬浮高亮（圆角块） */
+    --li-hv:rgba(20,30,60,.070);
+    /* 群背景（UP 主头像）不透明度 */
+    --gbg-op:.20; --gbg-op-hv:.30;
+  }
+  /* ── 日间 ──
+     ⚠️ 两套主题的变量必须**一一对应**，少一个就会串色
+        （var() 取不到值 → 整条声明失效 → 背景/文字变透明）。
+       改任一主题时，另一边要同步改。 */
+  [data-theme="light"] {
+    /* ⚠️ 这一套**会覆盖** static/style.css 里的同名变量
+       （内联 style 在后加载，特异性相同则后者胜）。
+       之前两边都写了但值不一样，改 style.css 是白改 ——
+       日间"看不清"的改动必须落在这一处。
+       --card 从 .74 提到 .90：.74 太透，背景光斑会透到字底下，
+       白卡片和 #EEF2F8 背景几乎分不开，卡片"浮不起来"。
+       --line 从 .13 提到 .20：边框对比度 1.3 → 1.5，边界看得见。
+       --line-2 从 .07 提到 .12：分隔线（列表行、表格）不再隐形。 */
+    --bg:#EEF2F8; --card:rgba(255,255,255,.90); --card-solid:#FFFFFF;
+    --line:rgba(20,30,60,.20); --line-2:rgba(20,30,60,.12);
+    --tx:#141B2B; --tx2:#4E5872; --tx3:#6B7590;
+    --input:#FFFFFF; --glass:rgba(20,30,60,.05);
+    --shadow:0 4px 18px rgba(30,40,80,.12);
+    /* 跟随鼠标的光：**暗色**。浅底上用亮色会盖住文字。 */
+    --tilt-glow:rgba(20,30,60,.10);
+    /* ⚠️ tx3 原 #8B94AC 在白底上对比度只有约 3.1:1，偏灰看不清，加深 */
+    --tx3:#626C87;
+    /* ⚠️ 文字态：品牌色是按深色底调的，直接当文字用在白卡片上
+       对比度只有 2.1~3.0（warn 仅 2.14）。这里换成压暗的同色系，
+       全部 ≥4.5。背景/渐变/光晕仍用原品牌色，不受影响。 */
+    --ok-tx:#16754A; --warn-tx:#8A5A0B; --danger-tx:#B82A20;
+    --blue-tx:#006491; --pink-tx:#BF3A61;
+  }
+    [data-theme="dark"] {
+    /* 夜间暗底：用亮绿 + 发光，否则发灰看不清 */
+    --hb-c:#4ADE80;
+
+    --logo-op:.16;
+    --li-hv:rgba(255,255,255,.052);
+    --gbg-op:.28; --gbg-op-hv:.40;
+    /* ⚠️ 卡片给到 **约 60% 半透明 + 偏黑**（原来是 .92，几乎不透，
+       看着像一块实心贴纸，也没法透出背景光）。 */
+    --bg:#0B0D14; --card:rgba(9,12,19,.62); --card-solid:#141924;
+    --line:rgba(255,255,255,.11); --line-2:rgba(255,255,255,.06);
+    /* 字色整体提亮：卡变透后，背后光斑会透到字底下，
+       不提亮就会发灰 —— 这是"看着像失焦"的另一半原因。 */
+    --tx:#F4F7FD; --tx2:#BCC6DE; --tx3:#98A4C2;
+    --input:#131824; --glass:rgba(255,255,255,.04);
+    --shadow:0 4px 18px rgba(0,0,0,.36);
+    /* 暗底上要更重的暗才能看出光在动 */
+    --tilt-glow:rgba(0,0,0,.30);
+    /* 夜间 tx3 原 #6E7894 在 #1A1F2D 上约 3.4:1，同样偏暗，提亮 */
+    --tx3:#8892AC;
+    /* ⚠️ 夜间文字态 = 品牌色（暗底上原色就够亮，压暗反而看不清）。
+       这里**必须显式写**：index.html 的 dark 块会盖住 style.css 的同名块，
+       不写的话这一组变量只靠级联从 style.css 取，加载顺序一变就丢。 */
+    --ok-tx:#2BAE6B; --warn-tx:#E8A33D; --danger-tx:#E5544B;
+    --blue-tx:#00AEEC; --pink-tx:#FB7299;
+  }
+  /* 主题切换：整页颜色平滑过渡，但**排除**初始加载，
+     否则一进页面所有颜色都在动，很怪。 */
+  html.theming, html.theming * {
+    transition:background-color .34s var(--ease), color .34s var(--ease),
+               border-color .34s var(--ease) !important;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--tx);
+    font-family:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    font-size:14px; line-height:1.6;
+  }
+  .app { display:flex; min-height:100vh; position:relative; z-index:2; }
+
+  /* ══════════════════════════════════════════════════════════
+     动效（对齐正式面板 v1.22.0 那套）
+     原则：只做"有物理感"的动效 —— 跟随指针的光、轻微 3D 倾斜、
+     按压反馈、错峰入场、数值过渡。
+     **不做**条纹滚动渐变（background-position 来回平移的条带，很廉价）。
+
+     全部尊重 prefers-reduced-motion：系统开了"减少动效"就自动静止。
+     ══════════════════════════════════════════════════════════ */
+
+  /* ---------- 背景光斑：三个，多段路径 + 各自不同节奏 ----------
+     ⚠️ 时长用 34/41/47s 这种互质的值：三个循环不同步，
+        看起来像真的在飘，而不是机械地来回平移。 */
+  .bgfx { position:fixed; inset:0; z-index:0; pointer-events:none; overflow:hidden; }
+  .bgfx span {
+    position:absolute; border-radius:50%; filter:blur(72px); opacity:.26;
+    will-change:transform;
+  }
+  .bgfx span:nth-child(1) {
+    width:520px; height:520px; left:-8%; top:-6%;
+    background:var(--pink); animation:drift1 34s var(--ease) infinite;
+  }
+  .bgfx span:nth-child(2) {
+    width:460px; height:460px; right:-6%; top:14%;
+    background:var(--blue); animation:drift2 41s var(--ease) infinite;
+  }
+  .bgfx span:nth-child(3) {
+    width:400px; height:400px; left:26%; bottom:-12%;
+    background:#8A7AFF; animation:drift3 47s var(--ease) infinite;
+  }
+  /* ⚠️ 关键帧里**不要带 scale**：
+     这三个 span 都挂着 filter:blur(72px)，而 blur 的结果会被缓存成层纹理，
+     纯位移可以整层搬走（几乎不耗 CPU）；一旦带 scale，层尺寸每帧都在变，
+     blur 就要**每帧重新光栅化** —— 520px 的元素模糊 72px，代价非常高，
+     这正是平时"动画卡"的主因之一。
+     去掉 scale 后位移路径（多段、三个不同节奏）仍在，看着照样在飘。 */
+  @keyframes drift1 {
+    0%   { transform:translate3d(0,0,0); }
+    32%  { transform:translate3d(22%,14%,0); }
+    63%  { transform:translate3d(6%,30%,0); }
+    100% { transform:translate3d(0,0,0); }
+  }
+  @keyframes drift2 {
+    0%   { transform:translate3d(0,0,0); }
+    38%  { transform:translate3d(-20%,18%,0); }
+    71%  { transform:translate3d(-8%,-10%,0); }
+    100% { transform:translate3d(0,0,0); }
+  }
+  @keyframes drift3 {
+    0%   { transform:translate3d(0,0,0); }
+    29%  { transform:translate3d(16%,-18%,0); }
+    66%  { transform:translate3d(-14%,-6%,0); }
+    100% { transform:translate3d(0,0,0); }
+  }
+
+  /* ---------- 指针柔光：一大团很淡的光跟着鼠标走 ----------
+     关键是 JS 里做 lerp（显示值慢慢追目标值），
+     不是硬跟 —— 硬跟会显得很生硬。鼠标不动一会儿会自动淡出。 */
+  .bg-glow {
+    /* ⚠️ z-index **必须**是 -1：正数会盖在内容之上，
+       等于整页蒙一层半透明色，文字对比度被拉低（易读性差）。
+       负值 = 画在页面背景之上、所有内容之下，只做氛围不打字。 */
+    position:fixed; inset:0; z-index:-1; pointer-events:none;
+    overflow:hidden;
+    opacity:0; transition:opacity .6s var(--ease);
+  }
+  /* ⚠️ 原来是**整屏** radial-gradient 跟着 --gx/--gy 走：
+     鼠标每动一帧，100vw×100vh 的渐变就要**重新绘制一遍** ——
+     这是拖动鼠标时掉帧的主因（而且旧 JS 的 rAF 循环永不停止，
+     鼠标不动也在每帧重绘整屏）。
+     现在改成一个**固定大小的发光圆 + translate3d 位移**：
+     渐变只在创建时画一次，之后每帧只是合成层位移，几乎不耗 CPU。 */
+  .bg-glow::before, .bg-glow::after {
+    content:''; position:absolute; left:0; top:0;
+    border-radius:50%; will-change:transform;
+  }
+  .bg-glow::before {
+    width:1200px; height:1200px; margin:-600px 0 0 -600px;
+    background:radial-gradient(closest-side,
+      rgba(251,114,153,.085), transparent 68%);
+    transform:translate3d(var(--gx,0px), var(--gy,0px), 0);
+  }
+  .bg-glow::after {
+    width:1000px; height:1000px; margin:-500px 0 0 -500px;
+    background:radial-gradient(closest-side,
+      rgba(0,174,236,.065), transparent 70%);
+    /* 第二个光斑做对角呼应（原来写的是 100% - gx），
+       由 JS 直接给另一组坐标，视觉一致但不额外重绘。 */
+    transform:translate3d(var(--gx2,0px), var(--gy2,0px), 0);
+  }
+  .bg-glow.on { opacity:1; }
+
+  /* ---------- 卡片：轻微 3D 倾斜 + 指针高光 ----------
+     ⚠️ 最大 5 度。再大就浮夸了，看着像网页特效 demo。 */
+  /* ⚠️⚠️ **不再用 3D 倾斜**（原来 rotateX/rotateY + perspective）。
+     原因：3D transform 会强制元素走 GPU 合成层，文字因此失去
+     **亚像素抗锯齿**，看起来发虚、发灰 —— 就是反馈的"失焦感"。
+     而且这是持续性的：只要卡片带 transform，字就一直是虚的。
+     改为**纯非 transform 的反馈**：外发光加强 + 边框提亮 + 光晕跟随。
+     这三项都不创建合成层，不影响字体渲染。 */
+  .fx-tilt {
+    position:relative; overflow:hidden;
+    /* isolation 建 stacking context（让下面 z-index:-1 的光晕能落在
+       卡片背景**之上**、文字**之下**），但**不**创建合成层 ——
+       这是它比 transform 合适的地方。 */
+    isolation:isolate;
+    transition:box-shadow .26s var(--ease), border-color .26s var(--ease),
+               background-color .26s var(--ease);
+  }
+  .fx-tilt::after {
+    content:''; position:absolute; inset:0; border-radius:inherit;
+    pointer-events:none; opacity:0; transition:opacity .35s var(--ease);
+    /* ⚠️⚠️ z-index:-1 是**关键**：把光压到卡片内容**下面**。
+       默认 ::after 按文档顺序画在内容之后，哪怕颜色再淡也会蒙住文字。
+       .fx-tilt 有 isolation:isolate → 自带 stacking context，
+       所以负 z-index 的伪元素正好落在"卡片背景之上、文字之下"这一层：
+       光跟着鼠标在卡面上走，但永远碰不到字，易读性不受影响。 */
+    z-index:-1;
+    background:radial-gradient(240px circle at var(--mx,50%) var(--my,50%),
+      var(--tilt-glow), transparent 66%);
+  }
+  .fx-tilt:hover::after { opacity:1; }
+  /* 悬浮反馈：外发光 + 边框提亮（都不涉及 transform） */
+  .fx-tilt:hover {
+    box-shadow:var(--shadow), 0 0 0 1px color-mix(in srgb, var(--pink) 22%, transparent);
+    border-color:color-mix(in srgb, var(--pink) 30%, var(--line));
+  }
+  /* 触屏没有 hover，光晕跟随会停在最后位置 —— 直接不显示 */
+  @media (hover:none) { .fx-tilt::after { display:none; } }
+
+  /* ---------- 错峰入场：切板块时一块块浮上来 ----------
+     ⚠️ 原来带 filter:blur(3px)→blur(0)：blur 是**每帧重新光栅化**的，
+        同时跑几十个元素的 blur 动画会明显掉帧（"动画卡"的来源之一）。
+        改成只用 opacity + 位移，观感几乎一样，开销低一个量级。 */
+  @keyframes fxIn {
+    from { opacity:0; transform:translateY(12px); }
+    to   { opacity:1; transform:none; }
+  }
+  .fx-in { animation:fxIn .46s var(--ease) backwards; }
+
+  /* ---------- 滚动渐入：滚到哪才浮现到哪 ---------- */
+  .fx-reveal {
+    opacity:0; transform:translateY(13px);
+    transition:opacity .5s var(--ease), transform .5s var(--ease);
+  }
+  .fx-reveal.in { opacity:1; transform:none; }
+
+  /* ── 侧边栏 ── */
+  .side {
+    width:190px; flex:0 0 190px; padding:20px 12px;
+    background:var(--card-solid); border-right:1px solid var(--line);
+    position:sticky; top:0; height:100vh;
+    /* 改成列布局：导航 flex:1 吃掉剩余高度，
+       于是主题切换和底部说明会**沉到左下角**。 */
+    display:flex; flex-direction:column;
+  }
+  .nav { flex:1; }
+  .side-theme {
+    display:flex; align-items:center; gap:9px;
+    padding:10px 8px 8px; margin-top:auto;
+    border-top:1px solid var(--line-2);
+  }
+  .side-theme-tx { font-size:12px; color:var(--tx3); }
+  /* ── 品牌名后的 logo 背景 ──
+     图片 851x198px（约 4.3:1），白色、透明底。
+     ⚠️ 放在文字**后面**当半透明底纹，不能压到字：
+        · z-index:0 + 文字 position:relative z-index:1
+        · 不透明度按主题分：夜间 .16（暗底上白色图会很跳，要压低）
+          日间 .10（白底上白图几乎看不见，再低就没意义了）
+     图片由 /api/brand/logo 给出（默认取仓库里那张，可换可关）；
+     **取不到时自动不显示**，不会留空白块、不会报错 —— 断网也照常用。 */
+  .brand {
+    position:relative; overflow:hidden;
+    padding-right:8px;
+  }
+  .brand::after {
+    content:''; position:absolute; z-index:0;
+    /* ⚠️ 以前是 right:-6px：图宽 150px 时右侧 6px 被 .brand 的
+       overflow:hidden 裁掉，看着就是"logo 显示不全"。改成贴边不出血。 */
+    right:2px; top:50%; transform:translateY(-50%);
+    width:min(72%, 132px); aspect-ratio:851 / 198;
+    /* 侧栏被压矮时（分屏/矮屏）不让图溢出被裁 */
+    max-height:calc(100% - 8px);
+    background-image:var(--logo, none);
+    /* contain = 完整显示、按比例缩，绝不裁切 */
+    background-size:contain; background-repeat:no-repeat;
+    background-position:right center;
+    opacity:var(--logo-op, .12);
+    pointer-events:none;
+    /* 静止时**完全不动**（以前的漂浮/呼吸已去掉）。
+       ⚠️ 元素靠 translateY(-50%) 垂直居中，hover 的 transform 必须带上
+       这个位移，否则 logo 会掉到下半部分。 */
+    transform:translateY(-50%);
+    transition:transform .32s var(--ease);
+  }
+  /* 掠过品牌区：后面的图片往左斜一点、往左挪一点、稍微放大。
+     ⚠️ 顺序不能乱：先 translateY(-50%) 居中 → translateX 往左 →
+     rotate 往左斜 → scale 放大。translateX 必须放在 rotate **前面**，
+     位移才是屏幕上的"往左"，否则会沿旋转后的坐标系斜着跑。 */
+  .brand:hover::after {
+    transform:translateY(-50%) translateX(-4px) rotate(-8deg) scale(1.18);
+  }
+  /* ⚠️ logo 原图是**白色线条、透明底**：深色底上正好，浅色底上等于白底白线，
+     日间模式根本看不见。这里用反色把白线变黑线 ——
+     一张图两种模式都能用，不用准备两份。 */
+  [data-theme="light"] .brand::after { filter:invert(1); }
+  .brand > * { position:relative; z-index:1; }
+
+  .brand {
+    display:flex; align-items:center; gap:9px;
+    padding:0 8px 18px; font-weight:700; font-size:15px;
+  }
+  .brand .dot {
+    width:9px; height:9px; border-radius:50%;
+    background:var(--ok); box-shadow:0 0 8px var(--ok);
+    transition:transform .32s var(--ease);
+  }
+  /* 掠过品牌区时状态点也跟着轻微放大（不再有常驻呼吸） */
+  .brand:hover .dot { transform:scale(1.25); }
+  /* ── 侧边栏顶部的 B站账户卡 ──
+     数据来自 /api/bili/status 的 account：uname / mid / face / pendant /
+     level / vip / vip_label。**放侧边栏最上面**（反馈要求），
+     这样在任何板块都能看到"当前登录的是谁"。 */
+  .acc {
+    display:flex; align-items:center; gap:9px;
+    padding:11px 10px; margin:0 6px 13px;
+    border:1px solid var(--line); border-radius:var(--r-md);
+    background:var(--glass); position:relative;
+    cursor:pointer; transition:border-color .22s var(--ease);
+  }
+  .acc:hover { border-color:color-mix(in srgb, var(--pink) 34%, var(--line)); }
+  .acc-av {
+    position:relative; flex:none; width:34px; height:34px; border-radius:50%;
+    background-size:cover; background-position:center; overflow:visible;
+    box-shadow:0 0 0 1.5px var(--card-solid),
+               0 0 0 3px color-mix(in srgb, var(--pink) 38%, transparent);
+    display:flex; align-items:center; justify-content:center;
+    font-size:13px; font-weight:700; color:#fff;
+  }
+  .acc-av.has-img { color:transparent; }
+  /* 头像框 pendant：B站装扮用户才有，**盖在头像外圈**且比头像大，
+     所以单独一层、父级 overflow 必须 visible，否则会被裁掉。 */
+  .acc-av .pendant {
+    position:absolute; left:50%; top:50%;
+    width:56px; height:56px; transform:translate(-50%,-50%);
+    background-size:contain; background-repeat:no-repeat;
+    background-position:center; pointer-events:none;
+  }
+  .acc-bd { min-width:0; flex:1; }
+  .acc-nm {
+    font-size:12.5px; font-weight:650;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .acc-sub {
+    margin-top:2px; font-size:10.5px; color:var(--tx3);
+    display:flex; align-items:center; gap:5px; flex-wrap:wrap;
+  }
+  /* ⚠️ 等级用 **B站官方等级色**（纯色，不是品牌渐变）。
+     B站等级徽章 LV0~LV6 各有固定配色，取自官方等级 SVG：
+       LV0/1 灰 #C0C0C0 ｜ LV2 绿 #8BD29B ｜ LV3 蓝 #92D1E5
+       LV4 粉 #EE9BA1   ｜ LV5 橙 #E9A77A ｜ LV6 深橙 #FF6C00
+     ⚠️ 浅色底（LV2~LV5）上白字对比度不够，所以每级**配套一个深色字**；
+        只有 LV6 底色够深，才用白字。 */
+  .acc-lv {
+    background:var(--lv-bg, #C0C0C0); color:var(--lv-fg, #2B2B2B);
+    font-size:9.5px; font-weight:700;
+    padding:1px 5px; border-radius:4px; flex:none;
+  }
+  /* ⚠️ 修正：之前 LV3/4/5/6 用错了色（LV6 写成橙色 #FF6C00）。
+     B站等级图标是**红色系递增**的：LV5 橙红 #EE672A → LV6 红 #F04C49。
+     以下取自官方等级 SVG 模板的 st2 填充色，不是我估的。 */
+  .acc-lv.lv0, .acc-lv.lv1 { --lv-bg:#C0C0C0; --lv-fg:#2B2B2B; }  /* 灰 */
+  .acc-lv.lv2 { --lv-bg:#8BD29B; --lv-fg:#12331F; }                /* 绿 */
+  .acc-lv.lv3 { --lv-bg:#7BCDEF; --lv-fg:#0E2F3E; }                /* 蓝 */
+  .acc-lv.lv4 { --lv-bg:#FEBB8B; --lv-fg:#4A2A0B; }                /* 橙黄 */
+  .acc-lv.lv5 { --lv-bg:#EE672A; --lv-fg:#FFFFFF; }                /* 橙红 */
+  .acc-lv.lv6 { --lv-bg:#F04C49; --lv-fg:#FFFFFF; }                /* 红 */
+  /* 硬核会员：也是红色，多个小闪电标识 */
+  .acc-lv.lv6.hc::after { content:'⚡'; margin-left:2px; }
+  .acc-vip {
+    font-size:9.5px; font-weight:700; padding:1px 5px; border-radius:4px;
+    background:var(--pink); color:#fff; flex:none;
+  }
+  .acc-off {
+    display:flex; align-items:center; gap:7px;
+    padding:11px 10px; margin:0 6px 13px;
+    border:1px dashed var(--line); border-radius:var(--r-md);
+    font-size:11.5px; color:var(--tx3); cursor:pointer;
+    transition:border-color .22s var(--ease), color .22s var(--ease);
+  }
+  .acc-off:hover { border-color:var(--pink); color:var(--tx2); }
+  /* 收窄态（<860px）：只留头像 */
+  @media(max-width:860px){
+    .acc, .acc-off { justify-content:center; padding:9px 0; }
+    .acc-bd { display:none; }
+  }
+
+  .nav { display:flex; flex-direction:column; gap:3px; }
+  .nav-i {
+    display:flex; align-items:center; gap:10px;
+    padding:9px 11px; border-radius:var(--r-sm);
+    color:var(--tx2); cursor:pointer; border:none;
+    background:transparent; font-size:13.5px; text-align:left;
+    font-family:inherit; transition:.18s;
+  }
+  .nav-i:hover { background:var(--glass); color:var(--tx); }
+  .nav-i.on { background:rgba(0,174,236,.14); color: var(--blue-tx); font-weight:600; }
+  .nav-i .ic { font-size:15px; width:18px; text-align:center; }
+  /* ── 顶部常驻状态条 ──
+     切到任何板块都能看到：机器人还活着吗、消息发到哪个群。
+     没有它，在设置页改东西时完全不知道机器人是不是已经挂了。 */
+  .topbar {
+    position:sticky; top:0; z-index:60;
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    /* ⚠️ 负 margin 必须跟 .main 的 --pad-x 一致，才能刚好铺满主区宽度 */
+    padding:9px var(--pad-x); margin:-26px calc(0px - var(--pad-x)) 18px;
+    background:var(--card-solid); border-bottom:1px solid var(--line);
+    font-size:12.5px;
+  }
+  .tb-i { display:flex; align-items:center; gap:6px; color:var(--tx2); }
+  .tb-i .d {
+    width:8px; height:8px; border-radius:50%;
+    background:var(--ok); box-shadow:0 0 7px var(--ok);
+    animation:tbPulse 2s ease-in-out infinite;
+  }
+  @keyframes tbPulse { 50% { opacity:.45; } }
+  .tb-i.bad .d { background:var(--danger); box-shadow:0 0 7px var(--danger); }
+  /* 轮询前的点 = 心跳指示灯。样式见 .hb-led（与波形同周期）。
+     ⚠️ 注意：这个点在 .hb 容器**外面**，靠后代关系的选择器都够不到它，
+        离线变红必须由 JS（setBotOnline）给它直接加 .bad 类。 */
+  .tb-i b { color:var(--tx); font-weight:600; }
+  /* ── 心跳：渐变框 + 框内滚动 + 每秒放大 ──
+     ⚠️ 这是**用户明确要求**保留渐变的地方：波形"在一个渐变的框里面滚动"。
+     全站其他地方已单色化，只有这里 + 进度条(--grad-bar) 保留渐变。
+     波形线条本身仍是**单色**（--ok），深浅靠 opacity。 */
+  .hb { gap:7px; }
+
+  /* 渐变框：外层渐变 + 内层实底，露出的 1px 就是渐变描边。
+     比 border-image 兼容性好，也不会影响圆角。 */
+  /* ── 心跳波形 ──
+     形态：真实 ECG（P-QRS-T），持续滚动；R 峰每经过可视区中心一次 = 一次心跳。
+     ⚠️ 用户多轮反馈，语义写死在这里：
+     ① **没有背景**：不加 background、不加底色块，只有波形本身。
+     ② **渐变 = 透明度渐变**：mask 直接作用在波形容器上让两端淡出，
+        不是"用底色块盖住两端"（那是障眼法，底色和框外不一致就露馅）。
+     ③ **搏动固定 1 秒一次**，与轮询间隔无关：轮询点**缩小**、波形框**放大**，
+        同一拍（同一批百分比）。⚠️ 以前做成"搏动周期 = 轮询间隔"，
+        8s 一轮就 8 秒才跳一下，看着像卡住 —— 不是要的效果。
+     ④ **滚动速度随轮询实时变化（无级）**：轮询快 → 滚得快，慢 → 滚得慢。
+        波长 = speed × 1 秒，所以每秒正好滚过一个波群，与 ① 的 1 秒搏动对齐，
+        R 峰到中心的那一瞬 = 点缩到底 = 框放到最大。
+     ⑤ **幅度给足**：点缩到 .65、框放到 1.18 —— 用户反馈"波动太不明显"。
+        突兀的根源是**硬起硬落 + 叠光晕**，不是幅度；现在起点终点都是静止态、
+        两段各带缓动，所以幅度大也不会"啪"一下。 */
+  .hb { gap:6px; }
+
+  .hb-frame {
+    position:relative; flex:none;
+    width:54px; height:20px;
+    border-radius:6px;
+    /* ① 无背景 */
+    background:none;
+    overflow:hidden;
+    /* ② 两端透明渐变淡出（mask 只改不透明度，单色） */
+    -webkit-mask-image:linear-gradient(90deg,
+      transparent 0%, #000 24%, #000 76%, transparent 100%);
+            mask-image:linear-gradient(90deg,
+      transparent 0%, #000 24%, #000 76%, transparent 100%);
+    /* ③ 搏动：与 R 峰同步（R 峰到中心 = 0% 峰值） */
+    animation:hbBeat 1s infinite;
+  }
+  /* hbBeat / hbLed：搏动固定 1 秒一次，与轮询间隔无关，
+     所以百分比是常量 —— 静态关键帧即可，且**只允许这一份**
+     （两份同名关键帧会互相覆盖，之前就是这么对不上拍的）。
+     0% 与 100% 都必须是静止态 scale(1)：循环回到开头才不会跳变。
+     9% 到极值（收缩快），30% 回落（回弹慢），剩下是等电位线。 */
+  @keyframes hbBeat {
+    0%   { transform:scale(1); animation-timing-function:cubic-bezier(.35,0,.5,1); }
+    9%   { transform:scale(1.18); animation-timing-function:cubic-bezier(.25,.6,.4,1); }
+    30%  { transform:scale(1); }
+    100% { transform:scale(1); }
+  }
+  /* 夜间加一点发光，暗底上才不发灰 */
+  [data-theme="dark"] .hb-frame {
+    filter:drop-shadow(0 0 3px color-mix(in srgb, var(--hb-c) 60%, transparent));
+  }
+
+  /* 波形宽度由 JS 按周期算（= 2 × 循环长度），这里只给兜底值。
+     ⚠️ 滚动 50% 正好移动**一个循环长度**，所以几何上无缝：
+        尖峰滚出左边后，下一个已经在框外画好等着进来。 */
+  .hb-wave {
+    position:relative; display:block;
+    width:210px; height:100%;
+    /* ⚠️ 时长必须是变量、由 JS 按 波长/速度 算出来：
+       写死 1s 的话，位移正好一个波长 → 每秒换一个波群，
+       和 1 秒的搏动叠在一起就是"动一下删一个波形"。 */
+    animation:hbRoll var(--hb-roll-dur, 3s) linear infinite;
+  }
+  /* 位移 = 一个波长（px，由 JS 设 --hb-shift）。⚠️ 不用 -50%：
+     周期数是按可视区宽度算的，位移百分比不固定。
+     因为路径满足 p(x) === p(x+wl)，走完一个波长跳回 0 是**无缝**的。 */
+  @keyframes hbRoll {
+    from { transform:translateX(0); }
+    to   { transform:translateX(var(--hb-shift, -50%)); }
+  }
+  .hb-line {
+    fill:none; stroke:var(--hb-c); stroke-width:1.6;
+    stroke-linecap:round; stroke-linejoin:round;
+  }
+
+  /* 轮询前的点：**和波形框同一拍**（都是 1s，同一批百分比）。
+     ⚠️ 以前周期是变量 --hb-dur，必须由 JS 设在 :root 上，
+        而这个点在 .hb 容器**外面**，设在内层取不到 → 点完全不动。
+        现在周期固定 1s，不再依赖变量，不会再出现"取不到就不动"。 */
+  /* ⚠️ 优先级坑：上面的 .tb-i .d 特异性是 (0,2,1)，比 .hb-led (0,1,0) 高，
+     会把这里指定的 hbLed 动画**整个覆盖掉**（点只按 2s 的 tbPulse 呼吸，
+     每秒一次的搏动永远看不到 —— 反馈"每秒没有放大动画"就是这个原因）。
+     所以必须写成 .tb-i .d.hb-led (0,4,1) 才能压过去。 */
+  .tb-i .d.hb-led {
+    background:var(--hb-c); box-shadow:0 0 5px var(--hb-c);
+    animation:hbLed 1s infinite;
+  }
+  /* 与 hbBeat **同一批百分比**、同一个 1s 时长 —— 同一拍：
+     点缩到最小的一瞬间，波形框正好放到最大。 */
+  @keyframes hbLed {
+    0%   { transform:scale(1); animation-timing-function:cubic-bezier(.35,0,.5,1); }
+    9%   { transform:scale(.65); animation-timing-function:cubic-bezier(.25,.6,.4,1); }
+    30%  { transform:scale(1); }
+    100% { transform:scale(1); }
+  }
+  /* ⚠️ 联动的是「心率波形」和「轮询点」，**不是**机器人的绿点：
+     机器人那个点只是普通的在线状态灯（上面 .tb-i .d 的 tbPulse 呼吸），
+     它跟心跳节奏无关，别把搏动动画挂上去。
+     心率侧的搏动在 .hb-frame 的 hbBeat（波形框放大），
+     与这里的 hbLed（轮询点缩小）由 JS 用**同一批百分比**生成 —— 同一拍。 */
+  /* 异常：机器人不在线 → 轮询必然也停，两者一起变红 */
+  .tb-i .d.hb-led.bad, .hb-led.bad {
+    background:var(--danger); box-shadow:0 0 7px var(--danger); animation:none;
+  }
+  .hb.bad .hb-line { stroke:var(--danger); }
+  .hb.bad .hb-frame { animation:none; }
+
+  .tb-sp { flex:1; }
+  .tb-btn {
+    padding:4px 12px; border-radius:999px; font-size:12px;
+    border:1px solid var(--line); background:var(--glass);
+    color:var(--tx2); cursor:pointer; font-family:inherit; transition:.18s;
+  }
+  .tb-btn:hover { color:var(--tx); border-color:var(--blue); }
+
+  /* 顶栏右上角只留「🔄 刷新」：
+     订阅数徽标写死不更新，「已填」/「已登录」与「⚙️ 凭据」页重复，
+     四个色标连同这里的 .th-badge 覆盖规则一起去掉，避免留死样式。 */
+
+  /* ── 待办清单 ──
+     把散落各处的异常聚到一起：未登录、失效群、近期错误。
+     概况页最上面一眼看到有几件事要处理，每条点了直达。 */
+  .todo {
+    /* 橙色渐变放 background-image，玻璃底放 background-color，
+       两层互不覆盖（写在一个 background 里会互相顶掉） */
+    background-image:linear-gradient(90deg, rgba(232,163,61,.14), transparent);
+    border:1px solid rgba(232,163,61,.34);
+    border-radius:var(--r-md); padding:13px 16px; margin-bottom:14px;
+  }
+  .todo h3 { margin:0 0 9px; font-size:13.5px; display:flex; align-items:center; gap:7px; }
+  .todo .n {
+    background:var(--warn); color:#1a1a1a; font-size:11px; font-weight:700;
+    padding:1px 7px; border-radius:999px;
+  }
+  .todo-i {
+    display:flex; align-items:center; gap:9px; padding:7px 0;
+    border-top:1px dashed rgba(232,163,61,.24); cursor:pointer; transition:.18s;
+  }
+  .todo-i:first-of-type { border-top:none; }
+  .todo-i:hover { transform:translateX(3px); }
+  .todo-i .ic { font-size:14px; flex:none; }
+  .todo-i .tx { flex:1; font-size:13px; }
+  .todo-i .go2 { font-size:11.5px; color: var(--blue-tx); font-weight:700; flex:none; }
+  /* 提示语里可点的群名：蓝色虚线下划线，一眼看出"能点"。
+     ⚠️ 中文引号「」**不要用文本写进 HTML**：
+        群名是中英混排（OnOBN 是半角拉丁、站通知订阅工具是全角汉字），
+        「紧贴半角字母、」紧贴全角汉字 —— 同样的全角引号，因为
+        邻居字宽不同，左右看起来一宽一窄（反馈的"一个半角一个全角"）。
+        解法：引号交给 **CSS 伪元素**，两侧给**完全相同的外间距**，
+        视觉上就对称了；而且 JS 更新群名时不用再管引号。 */
+  .lnk {
+    color: var(--blue-tx); font-weight:650; cursor:pointer;
+    border-bottom:1px dashed color-mix(in srgb, var(--blue) 55%, transparent);
+  }
+  .lnk:hover { border-bottom-style:solid; }
+
+  /* 全角「」统一由伪元素生成 —— 别把引号写进 HTML/JS 文本，
+     JS 更新群名时会连引号一起冲掉。
+     ⚠️ 两侧的引号必须**同码位、同字重、同间距**：
+        · 码位固定 U+300C / U+300D（全角），半角的 ｢｣ 在中文里明显偏窄
+        · font-weight 一律**继承**（以前 #tbSbName 写死 400，而它是 <b>
+          粗体，于是"细引号 + 粗文字"，看着就是"符号大小不一"）
+        · 引号本身就是全角码位，**不要用 font-variant-east-asian:full-width
+          去"锁"** —— 那个特性会把英文字母也拉成全角，中英混排的群名
+          （OnOBN 品牌行）会整个变胖一圈，看着就是"提示变宽了"。
+          引号宽度由码位决定，不需要这个特性。
+        · 群名太长时截断，别把顶栏/提示撑爆 */
+  .lnk, #tbSbName, #sbBoxName {
+    display:inline-block; max-width:16em; vertical-align:bottom;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .lnk::before, #tbSbName::before, #sbBoxName::before {
+    content:'\300C'; margin-right:.15em;
+  }
+  .lnk::after, #tbSbName::after, #sbBoxName::after {
+    content:'\300D'; margin-left:.15em;
+  }
+
+  /* 沙盒群没设时的警示（测试页顶部） */
+  .warn-box {
+    background:rgba(229,84,75,.10); border:1px solid rgba(229,84,75,.34);
+    border-radius:var(--r-sm); padding:11px 14px; font-size:12.5px;
+    color: var(--danger-tx); margin-bottom:13px;
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  }
+
+  /* 左下角版本行：居中显示「OnOBN · v2.0.1」。
+     OnOBN = OnOB站通知订阅工具（OnO Bilibili Notifier）。
+     文字变长了，字号压一点 + 允许换行，窄屏不至于顶出侧栏。 */
+  .side-foot {
+    font-size:11px; color:var(--tx3); padding:0 8px 4px;
+    text-align:center; display:flex; align-items:center;
+    justify-content:center; gap:5px; flex-wrap:wrap;
+  }
+  /* 品牌名可点：整块是通往 GitHub 的链接。
+     默认看起来跟以前一样（只是加粗），鼠标移上去/键盘聚焦才显出下划线和蓝色，
+     免得平常看着像个突兀的超链接。 */
+  .sf-brand { font-weight:600; color:var(--tx2); text-decoration:none;
+    cursor:pointer; border-radius:4px; padding:0 2px;
+    transition:color .16s ease, background .16s ease; }
+  .sf-brand:hover, .sf-brand:focus-visible {
+    /* ⚠️ 用 --blue-tx 而不是 --blue：浅色主题下品牌蓝打在浅底上对比度不足，
+       看不出链接变了色（tests/test_light_contrast.py 盯着这条）。 */
+    color:var(--blue-tx); text-decoration:underline;
+    background:var(--glass); outline:none; }
+  .sf-sep { opacity:.55; }
+  /* 关于页里的 GitHub 链接：默认就是可认出来的链接色，不玩悬停才变色的把戏 */
+  .gh-link { color:var(--blue-tx); text-decoration:none; display:inline-block;
+    margin-top:4px; border-radius:4px; padding:0 2px;
+    transition:background .16s ease; }
+  .gh-link:hover, .gh-link:focus-visible { text-decoration:underline;
+    background:var(--glass); outline:none; }
+  /* 更新日志：三档条数切换 */
+  .cl-tabs { display:flex; gap:6px; flex-wrap:wrap; }
+  .cl-tab {
+    font-size:11.5px; padding:4px 11px; border-radius:999px;
+    border:1px solid var(--line); background:var(--glass);
+    color:var(--tx3); cursor:pointer;
+  }
+  .cl-tab.on { background:var(--blue); border-color:var(--blue);
+    color:#fff; font-weight:600; }
+  /* 更新日志：默认是折叠的，点标题才展开。
+     ⚠️ 以前只有 .cl-body 的基础样式、没有 display 规则 ——
+        所有版本的内容全部铺开，压根不是折叠框。 */
+  .cl-body { display:none; }
+  .cl-item.open .cl-body { display:block; }
+  .cl-arrow { transition:transform .18s ease; display:inline-block; }
+  .cl-item.open .cl-arrow { transform:rotate(90deg); }
+
+  /* ── 主区 ── */
+  /* ⚠️ 自适应宽度：不写死 1080px。
+     用 max-width:min(1180px,100%) + margin-inline:auto：
+       · 宽屏（>1500px）放宽到 1240px，不浪费两侧空间
+       · 中等屏按可用宽度收缩，卡片跟着 auto-fit 重排
+       · flex:1 1 auto 而不是 flex:1，否则 flex-basis:0 会把左侧留白吃掉
+     横向内边距用 clamp 平滑过渡，不再靠断点跳变。 */
+  .main {
+    flex:1 1 auto; min-width:0; width:100%;
+    max-width:min(var(--main-max), 100%); margin-inline:auto;
+    padding:26px var(--pad-x) 60px;
+  }
+  .hd { margin-bottom:20px; }
+  .hd h1 { margin:0 0 4px; font-size:21px; font-weight:700; }
+  .hd p { margin:0; color:var(--tx3); font-size:13px; }
+
+  /* ── 选项卡 ── */
+  .tabs {
+    display:flex; gap:5px; margin-bottom:18px;
+    border-bottom:1px solid var(--line); padding-bottom:0; flex-wrap:wrap;
+  }
+  .tab {
+    padding:8px 14px; border:none; background:transparent;
+    color:var(--tx3); cursor:pointer; font-size:13.5px;
+    font-family:inherit; border-bottom:2px solid transparent;
+    margin-bottom:-1px; transition:.18s;
+  }
+  .tab:hover { color:var(--tx); }
+  .tab.on { color: var(--blue-tx); border-bottom-color:var(--blue); font-weight:600; }
+
+  /* ── 卡片 ──
+     ⚠️ 完整定义只在下方「顶部高光」那一处（带 ::before）。
+        这里**不要**再写一份，否则两个都在改背景，改色时容易只改一处
+        → 一半卡片变了另一半没变，又变成"色差"。 */
+  .card h3 {
+    margin:0 0 13px; font-size:14px; font-weight:650;
+    display:flex; align-items:center; gap:7px;
+  }
+  .grid { display:grid; gap:13px; }
+  /* ── 自适应列数 ──
+     ⚠️ 以前是写死 repeat(2/3/4,1fr)：窗口一窄，卡片被压成细条，
+        里面的字和按钮挤成一团。现在用 auto-fit + minmax，
+        列数由**可用宽度**决定，窗口怎么拉都不会挤。
+     ⚠️ min() 不能省：容器比 minmax 的下限还窄时（比如 320px 屏），
+        单纯写 minmax(240px,1fr) 会**溢出**出横向滚动条；
+        写成 min(240px,100%) 才会退化成单列。 */
+  .g2 { grid-template-columns:repeat(auto-fit, minmax(min(340px,100%), 1fr)); }
+  .g3 { grid-template-columns:repeat(auto-fit, minmax(min(260px,100%), 1fr)); }
+  .g4 { grid-template-columns:repeat(auto-fit, minmax(min(190px,100%), 1fr)); }
+  /* 网格子项必须有 min-width:0，否则长单词/长 ID 会把整个网格撑破 */
+  .grid > * { min-width:0; }
+  /* ── 防横向溢出（治本，不用 overflow:hidden 硬裁）──
+     flex/grid 子项默认 min-width:auto，内容再长也不会收缩，
+     于是长 ID、长链接、长日志会把整页撑出横向滚动条。
+     统一给容器 min-width:0，并让超长串能断行。 */
+  .card, .kpi, .panel, .grp, .grp-body, .li { min-width:0; }
+  .gid, .uid, code, .log-raw, .acc-nm { overflow-wrap:anywhere; }
+  /* ── 窄屏适配 ──
+     窗口变窄时侧边栏收成一条窄图标栏（只留图标，文字隐藏），
+     主区腾出空间。手机上不至于左边190px白占着。 */
+  /* ── 尊重系统「减少动效」设置 ──
+     开了之后整套动效静止（光斑、涟漪、倾斜、折叠展开）。
+     这是无障碍要求，不是可选项 —— 动效对部分人会引起不适。
+     ⚠️ 注意：只关 animation/transition，**不能关 display**，
+        否则折叠框会因为 .grp-body 还在而永远展开着。 */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration:.001ms !important;
+      animation-iteration-count:1 !important;
+      /* ⚠️ delay 也要清掉：折叠展开的 grpIn 带 .05s 延迟 + backwards 填充，
+         只缩短时长不清延迟的话，会有一小段 opacity:0 的空窗。 */
+      animation-delay:0s !important;
+      transition-duration:.001ms !important;
+      scroll-behavior:auto !important;
+    }
+    /* ⚠️ 光斑和柔光要整个藏掉，光靠缩短动画时长还会留在屏幕上 */
+    .bgfx, .bg-glow { display:none; }
+    /* 渐入类如果还是 opacity:0，内容就永远看不见了 */
+    .fx-reveal { opacity:1; transform:none; }
+    /* 心跳：停止滚动和搏动，但**保留波形可见**（不能 display:none） */
+    .hb-wave, .hb-frame, .tb-i .d.hb-led { animation:none !important; }
+  }
+
+  /* ── 宽屏：放宽主区，别让两侧空一大片 ── */
+  @media(min-width:1500px){
+    :root { --main-max:1240px; --pad-x:32px; }
+    .hd h1 { font-size:23px; }
+  }
+  /* ── 中等屏：侧边栏先瘦身，把宽度让给内容 ── */
+  @media(max-width:1180px){
+    .side { width:168px; flex:0 0 168px; padding:18px 10px; }
+    .hd h1 { font-size:20px; }
+  }
+  @media(max-width:1024px){
+    .side { width:150px; flex:0 0 150px; padding:16px 8px; }
+    .nav-i { font-size:13px; padding:9px 9px; gap:8px; }
+    .acc-nm { font-size:12px; }
+  }
+  /* ── 窄屏：侧边栏收成图标栏 ── */
+  @media(max-width:860px){
+    .side { width:58px; flex:0 0 58px; padding:16px 6px; }
+    .side .brand { font-size:0; padding:0 0 16px; justify-content:center; }
+    .side .brand .dot { width:11px; height:11px; }
+    .nav-i { justify-content:center; padding:11px 0; font-size:0; gap:0; }
+    .nav-i .ic { font-size:17px; width:auto; }
+    .side-foot { display:none; }
+    .side-theme { justify-content:center; padding:8px 0; }
+    .side-theme-tx { display:none; }
+    .main { padding-top:20px; }
+    .topbar { margin-top:-20px; margin-bottom:16px; gap:10px; font-size:12px; }
+  }
+  /* ── 手机：侧边栏改横排贴顶 ── */
+  @media(max-width:560px){
+    /* 极窄时侧边栏改横排，贴顶，避免挤占横向空间 */
+    .app { flex-direction:column; }
+    .side {
+      width:100%; flex:none; height:auto; position:sticky; top:0;
+      border-right:none; border-bottom:1px solid var(--line);
+      padding:8px 6px; display:flex; align-items:center; gap:6px; z-index:70;
+    }
+    .side .brand { display:none; }
+    .nav { flex-direction:row; width:100%; justify-content:space-around; flex:none; }
+    .nav-i { flex:1; font-size:0; padding:9px 0; }
+    .side-theme, .side-foot { display:none; }
+    .topbar { position:static; margin:0 0 14px; border-radius:var(--r-sm); }
+    .hd h1 { font-size:19px; }
+    /* 手机上按钮要够大才点得中 */
+    .btn { min-height:38px; }
+    .tabs { gap:2px; }
+    .tab { padding:8px 10px; font-size:13px; }
+  }
+  /* ── 超窄（<400px）：再收紧一轮，杜绝横向滚动 ── */
+  @media(max-width:400px){
+    :root { --pad-x:12px; }
+    .hd h1 { font-size:17px; }
+    .card { padding:13px 12px; }
+    .tabs { flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none; }
+    .tabs::-webkit-scrollbar { display:none; }
+    .tab { flex:none; }
+  }
+  /* ── 矮屏（笔记本横屏/分屏）：侧边栏自己滚，别把导航顶出屏幕外 ── */
+  @media(max-height:620px){
+    .side { height:100vh; overflow-y:auto; }
+    .nav { flex:none; }
+  }
+
+  /* ── 指标块 ── */
+  .kpi {
+    /* ⚠️ 背景刻意**不在这里写**：.kpi 是一级玻璃容器，
+       必须和 .card 用同一套（见下方 [data-theme] 段），
+       否则就会出现"指标块和卡片不是一个底色"的色差。 */
+    border:1px solid var(--line);
+    border-radius:var(--r-md); padding:15px 17px;
+  }
+  .kpi .lb { font-size:12px; color:var(--tx3); }
+  .kpi .vl { font-size:25px; font-weight:700; margin:3px 0 1px; }
+  .kpi .sb { font-size:11.5px; color:var(--tx3); }
+  .kpi.ok .vl { color: var(--ok-tx); }
+  .kpi.wn .vl { color: var(--warn-tx); }
+
+  /* ── 表单 ── */
+  .row { margin-bottom:13px; }
+  .row label { display:block; font-size:12.5px; color:var(--tx2); margin-bottom:5px; }
+  .row input, .row textarea, .row select {
+    width:100%; padding:8px 11px; border-radius:var(--r-sm);
+    border:1px solid var(--line); background:var(--input);
+    color:var(--tx); font-size:13px; font-family:inherit;
+  }
+  .row textarea { resize:vertical; min-height:62px; }
+  .hint { font-size:11.5px; color:var(--tx3); margin-top:4px; }
+
+  /* ── 可点击跳转 ──
+     概况页的东西点了要能跳到对应的选项卡去处理，
+     所以要有明显的"可点"提示：手型光标 + 悬停高亮 + › 箭头 */
+  .jump { cursor:pointer; transition:.18s; }
+  .jump:hover { background:var(--glass); border-color:var(--blue); }
+  .kpi.jump .sb::after { content:''; }
+  .jump-hint { color: var(--blue-tx); font-weight:700; }
+  .li.jump:hover .t1 { color: var(--blue-tx); }
+
+  /* ── 健康度进度条 ──
+     四项各 25%，正常一项就 +25% */
+  .hp { margin-bottom:12px; }
+  .hp-bar {
+    height:8px; border-radius:999px; background:var(--line);
+    overflow:hidden; margin-bottom:6px;
+  }
+  .hp-fill {
+    height:100%; border-radius:999px;
+    background:var(--grad-bar);   /* 进度条：允许渐变 */
+    transition:width .5s cubic-bezier(.22,1,.36,1);
+  }
+  .hp-txt { font-size:12px; color:var(--tx3); }
+
+  /* 群内细分：只有「UP 主」和「合集」两类 */
+  /* ── 提醒类型开关（chip-tgl）──
+     ⚠️ 这是**可点的开关**，不是状态标签。三条行为缺一不可：
+       1) 静默：只在库里改，**绝不给群里发任何消息**
+       2) 热更新：就地翻转显示，不整页重绘（重绘会闪、还会丢展开状态）
+       3) 双向：开→关、关→开 都要能点 */
+  .chip-tgl {
+    padding:5px 13px; border-radius:999px; font-size:12.5px;
+    border:1px solid var(--line); background:transparent;
+    color:var(--tx3); cursor:pointer; font-family:inherit;
+    transition:background .2s var(--ease), color .2s var(--ease),
+               border-color .2s var(--ease), transform .12s;
+  }
+  .chip-tgl:hover { color:var(--tx); border-color:var(--blue); }
+  .chip-tgl:active { transform:scale(.94); }
+  .chip-tgl.on {
+    /* 单色实底，不用渐变（反馈：按钮也是渐变色） */
+    background:var(--blue); color:#fff; border-color:transparent;
+    font-weight:600; box-shadow:0 2px 10px rgba(0,174,236,.28);
+  }
+  /* 关掉时加删除线，一眼看出"这个类型不推" */
+  .chip-tgl:not(.on) { text-decoration:line-through; text-decoration-thickness:1px; }
+  .chip-tgl.busy { opacity:.6; pointer-events:none; }
+
+  /* ── 群卡片：折叠框 ──
+     默认收起，点标题栏才展开。群一多，全展开会滚很久。
+
+     展开动画用 grid-template-rows: 0fr → 1fr：
+     这是目前唯一能平滑过渡到「内容真实高度」的写法。
+     用 max-height 必须猜一个值（群里 UP 主数量不定），
+     猜小了内容被裁，猜大了收起时会有明显的空档延迟。 */
+  .grp {
+    padding:0; overflow:hidden;
+    /* ⚠️ 群背景(.grp-bg)现在是卡片的直接子元素，需要卡片当定位基准；
+       不写的话它会往上找到别的定位祖先，位置全乱。 */
+    position:relative;
+    /* 撑起"卡片感"：默认比普通卡片更立体一点 */
+    transition:box-shadow .26s var(--ease), border-color .26s var(--ease),
+               transform .26s var(--ease);
+  }
+  .grp:hover { border-color:color-mix(in srgb, var(--pink) 26%, var(--line)); }
+  .grp.open {
+    box-shadow:var(--shadow), 0 0 0 1px color-mix(in srgb, var(--pink) 16%, transparent);
+  }
+  /* 左侧指示条：收起时几乎看不见，展开时整条亮起。
+     比"只看箭头转没转"直观得多 —— 余光就知道哪个群是展开的。 */
+  .grp-head {
+    position:relative;
+    display:flex; align-items:center; gap:11px; flex-wrap:wrap;
+    padding:15px 17px; cursor:pointer; user-select:none;
+    transition:background .2s var(--ease);
+  }
+  .grp-head::before {
+    content:''; position:absolute; left:0; top:12%; bottom:12%; width:3px;
+    border-radius:0 3px 3px 0;
+    background:var(--grad); opacity:0; transform:scaleY(.4);
+    transform-origin:center;
+    transition:opacity .3s var(--ease), transform .3s var(--ease),
+               box-shadow .3s var(--ease);
+  }
+  .grp.open .grp-head::before {
+    opacity:.95; transform:scaleY(1);
+    box-shadow:0 0 9px color-mix(in srgb, var(--pink) 60%, transparent);
+  }
+  /* 头部里所有内容都抬到横幅**之上**（横幅 z-index:0） */
+  /* ⚠️ 排除 .grp-bg —— 它必须在文字**下面** */
+  /* ⚠️ 群背景已移到卡片层，头部里不再有 .grp-bg，全员抬到 z-index:1 */
+  .grp-head > * { position:relative; z-index:1; }
+  /* 卡片层的三个直接子元素必须压在背景(z-index:0)之上 */
+  .grp > .grp-head, .grp > .gbg-pick, .grp > .grp-body {
+    position:relative; z-index:1;
+  }
+  .grp-head::before { z-index:2; }          /* 指示条压在横幅之上 */
+  /* ── 群背景（可选已订阅 UP 主的头像）──
+     ⚠️ 原比例：**只用 auto 撑高度**，宽度按图片自身比例算出来，
+        绝不用 cover/100% 100% 那种会拉伸的写法。
+        B站头像是正方形，所以这里高度取头部的 132%（略微溢出更有氛围），
+        宽度自动 = 同值，形状不会变形。
+     ⚠️ 向右淡出用 **mask 只改不透明度**，不叠第二层颜色；
+        单层渐变(90deg)做遮罩，不会有生硬边缘。
+     ⚠️ z-index:0 + 文字 z-index:1：背景永远在字下面，不影响易读。 */
+  .grp-bg {
+    content:''; position:absolute; z-index:0;
+    /* ⚠️ 反馈"选择头像后变化应该在外面的大边框上、展开就等比放大"：
+       容器改成**整张卡的外框**（挂在 .grp 上），高度跟着卡片走，
+       正方形 aspect-ratio 保证**等比**——卡片展开变高，方块整体放大，
+       不会被拉宽成扁平条（那是 100% 100% 的老毛病）。
+       max-height 是上限：卡片很高时不会糊满整屏，比例仍然不变。 */
+    right:0; top:50%; transform:translateY(-50%);
+    height:100%; max-height:var(--gbg-max, 300px);
+    aspect-ratio:1 / 1;
+    background-image:var(--gbg, none);
+    background-repeat:no-repeat;
+    background-position:right center;
+    /* contain：任何比例的头像都不会变形（正方形头像时和铺满一样） */
+    background-size:contain;
+    opacity:var(--gbg-op, .26);
+    /* ⚠️ 从右往左：270deg = 右端不透明 → 向左淡出到全透明。
+       仍然只改**不透明度**，不叠第二个颜色。 */
+    -webkit-mask-image:linear-gradient(270deg,
+      #000 0%, #000 38%, rgba(0,0,0,.34) 66%, transparent 100%);
+            mask-image:linear-gradient(270deg,
+      #000 0%, #000 38%, rgba(0,0,0,.34) 66%, transparent 100%);
+    pointer-events:none;
+    transition:background-image .3s var(--ease), opacity .3s var(--ease);
+  }
+  /* 再叠一层很淡的、更宽的"余晖"，让淡出延伸到文字左侧，
+     避免方形块边缘太硬（同样是单色，只改不透明度） */
+  .grp-bg::after {
+    /* 父容器现在可能很高（整张卡），余晖按父高 100% 会糊一大片；
+       取 56% 并垂直居中，只做"边缘柔化"，不抢主体。 */
+    content:''; position:absolute; top:50%; transform:translateY(-50%);
+    height:56%; right:100%;
+    width:120px;
+    background-image:var(--gbg, none);
+    background-repeat:no-repeat;
+    background-position:right center;
+    background-size:auto 100%;
+    opacity:.35;
+    -webkit-mask-image:linear-gradient(270deg, rgba(0,0,0,.5) 0%, transparent 92%);
+            mask-image:linear-gradient(270deg, rgba(0,0,0,.5) 0%, transparent 92%);
+    pointer-events:none;
+  }
+  /* 悬停时略微提亮，能看清是谁 */
+  /* 悬停整张卡都提亮：背景现在属于卡片，不只是头部 */
+  .grp:hover .grp-bg { opacity:var(--gbg-op-hv, .38); }
+
+  .gbg-btn {
+    flex:none; padding:2px 6px; border-radius:7px; cursor:pointer;
+    border:1px solid var(--line); background:var(--glass);
+    color:var(--tx3); font-size:11px; line-height:1; font-family:inherit;
+    opacity:0; transition:.18s var(--ease);
+  }
+  .grp-head:hover .gbg-btn { opacity:1; }
+  .gbg-btn:hover { color:var(--tx); border-color:var(--blue); }
+
+  .gbg-pick {
+    display:none; align-items:center; gap:6px; flex-wrap:wrap;
+    padding:8px 17px 10px; border-bottom:1px solid var(--line-2);
+  }
+  .gbg-pick.show { display:flex; }
+  .gbg-lab { font-size:11px; color:var(--tx3); margin-right:2px; }
+  .gbg-chip {
+    padding:3px 10px; border-radius:999px; cursor:pointer;
+    border:1px solid var(--line); background:var(--glass);
+    color:var(--tx2); font-size:11.5px; font-family:inherit;
+    transition:.18s var(--ease);
+  }
+  .gbg-chip:hover { color:var(--tx); border-color:var(--blue); }
+  .gbg-chip.on { background:var(--blue); border-color:transparent; color:#fff; }
+
+  /* ⚠️ 悬浮高亮改用 .grp-head 自身的圆角背景：
+     之前想用 ::before 做，但 ::before **已经被左侧指示条占用**，
+     同一元素上写两份 ::before，后一份会把前一份整个覆盖掉
+     —— 结果指示条失效、高亮也没了（两份都白写）。
+     ::after 也被展开后的分割线占用，所以不再抢伪元素，
+     直接给头部加 border-radius + hover 背景，最干净。 */
+  .grp-head { border-radius:12px; }
+  .grp.open .grp-head { border-radius:12px 12px 0 0; }
+  /* ⚠️ 反馈"加了头像就不是圆角框了"：.grp-bg 是绝对定位的方块，
+     它**不知道父级有圆角**，会照自己方形边界画出去，
+     右侧正好压在卡片圆角上 → 看着像缺了一角。
+     用 overflow:hidden 把背景块裁进头部的圆角里；
+     比给背景块单独写 border-radius 更稳——
+     展开时头部下缘是直的(12px 12px 0 0)，写死圆角反而会露缝。
+     代价：左侧指示条的 box-shadow 光晕会被裁掉一点，影响很小。 */
+  .grp-head { overflow:hidden; }
+  .grp-head:hover { background:var(--li-hv); }
+  .grp-head:active { background:var(--glass-2, var(--glass)); }
+
+  /* ⚠️ 群头像**不做**：QQ 官方接口不返回头像 URL，
+     机器人拿到的是 openid 拼不出地址；生成占位效果不好，按反馈撤掉。 */
+
+  /* 群名区：名字 + 下面一行元信息，层次清楚 */
+  .grp-meta { min-width:0; flex:1; }
+  .grp-head h3 {
+    margin:0; font-size:14.5px; font-weight:650;
+    /* 长群名截断，不把卡片撑破 */
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .grp-sub {
+    margin-top:2px; font-size:11.5px; color:var(--tx3);
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+
+  /* chevron 用**CSS 画的两条线**，不用字体字符 › ——
+     字体字符在不同系统/字体下位置和高低都不一样，看着很业余。 */
+  .grp-head .chev {
+    flex:none; width:8px; height:8px; position:relative;
+    /* 经典写法：右边+下边两条边框，旋转后尖角朝右/朝下。
+       比用两条线拼的"Γ"更像 chevron，也更好控。 */
+    border-right:2px solid var(--tx3); border-bottom:2px solid var(--tx3);
+    border-radius:0 0 2px 0;
+    transform:rotate(-45deg); transform-origin:60% 60%;
+    transition:transform .3s cubic-bezier(.34,1.4,.64,1),
+               border-color .3s var(--ease);
+  }
+  .grp.open .chev {
+    transform:rotate(45deg);
+    border-color:var(--blue);
+  }
+
+  .grp-head .grp-hint {
+    margin-left:auto; font-size:11.5px; color:var(--tx3); flex:none;
+    transition:opacity .2s var(--ease);
+  }
+  .grp.open .grp-head .grp-hint { opacity:0; }
+
+  /* 展开后头部下方一道渐隐分割线：视觉上把标题和内容分开 */
+  .grp.open .grp-head::after {
+    content:''; position:absolute; left:17px; right:17px; bottom:0; height:1px;
+    /* 单色：只用粉色，靠**不透明度**从左往右淡出。
+       原来是 粉→灰线→透明 三色，尾端会有一次色相突变。 */
+    background:linear-gradient(90deg,
+      color-mix(in srgb, var(--pink) 42%, transparent),
+      color-mix(in srgb, var(--pink) 12%, transparent) 45%,
+      transparent 92%);
+  }
+  .grp-body {
+    display:grid; grid-template-rows:0fr; opacity:0;
+    transition:grid-template-rows .32s var(--ease), opacity .22s var(--ease);
+  }
+  .grp.open .grp-body { grid-template-rows:1fr; opacity:1; }
+  /* 展开时内容从上方轻轻落下来。
+     ⚠️ 加这层的原因：高度过渡靠 grid-template-rows 的 0fr→1fr 插值，
+     少数旧内核不支持 fr 插值会**直接硬切**；有了这段内容动画，
+     哪怕高度是跳变的，也一定能看到"内容浮出来"的过程。
+     ⚠️ 另外：app.js 的 toggle-group 现在只切 class 不整块重画 ——
+     以前重画出来的卡片是带着 .open 一起插入 DOM 的，浏览器把它当
+     初始状态，过渡没有起点可插值，所以点开是"啪"一下硬切。 */
+  .grp.open .grp-inner {
+    animation:grpIn .34s var(--ease) backwards;
+    animation-delay:.05s;
+  }
+  @keyframes grpIn {
+    from { opacity:0; transform:translateY(-7px); }
+    to   { opacity:1; transform:none; }
+  }
+  /* ⚠️ min-height:0 + overflow:hidden 缺一不可：
+     没有 min-height:0，grid 行不会真的收缩到 0（内容会撑开）。
+     没有 overflow:hidden，收起时内容会溢出来。 */
+  .grp-inner { min-height:0; overflow:hidden; padding:0 16px 16px; }
+
+  /* ── 日/夜间切换 ──
+     按钮里的图标会转 + 换（☀️/🌙），不是硬切。 */
+  .theme-btn {
+    position:relative; display:flex; align-items:center; justify-content:center;
+    width:34px; height:34px; border-radius:50%; flex:none;
+    border:1px solid var(--line); background:var(--glass);
+    cursor:pointer; font-size:15px; line-height:1; overflow:hidden;
+    transition:transform .2s var(--ease), border-color .2s, background .2s;
+  }
+  .theme-btn:hover {
+    transform:scale(1.09);
+    border-color:color-mix(in srgb, var(--pink) 45%, var(--line));
+  }
+  .theme-btn:active { transform:scale(.9); }
+  .theme-btn .tg {
+    display:block;
+    transition:transform .5s cubic-bezier(.34,1.56,.64,1),
+               opacity .3s var(--ease);
+  }
+  /* 切的时候图标旋出去再旋进来，中间换字 */
+  .theme-btn.spin .tg { transform:rotate(-180deg) scale(.4); opacity:0; }
+
+  /* 切换瞬间的圆形扩散规则统一放在文件末尾「③ 主题切换」那一段。
+     ⚠️ 这里以前还有一份：它要求根元素带上那个 .w 开头的 class，
+        而 app.js 从来没加过 —— 那份是死规则。
+        两份同名的 ::view-transition 规则并存，改的时候极易改错地方，
+        所以这里不再留第二份。 */
+
+  /* 切主题期间**临时**锁掉所有元素自身的过渡。
+     原因：::view-transition-new(root) 是**实时快照**，新主题一应用，
+     页面里几十个元素（transition:.18s / .2s / .26s 的 background、color、
+     border-color）就开始各自跑补间。于是圆形刚铺开的那一片颜色还是半成品，
+     铺到一半才追上 —— 看出来就是"闪一下、颜色错位"。
+     锁掉之后，铺开的每一片立刻是最终颜色。
+     ⚠️ 只锁 transition，不锁 animation（光斑飘移、心跳都照常跑）；
+        图标旋转要保留，所以单独放行。 */
+  html.theme-lock *, html.theme-lock *::before, html.theme-lock *::after {
+    transition:none !important;
+  }
+  html.theme-lock .theme-btn .tg {
+    transition:transform .5s cubic-bezier(.34,1.56,.64,1),
+               opacity .3s var(--ease) !important;
+  }
+
+  /* ── 防误选：连点按钮会选中文字 ──
+     只给"纯交互元素"加，**不能**加在 input/textarea 和可复制内容上
+     （日志正文、群 ID、UID 这些用户要选中去复制）。 */
+  button, .nav-i, .tab, .mini-tab, .tag, .chip-tgl, .sw-btn,
+  .theme-btn, .grp-head, .push, .tb-btn, .todo-i, .sw.jump, .li .av {
+    -webkit-user-select:none; user-select:none;
+    -webkit-tap-highlight-color:transparent;   /* 手机端点不出蓝色高亮块 */
+  }
+  /* ⚠️ 输入框和可复制内容**必须**保持可选中，别被上面的规则波及 */
+  input, textarea, select, .log-raw, .log-trans, .gid, .uid, code {
+    -webkit-user-select:text; user-select:text;
+  }
+
+  /* 提示里的可点链接（跳去别处改设置） */
+  .note-link {
+    color: var(--blue-tx); font-weight:600; cursor:pointer;
+    text-decoration:underline; text-decoration-style:dotted;
+    text-underline-offset:3px; transition:color .18s;
+  }
+  .note-link:hover { color: var(--pink-tx); }
+
+  /* 跳转过去后闪一下，让人知道"就是这块" */
+  @keyframes flashCard {
+    0%,100% { box-shadow:0 0 0 0 rgba(0,174,236,0); }
+    30%     { box-shadow:0 0 0 3px rgba(0,174,236,.45); }
+  }
+  .card.flash { animation:flashCard 1.5s var(--ease); }
+
+  .mini-tabs { display:flex; gap:4px; margin:10px 0 12px; }
+  .mini-tab {
+    padding:5px 13px; border-radius:999px; font-size:12.5px;
+    border:1px solid var(--line); background:transparent;
+    color:var(--tx3); cursor:pointer; font-family:inherit; transition:.18s;
+  }
+  .mini-tab:hover { color:var(--tx); }
+  .mini-tab.on { background:rgba(0,174,236,.14); color: var(--blue-tx); border-color:transparent; font-weight:600; }
+  .mini-view { display:none; }
+  .mini-view.on { display:block; }
+
+  /* ── 按钮 ── */
+  .btn {
+    padding:8px 15px; border-radius:var(--r-sm); border:1px solid var(--line);
+    background:var(--glass); color:var(--tx); cursor:pointer;
+    font-size:13px; font-family:inherit; transition:.18s;
+  }
+  .btn:hover { background:var(--line); }
+  .btn.pri { background:var(--blue); border-color:var(--blue); color:#fff; }
+  .btn.pri:hover { filter:brightness(1.08); }
+  .btn.dg { color: var(--danger-tx); border-color:rgba(229,84,75,.4); }
+  /* 「亮起」态：只看问题 / 排序这类按下才生效的按钮，
+     按下去要有明确的视觉反馈，不然点了跟没点一样 */
+  .btn.on { background:var(--blue); border-color:var(--blue); color:#fff; }
+  .btn.on:hover { filter:brightness(1.08); }
+  .btns { display:flex; gap:9px; flex-wrap:wrap; }
+
+  /* ── 开关 ── */
+  .sw { display:flex; align-items:center; justify-content:space-between;
+        padding:9px 0; border-bottom:1px solid var(--line-2); }
+  .sw:last-child { border-bottom:none; }
+  .sw .nm { font-size:13.5px; }
+  .sw .ds { font-size:11.5px; color:var(--tx3); }
+
+  /* ── 可点行（jump）──
+     正常项不带这个类：正常就该老老实实显示"正常"，不做成可点的样子，
+     否则看着像出了问题。只有异常项才 jump（整行可点 + 蓝色提示）。 */
+  .jump { cursor:pointer; transition:background .18s var(--ease),
+                                     box-shadow .18s var(--ease); }
+  /* 圆角高亮，且**不引起位移**：用 box-shadow 向外扩代替 padding。
+     ⚠️ .sw 左右 padding 是 0，直接加 background 会和文字一样宽、紧贴文字。 */
+  .sw.jump { border-radius:10px; }
+  .sw.jump:hover { background:var(--glass); box-shadow:0 0 0 8px var(--glass); }
+  .jump-hint { color: var(--blue-tx); font-weight:700; }
+  .sw-btn {
+    width:40px; height:22px; border-radius:11px; border:none;
+    background:var(--line); cursor:pointer; position:relative; flex:0 0 40px;
+    transition:.2s;
+  }
+  .sw-btn.on { background:var(--ok); }
+  .sw-btn::after {
+    content:''; position:absolute; top:3px; left:3px;
+    width:16px; height:16px; border-radius:50%; background:#fff;
+    transition: transform .26s var(--ease), background .26s var(--ease);
+  }
+  /* ⚠️ 开到位用 transform 位移，不要改 left：
+     left 会触发重排；而且任何一道"光泽扫过"用的也是 translateX，
+     两者抢同一个属性时过渡会叠在一起，滑块就滑到按钮外面去了。
+     18px = 21 - 3（终点 left 减起点 left），位移量跟原来一致。 */
+  .sw-btn.on::after { transform: translateX(18px); }
+
+  /* ── 推送测试按钮网格 ── */
+  .push {
+    display:flex; flex-direction:column; align-items:center; gap:6px;
+    padding:16px 10px; border-radius:var(--r-md);
+    border:1px solid var(--line); background:var(--glass);
+    cursor:pointer; transition:.18s; font-family:inherit; color:var(--tx);
+  }
+  .push:hover { transform:translateY(-2px); border-color:var(--blue); }
+  .push .ic { font-size:22px; }
+  .push .nm { font-size:13px; font-weight:600; }
+  .push .ds { font-size:11px; color:var(--tx3); }
+
+  /* ── 列表 ── */
+  .li {
+    display:flex; align-items:center; gap:11px; padding:11px 0;
+    border-bottom:1px solid var(--line-2);
+    /* ⚠️ 悬浮高亮改成 ::before 圆角块，而不是给 .li 直接加 background：
+       1) 直接加背景是**直角**，在圆角卡片里看着割裂（反馈）
+       2) .li 左右 padding 是 0，背景块会和文字一样宽、紧贴文字，
+          看着"框比文字小"
+       用伪元素 + 负 inset 让高亮块**四周都比文字大一圈**，
+       而且不影响 border-bottom 分隔线，也不会引起布局位移。 */
+    position:relative;
+  }
+  .li::before {
+    content:''; position:absolute; z-index:0;
+    /* 上下各内收 2px（行与行之间留缝），左右各外扩 10px（比文字宽） */
+    inset:2px -10px;
+    border-radius:10px;
+    background:transparent;
+    transition:background .2s var(--ease);
+    pointer-events:none;
+  }
+  /* 文字/头像/标签要压在高亮块**上面** */
+  .li > * { position:relative; z-index:1; }
+  .li:hover::before { background:var(--li-hv); }
+  /* ⚠️ .jump:hover 那条通用规则会给元素加直角背景，
+     .li 必须显式清掉，否则圆角块外面又叠一层方的。 */
+  .li.jump:hover { background:transparent; }
+  .li:last-child { border-bottom:none; }
+  .li .av {
+    width:34px; height:34px; border-radius:50%; flex:0 0 34px;
+    /* 占位头像用**纯色**（反馈：渐变在这么小的圆上能看到生硬边缘） */
+    background:#5A6480;
+    display:flex; align-items:center; justify-content:center;
+    font-size:13px; font-weight:700; color:#fff;
+    /* 头像层：--av 由 JS 写入（真实图或生成的 SVG），画在首字**下面** */
+    background-image:var(--av, none);
+    background-size:cover; background-position:center;
+    overflow:hidden; position:relative;
+    box-shadow:0 0 0 1px rgba(0,0,0,.18);
+    transition:transform .24s var(--ease);
+  }
+  /* 有真实头像时，首字要藏起来（否则叠在图上很脏） */
+  .li .av.has-img { color:transparent; }
+  .li .av.has-img::after {
+    content:''; position:absolute; inset:0; border-radius:inherit;
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.14);
+  }
+  .li:hover .av { transform:scale(1.05); }
+  /* 合集头像：圆角方形（不是圆的），像视频封面/箱子 */
+  .li .av.season-av { border-radius:8px; }
+  .li .bd { flex:1; min-width:0; }
+  .li .t1 { font-size:13.5px; font-weight:600; }
+  .li .t2 { font-size:11.5px; color:var(--tx3); }
+  .tag {
+    display:inline-block; padding:2px 8px; border-radius:20px;
+    font-size:11px; background:var(--glass); color:var(--tx2);
+    border:1px solid var(--line);
+  }
+  .tag.on { background:rgba(0,174,236,.15); color: var(--blue-tx); border-color:transparent; }
+  .tag.warn { background:rgba(229,84,75,.15); color: var(--danger-tx); border-color:transparent; }
+  /* 绿标：安全体检测完没问题的项用它（v1.62.0）。
+     ⚠️ 只有 .on（蓝）/.warn（红）时，"没问题"只能用蓝标，
+     而蓝标在本项目里是"可点击/进行中"的意思，语义对不上。 */
+  .tag.ok { background:rgba(43,174,107,.15); color: var(--ok-tx); border-color:transparent; }
+
+  /* 运行状态：一行一项（左边名字 / 中间值 / 右边状态标签）。
+     以前这个面板只有标题和两个按钮，实际参数一个都没渲染。 */
+  .runrow {
+    display:grid; grid-template-columns:78px 1fr auto; gap:10px;
+    align-items:center; padding:9px 2px; border-top:1px solid var(--line);
+  }
+  .runrow:first-child { border-top:0; }
+  .runrow .rk { font-size:12.5px; color:var(--tx3); }
+  .runrow .rv { font-size:13px; min-width:0; word-break:break-word; }
+  @media (max-width:560px) {
+    .runrow { grid-template-columns:64px 1fr; }
+    .runrow .tag { grid-column:2; justify-self:start; }
+  }
+
+  /* ── 日志时间轴（沿用正式面板的设计，不另造）── */
+  .log-timeline { display:flex; flex-direction:column; gap:14px; }
+
+  /* 概览每行可点：点了跳到对应设置项并闪一下。
+     以前只做展示 —— 看到「B站接口 12 条」却不知道去哪处理。 */
+  .log-sum-row { cursor:pointer; transition:background .15s, border-color .15s; }
+  .log-sum-row:hover { background:var(--line); border-color:rgba(0,174,236,.35); }
+  .log-sum-go { opacity:.5; font-size:12px; white-space:nowrap; }
+  .log-sum-row:hover .log-sum-go { opacity:1; color: var(--blue-tx); }
+
+  .tl-group { position:relative; }
+
+  /* 大日期头：粉→透明渐变 + 左侧粉色竖条 */
+  .tl-date {
+    display:flex; align-items:baseline; gap:10px;
+    padding:8px 12px; margin-bottom:8px;
+    border-radius:var(--r-sm);
+    background:linear-gradient(90deg, rgba(251,114,153,.16), transparent);
+    border-left:3px solid var(--pink);
+  }
+  .tl-date.dim { opacity:.72; border-left-color:var(--tx3); }
+  .tl-date-t { font-size:14px; font-weight:800; letter-spacing:.3px; color:var(--tx); }
+  .tl-count { font-size:11px; color:var(--tx3); }
+
+  /* 竖线：粉→蓝渐变 */
+  .tl-items {
+    position:relative; padding-left:18px;
+    display:flex; flex-direction:column; gap:2px;
+  }
+  .tl-items::before {
+    content:''; position:absolute; left:5px; top:4px; bottom:4px;
+    width:2px; border-radius:2px;
+    /* 单色：只取粉色，末端靠不透明度淡出。
+       ⚠️ 不叠蓝色——粉蓝两色在 2px 细线上会看出明显的中段过渡带。 */
+    background:var(--pink);
+    -webkit-mask-image:linear-gradient(180deg, #000 0%, #000 55%, transparent 100%);
+            mask-image:linear-gradient(180deg, #000 0%, #000 55%, transparent 100%);
+    opacity:.32;
+  }
+
+  /* 每条：时间列 62px + 正文 */
+  .tl-item {
+    position:relative;
+    display:grid; grid-template-columns:62px 1fr;
+    gap:4px 10px; align-items:start;
+    padding:7px 10px 7px 4px;
+    border-radius:var(--r-sm);
+    border-bottom:1px dashed var(--line-2);
+  }
+  .tl-item:last-child { border-bottom:none; }
+  .tl-item:hover { background:var(--glass); }
+
+  /* 时间点圆点：按级别着色 */
+  .tl-dot {
+    position:absolute; left:-17px; top:13px;
+    width:9px; height:9px; border-radius:50%;
+    background:var(--tx3);
+    box-shadow:0 0 0 3px rgba(251,114,153,.18);
+  }
+  .tl-item.lv-error .tl-dot { background:var(--danger); box-shadow:0 0 0 3px rgba(229,84,75,.22); }
+  .tl-item.lv-warn  .tl-dot { background:var(--warn);  box-shadow:0 0 0 3px rgba(232,163,61,.22); }
+  .tl-item.lv-info  .tl-dot { background:var(--blue);  box-shadow:0 0 0 3px rgba(0,174,236,.18); }
+
+  .tl-clock {
+    font-family:ui-monospace,Menlo,Consolas,monospace;
+    font-size:11.5px; font-weight:700; color:var(--tx3);
+    padding-top:2px; white-space:nowrap;
+  }
+  .tl-body { min-width:0; display:flex; flex-direction:column; gap:3px; }
+  .tl-meta { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+
+  /* 部件名 / 级别 / 白话解释 / 正文
+     ⚠️ 这四个在正式代码里**CSS 没定义**（JS 用了但样式缺失），
+     草稿里先补上正确样子，正式实现时一并修 */
+  .log-part {
+    font-size:11px; font-weight:700; color:var(--tx2);
+    background:var(--glass); border:1px solid var(--line);
+    padding:1px 8px; border-radius:999px;
+  }
+  .log-lv {
+    font-size:10.5px; font-weight:700; padding:1px 8px; border-radius:999px;
+  }
+  .log-lv.info  { background:rgba(0,174,236,.15);  color: var(--blue-tx); }
+  .log-lv.warn  { background:rgba(232,163,61,.15); color: var(--warn-tx); }
+  .log-lv.error { background:rgba(229,84,75,.15);  color: var(--danger-tx); }
+  /* 连着出现多次的同一句：标出次数，不再占好几行 */
+  .log-rep {
+    font-size:10.5px; font-weight:800; padding:1px 7px; border-radius:999px;
+    background:rgba(232,163,61,.16); color:var(--warn-tx);
+    border:1px solid rgba(232,163,61,.30);
+    animation: repIn .4s var(--ease);
+  }
+  /* 原文折叠：有白话解释时原文默认收起，否则同一件事在一条里出现两遍
+     （上面一句人话、下面一行「机器人主程序 调整检测间隔 …」） */
+  .log-detail { margin-top:3px; }
+  .log-detail > summary {
+    font-size:11px; color:var(--tx3); cursor:pointer; list-style:none;
+    display:inline-flex; align-items:center; gap:4px;
+    padding:1px 7px; border-radius:999px; border:1px solid var(--line);
+    background:var(--glass); user-select:none;
+    transition:color .18s var(--ease), background .18s var(--ease);
+  }
+  .log-detail > summary::-webkit-details-marker { display:none; }
+  .log-detail > summary:hover { color:var(--accent); }
+  .log-detail > summary::after {
+    content:'\25B8'; font-size:9px;
+    transition:transform .2s var(--ease);
+  }
+  .log-detail[open] > summary::after { transform:rotate(90deg); }
+  .log-detail[open] > .log-raw { animation: fxIn .26s var(--ease); }
+  .log-trans { font-size:12px; color:var(--tx2); }
+  .log-raw {
+    font-size:12px; color:var(--tx); word-break:break-all;
+    font-family:ui-monospace,Menlo,Consolas,monospace;
+    /* ⚠️ 多行正文要保留换行：后端把没有时间戳的续行（堆栈等）
+       合并进上一条，不保留换行就会挤成一坨，反而更看不清。 */
+    white-space:pre-wrap;
+  }
+
+  @media (max-width:620px){
+    .tl-item { grid-template-columns:1fr; }
+    .tl-clock { padding-top:0; }
+  }
+
+  /* ── 点击反馈 ──
+     分四层，缺一层就会觉得"点了没反应"：
+     1) 按下瞬间缩一下（:active）
+     2) 从按下那一点扩散涟漪（不是整块高亮）
+     3) 异步操作时按钮转圈 + 禁用（防重复点）
+     4) 结束后 toast 明确说成功/失败 */
+
+  .btn, .push, .nav-i, .tab { position:relative; overflow:hidden; }
+  .btn:active, .push:active { transform:scale(.955); }
+
+  .ripple {
+    position:absolute; border-radius:50%; pointer-events:none;
+    background:currentColor; opacity:.22;
+    transform:translate(-50%,-50%) scale(0);
+    animation:ripple .55s cubic-bezier(.22,1,.36,1) forwards;
+  }
+  @keyframes ripple {
+    to { transform:translate(-50%,-50%) scale(1); opacity:0; }
+  }
+
+  /* 转圈 + 禁用：让用户知道"正在做"，也防重复点 */
+  .btn.busy, .push.busy { opacity:.62; pointer-events:none; }
+  .btn.busy::before, .push.busy::before {
+    content:''; position:absolute; width:13px; height:13px;
+    border-radius:50%; border:2px solid rgba(255,255,255,.35);
+    border-top-color:#fff; animation:spin .8s linear infinite;
+    left:50%; top:50%; margin:-7px 0 0 -7px;
+  }
+  .btn.busy > *, .push.busy > * { visibility:hidden; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* toast：从下方弹入 */
+  #toast {
+    position:fixed; left:50%; bottom:26px; z-index:999;
+    /* ⚠️ 以前是 white-space:nowrap + 胶囊圆角：
+       长提示（比如一整句出错原因）会撑成一条横贯屏幕的长条，
+       窄屏上直接顶出屏幕外、后半句看不见。
+       现在允许换行、限宽、圆角收到 16px，长句也能完整读完。 */
+    max-width:min(560px, calc(100vw - 40px));
+    padding:10px 18px; border-radius:16px;
+    background:var(--card-solid); border:1px solid var(--line);
+    box-shadow:0 8px 28px rgba(0,0,0,.4);
+    font-size:13px; color:var(--tx);
+    white-space:pre-wrap; word-break:break-word;
+    line-height:1.5; text-align:center;
+    transform:translateX(-50%) translateY(18px) scale(.96);
+    opacity:0; pointer-events:none;
+    transition:transform .38s cubic-bezier(.34,1.56,.64,1), opacity .3s;
+  }
+  #toast.show { transform:translateX(-50%) translateY(0) scale(1); opacity:1; }
+  #toast.ok   { border-color:var(--ok);    color: var(--ok-tx); }
+  #toast.err  { border-color:var(--danger); color: var(--danger-tx); }
+
+  /* 大块按钮点完给个对勾，比只有 toast 更直观 */
+  .push.done { border-color:var(--ok); }
+  .push.done .ic::after {
+    content:' ✓'; color: var(--ok-tx); font-size:15px;
+  }
+
+  .panel { display:none; }
+  .panel.on { display:block; }
+  .note {
+    background:rgba(232,163,61,.10); border:1px solid rgba(232,163,61,.3);
+    border-radius:var(--r-sm); padding:10px 13px; font-size:12.5px;
+    color: var(--warn-tx); margin-bottom:15px;
+  }
+  /* 自检六行：左侧项目名，右侧检测到的参数。
+     未检测是灰色「未检测」，失败是红色，正常是主色。
+     ⚠️ 以前 .diag-row 只在 JS 里拼，**没有任何样式**，所以六行挤成一坨。 */
+  .diag-row {
+    display:flex; align-items:center; gap:10px;
+    padding:9px 12px; margin-bottom:7px;
+    background:var(--card2, rgba(127,127,127,.07));
+    border:1px solid var(--line); border-radius:var(--r-sm);
+    font-size:12.5px; line-height:1.5;
+  }
+  .diag-row .dk { flex:0 0 74px; color:var(--tx2); }
+  .diag-row .dv {
+    flex:1 1 auto; min-width:0; word-break:break-all; color:var(--tx);
+    /* 检测到的参数**右对齐**：左边是项目名，右边是值，一眼能对上 */
+    text-align:right;
+  }
+  .diag-row .dv.idle { color:var(--tx3); }
+  .diag-row .dv.ok { color: var(--blue-tx); }
+  .diag-row .dv.bad { color:var(--err, #FF6B6B); }
+  /* 详细参数不再直接铺在右边（六行长短不一，挤成一坨也对不齐），
+     右边只显示「未检测 / 通过 / 异常」，详细内容放进 data-tip，
+     鼠标移到这一行的状态上才浮出来看。 */
+  .diag-row .dv { position:relative; cursor:help; }
+  .diag-row .dv[data-tip]::after {
+    content:attr(data-tip);
+    position:absolute; right:0; bottom:calc(100% + 7px);
+    z-index:30; width:max-content; max-width:min(420px, 74vw);
+    padding:7px 11px; border-radius:var(--r-sm);
+    background:var(--card); border:1px solid var(--line);
+    box-shadow:0 8px 22px rgba(0,0,0,.28);
+    color:var(--tx); font-size:12px; line-height:1.55;
+    text-align:left; white-space:normal; word-break:break-word;
+    opacity:0; transform:translateY(4px); pointer-events:none;
+    transition:opacity .16s var(--ease), transform .16s var(--ease);
+  }
+  .diag-row .dv[data-tip]:hover::after {
+    opacity:1; transform:translateY(0);
+  }
+  /* 异常时**连提示一起标红**，扫一眼就知道是哪一项的问题 */
+  .diag-row .dv.bad[data-tip]::after {
+    color:var(--err, #FF6B6B);
+    border-color:color-mix(in srgb, var(--err, #FF6B6B) 45%, transparent);
+  }
+  /* 没跑过时提示是"去点重新自检"，用灰的，别跟异常混 */
+  .diag-row .dv.idle[data-tip]::after { color:var(--tx2); }
+
+  /* 「📊 当前数据」：UID / 直播间号 / 每轮检测结果收在这里，
+     鼠标移上去才展开 —— 详情直接铺开会把卡片撑得很高。
+     换行要保留，所以用 pre-line 而不是 normal。 */
+  .curdata {
+    flex:0 0 auto; align-self:center; cursor:help;
+    padding:5px 9px; border-radius:999px;
+    background:var(--card2, rgba(127,127,127,.07));
+    border:1px solid var(--line);
+    font-size:11.5px; color:var(--tx2); white-space:nowrap;
+    position:relative;
+  }
+  .curdata:hover { color: var(--blue-tx); border-color:var(--blue); }
+  .curdata[data-tip]::after {
+    content:attr(data-tip);
+    position:absolute; right:0; bottom:calc(100% + 7px);
+    z-index:40; width:max-content; max-width:min(420px, 74vw);
+    padding:8px 12px; border-radius:var(--r-sm);
+    background:var(--card); border:1px solid var(--line);
+    box-shadow:0 8px 22px rgba(0,0,0,.28);
+    color:var(--tx); font-size:12px; line-height:1.7;
+    text-align:left; white-space:pre-line; word-break:break-word;
+    opacity:0; transform:translateY(4px); pointer-events:none;
+    transition:opacity .16s var(--ease), transform .16s var(--ease);
+  }
+  .curdata[data-tip]:hover::after { opacity:1; transform:translateY(0); }
+
+  /* ── 详情浮层：挂在 body 下的**顶层**层 ──
+     ⚠️ 原来靠 CSS ::after 弹浮层，而 ::after 属于元素自己的层叠上下文：
+        ① .grp 群卡片有 overflow:hidden（折叠动画必须），浮层向上弹出
+           的那部分会被卡片**直接裁掉**，看着像"浮不出来"；
+        ② 它压不住后面的卡片，"不是顶层"。
+        改成 JS 定位的 #tipLayer（position:fixed + z-index:9999），
+        不受任何祖先的 overflow 与层叠上下文影响，永远在最上面。
+     开 JS 后给 <html> 加 .js-tips 关掉老的伪元素，避免两处都弹。 */
+  #tipLayer {
+    display:none; position:fixed; z-index:9999;
+    width:max-content; max-width:min(420px, 74vw);
+    padding:8px 12px; border-radius:var(--r-sm);
+    background:var(--card); border:1px solid var(--line);
+    box-shadow:0 10px 30px rgba(0,0,0,.34);
+    color:var(--tx); font-size:12px; line-height:1.7;
+    text-align:left; white-space:pre-line; word-break:break-word;
+    pointer-events:none;
+  }
+  html.js-tips .curdata[data-tip]::after,
+  html.js-tips .diag-row .dv[data-tip]::after { display:none !important; }
+
+  /* 「💬 登记群」里的已登记群列表 */
+  .gl-li { align-items:center; }
+  .gl-li .gl-tag {
+    flex:0 0 auto; font-size:11.5px; color:var(--tx2);
+    padding:3px 8px; border-radius:999px;
+    background:var(--card2, rgba(127,127,127,.07));
+  }
+  .gl-li .gl-ok {
+    flex:0 0 auto; font-size:11.5px; color:var(--ok, #3ddc97);
+    padding:3px 9px; border-radius:6px;
+    background:color-mix(in srgb, var(--ok, #3ddc97) 14%, transparent);
+  }
+  /* 群搜索框别占满一屏 */
+  .sub-search { padding:13px 15px; }
+  .sub-search .row { margin-bottom:8px; }
+
+  /* 「立即检测」的结果区：每个触发点一份（概况页/自检页/运行状态页） */
+  .check-now-out { margin-top:12px; }
+  .check-now-out:empty { margin-top:0; }
+  .dcard-note { color:var(--tx2); font-size:12px; margin:6px 0 8px; }
+  .dcard-body-full { display:block; }
+  .diag-card {
+    border:1px solid var(--bd, rgba(255,255,255,.12));
+    border-radius:10px; padding:11px 13px; margin-bottom:10px;
+    background:var(--bg2, rgba(255,255,255,.03));
+    transition:border-color .6s ease, box-shadow .6s ease;
+  }
+  /* 新跑出来的一块先亮一下再淡出，方便一眼定位 */
+  .diag-card.flash {
+    border-color:var(--blue, #4A9EFF);
+    box-shadow:0 0 0 3px rgba(74,158,255,.18);
+  }
+  .dcard-head {
+    display:flex; flex-wrap:wrap; gap:10px; align-items:baseline;
+    font-size:12px; color:var(--tx2); margin-bottom:8px;
+  }
+  .dcard-head .dt { font-weight:600; color:var(--tx); }
+  .dcard-head .dsrc { color:var(--blue, #4A9EFF); }
+  .dcard-head .duid { color:var(--tx2); }
+  /* ══════════════════════════════════════════════════════════
+     美术风格（统一补齐）
+     一套贯穿全页的视觉规则，避免各元素各画各的：
+     · 品牌色粉→蓝渐变只用在"强调处"（主按钮 / 标题条 / 选中态）
+     · 卡片统一：半透明底 + 1px 细边 + 顶部一道极淡高光（做出玻璃厚度）
+     · 层级：靠**背景明度差**拉开，不靠加重边框
+     · 圆角三档 r-lg / r-md / r-sm，不出现第四种
+     ══════════════════════════════════════════════════════════ */
+
+  /* 卡片：顶部一道极淡高光 —— 让平面卡片有"玻璃厚度"，
+     比单纯加阴影干净，日间模式下也不会显脏。 */
+  .card {
+    position:relative;
+    background:var(--card); border:1px solid var(--line);
+    border-radius:var(--r-md); padding:17px 19px; margin-bottom:14px;
+    box-shadow:var(--shadow);
+  }
+  .card::before {
+    content:''; position:absolute; inset:0 0 auto 0; height:1px;
+    border-radius:var(--r-md) var(--r-md) 0 0;
+    background:linear-gradient(90deg, transparent,
+      color-mix(in srgb, var(--pink) 30%, transparent), transparent);
+    opacity:.5; pointer-events:none;
+  }
+  /* 标题条：左侧一道渐变竖条，一眼看出这块是什么 */
+  .card > h3 {
+    position:relative; padding-left:11px;
+  }
+  .card > h3::before {
+    content:''; position:absolute; left:0; top:2px; bottom:2px; width:3px;
+    border-radius:2px; background:var(--grad); opacity:.85;
+  }
+
+  /* 板块大标题：渐变字 + 下面一道渐隐线 */
+  .hd { position:relative; margin-bottom:20px; }
+  .hd h1 {
+    margin:0 0 4px; font-size:21px; font-weight:700; letter-spacing:.2px;
+    /* ⚠️ 不再用 background-clip:text 做渐变字：
+       1) --grad 现在是单色，渐变字没意义
+       2) 这特性有个老坑：不支持时文字会**全透明看不见**
+       直接用纯色，最稳。 */
+    color:var(--tx);
+  }
+  .hd p { margin:0; color:var(--tx3); font-size:13px; }
+
+  /* 品牌区：dot 单色（--grad 已是单色） */
+  .brand .dot {
+    background:var(--grad); box-shadow:0 0 10px color-mix(in srgb, var(--pink) 60%, transparent);
+  }
+
+  /* 输入控件：统一圆角与聚焦样式。
+     聚焦用**双层**光圈（内白外粉），比单层描边更有质感。 */
+  input, select, textarea {
+    border-radius:var(--r-sm);
+    border-color:var(--line);
+    transition:border-color .2s var(--ease), box-shadow .2s var(--ease);
+  }
+  input:focus, select:focus, textarea:focus {
+    outline:none;
+    border-color:color-mix(in srgb, var(--pink) 55%, var(--line));
+    box-shadow:0 0 0 3px color-mix(in srgb, var(--pink) 16%, transparent);
+  }
+  /* 键盘用户 Tab 过来时要看得见（无障碍） */
+  .nav-i:focus-visible, .tab:focus-visible, .theme-btn:focus-visible {
+    outline:2px solid var(--blue); outline-offset:2px;
+  }
+
+  /* 滚动条：细一点，别抢注意力 */
+  ::-webkit-scrollbar { width:9px; height:9px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb {
+    background:color-mix(in srgb, var(--tx3) 34%, transparent);
+    border-radius:99px; border:2px solid transparent; background-clip:content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background:color-mix(in srgb, var(--pink) 50%, transparent);
+    background-clip:content-box;
+  }
+
+  /* 标签：统一胶囊形，选中态用品牌蓝 */
+  .tag {
+    border-radius:999px;
+    border-color:color-mix(in srgb, var(--tx3) 24%, transparent);
+  }
+  /* 危险按钮：悬停才变红，平时保持克制 */
+  .btn.dg:hover {
+    border-color:color-mix(in srgb, var(--danger) 60%, var(--line));
+    background:color-mix(in srgb, var(--danger) 12%, transparent);
+    color: var(--danger-tx);
+  }
+
+
+  /* ══════════════════════════════════════════════════════════
+     卡片：日间 / 夜间**两种形态**，不是换个颜色就完事
+     · 日间：实白底 + 更淡的阴影 + 更清的边 —— 白底本来就亮，
+             再加浓阴影会显脏，靠"实"和"边"来分层
+     · 夜间：半透明玻璃 + 顶部内发光 —— 暗底靠"微透"和"内高光"
+             做出层次，纯色块在暗背景上会像贴纸
+     两种模式的目标一致：正文对比度够、层次清楚、不刺眼。
+     ══════════════════════════════════════════════════════════ */
+  /* ⚠️⚠️ 一级玻璃容器：**必须同一套**背景 + backdrop-filter。
+     之前 .kpi 用的是 var(--card)（半透明、无 backdrop），
+     而 .card 有 backdrop 压亮 —— 两者视觉不一致，出现"卡片和指标块
+     不是一个底色"的色差。现在 .card / .kpi 共用同一组。 */
+  [data-theme="light"] .card, [data-theme="light"] .kpi {
+    /* ⚠️ 这两个是**硬编码**的，不走 --card 变量 —— 改变量对它们无效。
+       .74 太透：白卡片压不住背后的光斑，和背景几乎同色，看不出边界。
+       提到 .90，保留一点玻璃感但能压住背景。 */
+    background:rgba(255,255,255,.90);
+    /* 白底上要"提亮"透进来的背景（brightness 1.06 + 去饱和），
+       否则背后的光斑会让白底发脏、字发灰。 */
+    -webkit-backdrop-filter:blur(12px) saturate(105%) brightness(1.06);
+    backdrop-filter:blur(12px) saturate(105%) brightness(1.06);
+  }
+  [data-theme="light"] .card {
+    box-shadow:0 2px 10px rgba(30,40,80,.10);
+    /* 边框同样硬编码：.13 的对比度只有约 1.3，白卡片糊在背景里。
+       提到 .20（约 1.5），边界才看得出来。 */
+    border-color:rgba(20,30,60,.20);
+  }
+  [data-theme="light"] .kpi {
+    box-shadow:0 2px 10px rgba(30,40,80,.09);
+    border-color:rgba(20,30,60,.17);
+  }
+  @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
+    [data-theme="light"] .card, [data-theme="light"] .kpi { background:#FFFFFF; }
+  }
+  [data-theme="light"] .card::before { opacity:.32; }
+
+  /* 待办条：橙色渐变**叠在**同一层玻璃上（多层 background-image，
+     橙色在上、玻璃在下），避免它比卡片更透而显得"不是一块"。 */
+  [data-theme="light"] .todo {
+    background-image:linear-gradient(90deg, rgba(232,163,61,.16), transparent);
+    background-color:rgba(255,255,255,.90);
+    -webkit-backdrop-filter:blur(12px) saturate(105%) brightness(1.06);
+    backdrop-filter:blur(12px) saturate(105%) brightness(1.06);
+  }
+
+  /* ⚠️ 二级块（列表行 / 开关行）：**只用普通 rgba，不加 backdrop-filter**。
+     它们已经在一级玻璃**里面**了 —— 嵌套 backdrop-filter 会二次采样
+     父元素合成后的画面，再压一次亮度，结果就是比周围暗/亮一截，
+     看起来像"多叠了一层背景"。父级磨砂过，子级不该再磨砂。 */
+  /* ⚠️ .li / .sw 默认**不给背景色**：卡片已经是半透明玻璃，行里再叠一层
+     就是第三层叠加 —— 白天深色行在白卡上显黑、夜间白色行在暗卡上显亮，
+     正是反馈的"色差/叠了个背景"。改用**分隔线**区分行，底色与卡片完全一致。
+     只在 hover 时才给一点点色。 */
+  [data-theme="light"] .li, [data-theme="light"] .sw {
+    background:transparent;
+  }
+  /* 悬浮高亮已改 ::before 圆角块（见 .li::before），颜色由 --li-hv 给 */
+  [data-theme="light"] input, [data-theme="light"] select,
+  [data-theme="light"] textarea {
+    background:#FBFCFE; border-color:rgba(20,30,60,.22);
+  }
+
+  /* 夜间：半透明磨砂，**约 60% 不透明度 + 偏黑**。
+     关键是 backdrop-filter 里的 brightness(.42)：
+     把透进来的背景光斑**压暗**再糊开 —— 这样既有玻璃质感、
+     能看到背后在动，文字底下又是均匀的暗面，**不会发灰失焦**。
+     只降不透明度不压亮度的话，光斑会直接透到字底下，就是"失焦感"的来源。 */
+  /* ⚠️ 同日间：.card / .kpi 共用完全相同的玻璃参数，消除色差。 */
+  [data-theme="dark"] .card, [data-theme="dark"] .kpi {
+    background:linear-gradient(180deg,
+      rgba(12,16,24,.66), rgba(8,11,17,.60));
+    -webkit-backdrop-filter:blur(12px) saturate(120%) brightness(.42);
+    backdrop-filter:blur(12px) saturate(120%) brightness(.42);
+    box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.055);
+  }
+  /* ⚠️ 这里**不要**给文字加 text-shadow：半透明卡上想"稳住对比度"很自然会想到
+     加阴影，但 text-shadow 会让字**发糊**，正是"失焦感"的另一半来源。
+     正确做法是压暗透进来的背景（brightness(.42)）+ 提亮字色，不动字本身。 */
+  /* ⚠️ 兜底：不支持 backdrop-filter 时，60% 半透明会直接透出背景，
+     文字像浮在花纹上 —— 退回接近实心，宁可没磨砂也要好读。 */
+  @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) {
+    [data-theme="dark"] .card, [data-theme="dark"] .kpi { background:rgba(16,20,30,.95); }
+  }
+  [data-theme="dark"] .card::before { opacity:.6; }
+
+  /* 待办条：橙色渐变叠在同一层玻璃下（多层 background-image） */
+  [data-theme="dark"] .todo {
+    background-image:linear-gradient(90deg, rgba(232,163,61,.15), transparent);
+    background-color:rgba(10,14,21,.63);
+    -webkit-backdrop-filter:blur(12px) saturate(120%) brightness(.42);
+    backdrop-filter:blur(12px) saturate(120%) brightness(.42);
+  }
+
+  /* ⚠️⚠️ 二级块：**去掉 backdrop-filter**（原来有 blur(12px) brightness(.5)）。
+     这是"叠了个背景"的主因 —— 嵌套 backdrop-filter 会二次采样父卡片
+     合成后的画面再压一次亮度，于是列表行/开关行比同一张卡片里的其他
+     区域明显暗一截。二级块只需一层普通半透明提亮即可。 */
+  [data-theme="dark"] .li, [data-theme="dark"] .sw {
+    background:transparent;
+  }
+  /* 同上：夜间由 --li-hv 给 */
+  /* 夜间：跟随光再压一层，避免暗底上看不出在动 */
+  [data-theme="dark"] .fx-tilt:hover::after { opacity:1; }
+
+  /* 侧边栏：日间实心、夜间稍深，跟主区拉开一点 */
+  [data-theme="dark"] .side {
+    background:rgba(19,23,34,.90);
+    -webkit-backdrop-filter:blur(12px) saturate(135%);
+    backdrop-filter:blur(12px) saturate(135%);
+  }
+
+  /* 3D 倾斜：幅度已经降到 ±1.2°（原 ±4°，反馈"晕"）。
+     ⚠️ 如果还是觉得晃，把 JS 里的系数 2.4 改成 0 就能彻底关掉，
+        高光跟随仍会保留。 */
+  @media (prefers-reduced-motion: reduce) {
+  }
+
+  /* ══════════════════════════════════════════════════════════
+     桥接规则：布局草稿里没有、但 app.js 运行时需要的几条
+     ══════════════════════════════════════════════════════════ */
+  /* 选项卡子面板：草稿靠 JS 直接改 style.display，正式版由 app.js
+     切 class 控制，所以这里补上显示规则（否则 4 个选项卡会全显示）。 */
+  .sub-panel { display:none; }
+  .sub-panel.on, .sub-panel.show { display:block; }
+  /* 多个群卡片之间留间距 */
+  .grp { margin-bottom:13px; }
+  /* .hero / .tile / .empty / .msg 等由 app.js 动态渲染的样式
+     在 style.css 里已有定义，这里不重复写，避免两套规则打架。 */
+
+  /* ══════════════════════════════════════════════════════════
+     覆盖 style.css 里的旧规则（合并时两套 CSS 并存，旧的会漏出来）
+     ══════════════════════════════════════════════════════════ */
+  /* ① 心跳：用户明确要求"渐变是没有边框的"。
+     style.css 里 .hb-frame::before 画了 1px 描边、::after 用底色
+     伪装两端淡出 —— 内联版是"无背景 + mask 真透明"，把这两个旧的关掉。 */
+  .hb-frame::before, .hb-frame::after { display:none !important; }
+
+  /* ② 等级徽章：app.js 侧边栏账户卡用的是 .lv-badge.lv-N，
+     而 style.css 里那套是**渐变**（LV6 = 橙粉 #FF8A5B→#FB7299），
+     不是 B站官方色。这里覆盖成官方配色（与 .acc-lv.lvN 一致）。
+       LV0/1 灰 · LV2 绿 · LV3 蓝 · LV4 橙黄 · LV5 橙红 · LV6 红 */
+  .lv-badge.lv0, .lv-badge.lv1 { background:#C0C0C0; color:#2B2B2B; }
+  .lv-badge.lv2 { background:#8BD29B; color:#12331F; }
+  .lv-badge.lv3 { background:#7BCDEF; color:#0E2F3E; }
+  .lv-badge.lv4 { background:#FEBB8B; color:#4A2A0B; }
+  .lv-badge.lv5 { background:#EE672A; color:#FFFFFF; }
+  .lv-badge.lv6 { background:#F04C49; color:#FFFFFF; }
+  /* LV2~LV5 底色偏浅，白字对比度不够 → 每级单独配深色字；
+     只有 LV6 底色够深才用白字。 */
+  .lv-badge { background-image:none !important; font-weight:700; }
+
+  /* ③ 主题切换：圆形扩散，从按钮那一点铺满屏幕。
+     ⚠️ 「闪在收尾」的三条来源，逐条堵死，别再退回去：
+       (a) 两份快照的叠放顺序不能只靠 UA 默认 → 显式 z-index，新压在旧上。
+           旧快照全程不透明（animation:none 关掉了 UA 的默认淡出），
+           只要叠放反过来，收尾看到的就是旧主题。
+       (b) 关键帧只写 to 时，起点是"隐式值"；终态半径若比视口对角差 1px，
+           最后一帧角落就露出旧快照，伪元素销毁时才被纠正成新主题 ——
+           这一下正是收尾的闪。→ from/to 都写，半径由 JS 留余量。
+       (c) 动画结束若没有 forwards，clip-path 会弹回 circle(0)，整屏被裁。
+       (d) 伪元素销毁与真 DOM 首帧绘制挤在同一帧 → 见 app.js 的延迟解锁。 */
+  ::view-transition-old(root), ::view-transition-new(root) {
+    animation:none; mix-blend-mode:normal;
+  }
+  ::view-transition-old(root) { z-index:1; }
+  ::view-transition-new(root) {
+    z-index:2;
+    animation:themeReveal .5s var(--ease) forwards;
+    clip-path:circle(0 at var(--theme-x, 50%) var(--theme-y, 50%));
+    will-change:clip-path;
+  }
+  @keyframes themeReveal {
+    from { clip-path:circle(0 at var(--theme-x, 50%) var(--theme-y, 50%)); }
+    to   { clip-path:circle(var(--theme-r, 150vmax)
+           at var(--theme-x, 50%) var(--theme-y, 50%)); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    /* ⚠️ 关掉动画时必须同时撤掉裁切：只写 animation:none 会把新快照
+       留在 clip-path:circle(0) 上，整屏只剩旧快照 —— 那也是一次闪。 */
+    ::view-transition-new(root) { animation:none; clip-path:none; }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     ④ 补齐 v1.31.4 重建时漏掉的样式
+     ⚠️ 这些 class 在 index.html / app.js 里都在用，但既不在
+        style.css 也不在内联样式里 —— 没有样式 = 裸元素。
+        最典型的是 #tplSheet：它是页面末尾的普通 div，
+        没有弹层样式就会**常驻显示在页面左下角**。
+        以后新增元素务必同步加样式。
+     ═══════════════════════════════════════════════════════════ */
+
+  /* 文案编辑弹层：默认必须藏起来，靠 .show 打开 */
+  #tplSheet {
+    position:fixed; inset:0; z-index:80;
+    display:flex; align-items:center; justify-content:center;
+    padding:24px; background:rgba(0,0,0,.45);
+    visibility:hidden; opacity:0; pointer-events:none;
+    transition:opacity .18s var(--ease), visibility .18s;
+  }
+  #tplSheet.show { visibility:visible; opacity:1; pointer-events:auto; cursor:pointer; }
+  #tplSheet.show .tpl-box { cursor:auto; }
+  .tpl-box {
+    width:min(560px, 100%); max-height:min(76vh, 640px);
+    display:flex; flex-direction:column;
+    background:var(--card-solid); border:1px solid var(--line);
+    border-radius:var(--r); box-shadow:var(--sh-lg, 0 18px 50px rgba(0,0,0,.4));
+    overflow:hidden;
+  }
+  .tpl-hd {
+    display:flex; align-items:center; gap:10px;
+    padding:13px 15px; border-bottom:1px solid var(--line);
+    font-size:14px; font-weight:600; flex:none;
+  }
+  .tpl-hd b { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+  #tplSheetBody { padding:15px; overflow:auto; }
+
+  /* B站账户/UP主查询结果卡：头像 + 昵称 + UID 一行 */
+  .up-card {
+    display:flex; align-items:center; gap:10px;
+    padding:10px 12px; border-radius:var(--r-sm);
+    background:var(--glass); border:1px solid var(--line);
+  }
+  .up-card > img, .up-card .bili-avatar {
+    width:38px; height:38px; border-radius:50%; flex:none;
+    object-fit:cover; display:flex; align-items:center; justify-content:center;
+    background:var(--glass-2, var(--glass)); font-size:18px;
+  }
+  .up-card > div { min-width:0; }
+  .up-card .n { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .up-card .u { font-size:11.5px; color:var(--tx3); margin-top:2px; }
+
+  /* 浏览器登录进度：.progress-bar > i 只认 i 标签，
+     而 app.js 生成的是 div.progress-fill → 填充条没有宽度样式 */
+  .progress-wrap { display:flex; flex-direction:column; gap:7px; }
+  .progress-fill {
+    height:100%; width:0; border-radius:inherit;
+    background:var(--grad-bar);
+    transition:width .3s var(--ease);
+  }
+
+  /* 提示块 / 副标题 / 状态补充 / KPI 数字 / 二维码状态 */
+  .hint-block {
+    padding:10px 12px; border-radius:var(--r-sm);
+    background:var(--glass); border:1px solid var(--line);
+    font-size:12.5px; color:var(--tx2); line-height:1.7;
+  }
+  .hd-sub { font-size:12.5px; color:var(--tx3); margin-top:2px; }
+  .st-extra { font-size:12px; color:var(--tx3); }
+  .kpi-num { font-variant-numeric:tabular-nums; }
+  .qr-status {
+    display:flex; align-items:center; gap:8px;
+    font-size:13px; color:var(--tx2);
+  }
+
+  /* 更新日志：分组标题 + 等级标签 */
+  .cl-group {
+    font-size:12px; font-weight:600; color:var(--tx2);
+    margin:10px 0 5px;
+  }
+  .cl-lv {
+    font-size:10.5px; padding:1px 7px; border-radius:999px;
+    background:var(--glass); color:var(--tx3); border:1px solid var(--line);
+  }
+
+  /* 文案输入框：弹层里的，得有输入框样子 */
+  .stpl-in, .utpl-in {
+    width:100%; padding:7px 10px; font-size:13px;
+    border-radius:var(--r-sm); border:1px solid var(--line);
+    background:var(--inp, var(--glass)); color:var(--tx);
+  }
+  .stpl-in:focus, .utpl-in:focus { outline:none; border-color:var(--blue); }
+
+  /* 侧边栏版本号 */
+  .ver { font-variant-numeric:tabular-nums; }
+
+  /* 沙盒群卡片高亮：.card.flash 的动画在上面已定义（@keyframes flashCard）。
+     这里只补「减少动效」时的降级 —— 系统开了减少动效就别闪，
+     改成静态描边提示，一样能认出是哪张卡片。 */
+  @media (prefers-reduced-motion: reduce) {
+    .card.flash { animation:none; border-color:var(--blue); }
+  }
+</style>
+</head>
+<body>
+
+<!-- 顶部加载光带：点按钮/提交时才走，自动刷新不亮（否则一直闪） -->
+<div id="topLoad" aria-hidden="true"></div>
+
+<!-- 背景光斑 + 指针柔光：都是装饰层，pointer-events:none 不挡操作 -->
+<div class="bgfx" aria-hidden="true"><span></span><span></span><span></span></div>
+<div class="bg-glow" id="bgGlow" aria-hidden="true"></div>
+
+<div class="app">
+
+  <!-- ═══ 侧边栏：五个板块 ═══ -->
+  <aside class="side">
+    <div class="brand"><span class="dot"></span>B站消息订阅工具</div>
+
+    <!-- B站账户：登录了显示头像/等级/UID，没登录显示去登录。
+         点了跳到 凭据 → B站登录。 -->
+    <div id="accCard" class="acc" data-act="goto-tab" data-sec="cred" data-tab="bili"></div>
+
+    <nav class="nav">
+      <button class="nav-i on" data-act="goto-sec" data-sec="home"><span class="ic">🏠</span>概况</button>
+      <button class="nav-i" data-act="goto-sec" data-sec="cred"><span class="ic">🔐</span>凭据</button>
+      <button class="nav-i" data-act="goto-sec" data-sec="subs"><span class="ic">📺</span>订阅</button>
+      <button class="nav-i" data-act="goto-sec" data-sec="diag"><span class="ic">🧪</span>测试与诊断</button>
+      <button class="nav-i" data-act="goto-sec" data-sec="setup"><span class="ic">⚙️</span>设置</button>
+    </nav>
+    <!-- 日/夜间切换：放在左下角，底部那行字的**上方**。
+         图标会转着换（☀️⇄🌙），不是硬切。 -->
+    <div class="side-theme">
+      <button class="theme-btn" id="themeBtn"
+              title="切换日间 / 夜间" aria-label="切换主题"><span class="tg">🌙</span></button>
+      <span class="side-theme-tx" id="themeTx">夜间</span>
+    </div>
+    <!-- 左下角版本行：居中，格式「OnOiduts工业 · v2.0.5」
+         ⚠️ 品牌名回退到最早那版「OnOiduts工业」：v2.0.1 正式更名时把它换成了
+            缩写 OnOBN，作者要求原样留在左下角这个位置，只把整块做成可点的
+            GitHub 链接。位置和排版都不动，只是 span 换成 a。
+         ⚠️ 别在注释里写别的旧名：品牌名检查是全站朴素扫描，
+            注释里出现旧名会被误判成"还在用旧名"（踩过一次）。 -->
+    <div class="side-foot"><a class="sf-brand" id="sfBrand"
+        href="https://github.com/XxBoLuoxX" target="_blank"
+        rel="noopener noreferrer"
+        title="OnOB站通知订阅工具（OnO Bilibili Notifier）· 打开 GitHub 主页">OnOiduts工业</a><span class="sf-sep">·</span><span class="ver">v{{ app_version }}</span></div>
+  </aside>
+
+  <!-- ═══ 主区 ═══ -->
+  <main class="main">
+
+    <!-- 顶部常驻状态条：任何板块都在最上面 -->
+    <div class="topbar">
+      <div class="tb-i" id="tbSb" data-act="goto-sandbox" style="cursor:pointer">沙盒群 <b id="tbSbName">未设置</b></div>
+      <!-- 机器人的点 = 普通在线状态灯（绿=在线 / 红=未运行），不跟心跳节奏联动 -->
+      <div class="tb-i"><span class="d" id="botLed"></span>机器人 <b id="botTx">检查中…</b></div>
+      <!-- 心跳指示灯放轮询前：常亮呼吸=活着，变红=异常（机器人在跑轮询才跑得起来） -->
+      <div class="tb-i"><span class="d hb-led" id="hbLed"></span>轮询 <b id="tbIv">12s</b></div>
+      <!-- 心跳 = 渐变框 + 框内滚动；滚动周期 = 轮询间隔，每秒搏动一下 -->
+      <div class="tb-i hb" id="tbHb" title="心跳：一轮轮询 = 一次心跳，波形在渐变框内滚动；没启动时是一条红线">
+        <div class="hb-frame">
+          <svg class="hb-wave" id="hbSvg" viewBox="0 0 240 20"
+               preserveAspectRatio="none" aria-hidden="true">
+            <path class="hb-line" id="hbPath" vector-effect="non-scaling-stroke" d=""/>
+          </svg>
+        </div>
+      </div>
+      <div class="tb-i" id="tbBili" data-act="goto-tab" data-sec="cred" data-tab="bili" style="cursor:pointer" title="点击去登录 / 续期"><span class="d"></span>B站 <b id="tbBiliTx">未登录</b></div>
+      <div class="tb-sp"></div>
+      <!-- updateStatusBar 用的状态文本；显示由 #botTx 负责，这里只承载数据 -->
+      <span id="liveText" hidden></span>
+      <button class="tb-btn" data-act="refresh-state">🔄 刷新</button>
+    </div>
+
+    <!-- ───── 概况 ───── -->
+    <section class="panel sec" id="ov" data-sec="home">
+      <div class="hd"><h1>概况</h1><p>一开门就知道：机器人活着吗、有多少订阅、最近有没有出错</p></div>
+
+      <!-- 新手引导：凭据没填时才出现，填了自动消失 -->
+      <div id="guideBox"></div>
+
+      <!-- Hero 状态条：机器人活着 / 没跑 / 还差凭据 -->
+      <div id="heroBox" class="hero"></div>
+
+      <!-- 待办：把散在各处的异常聚成清单，每条点了直达处理 -->
+      <div id="todoBox"></div>
+
+      <!-- 四张指标卡：数字由 JS 填，点了跳到对应板块 -->
+      <div id="statsBox" class="grid g4" style="margin-bottom:14px"></div>
+
+      <div class="grid g2">
+        <div class="card">
+          <h3>🩺 健康度</h3>
+          <!-- 四项各占 25%；不正常的项整行可点，直接跳过去处理 -->
+          <div id="healthBox"></div>
+        </div>
+        <div class="card">
+          <h3>⚡ 快捷操作</h3>
+          <div class="btns">
+            <button class="btn pri" data-act="test-push">📤 发条测试</button>
+            <button class="btn" data-act="diagnose">🧪 跑一次自检</button>
+            <button class="btn" data-act="refresh-names">🏷️ 刷新群名</button>
+            <button class="btn" data-act="check-now">⚡ 立即检测</button>
+            <button class="btn" data-act="restart-bot">🔄 重启机器人</button>
+            <!-- ⚠️ 只在 B站未登录/已过期时出现（JS 控制显隐）。
+                 Cookie 过期是最高频的故障，续期入口必须能一步直达，
+                 不能让人先去猜在哪个板块。 -->
+            <button class="btn" id="quickBiliLogin" data-act="bili-browser" hidden>🍪 登录 B站</button>
+          </div>
+          <!-- ⚠️ 群名由 JS 统一更新（#sbName），不是写死文字。
+               用 .note（有边框的提示块）而不是裸 .hint，并且**只显示群名**，
+               不拼群号 —— 群号看着像乱码，也容易误当成要填的东西。 -->
+          <div class="note" style="margin-top:12px;margin-bottom:0">测试消息默认发到沙盒群 <a class="lnk" id="sbName" data-act="goto-sandbox">未设置</a>，卡片最上面会多一行「🧪 测试」</div>
+          <div id="quickMsg" class="msg"></div>
+          <div id="checkNowBoxQuick" class="check-now-out"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>📋 最近动态</h3>
+        <div id="recentBox"></div>
+      </div>
+    </section>
+
+<section class="panel sec" id="cr" data-sec="cred">
+      <div class="hd"><h1>凭据</h1><p>QQ 和 B站的登录信息放一起</p></div>
+      <div class="tabs">
+        <button class="tab on" data-act="goto-tab" data-sec="cred" data-tab="qq">QQ 凭据</button>
+        <button class="tab" data-act="goto-tab" data-sec="cred" data-tab="bili">B站登录</button>
+        <button class="tab" data-act="goto-tab" data-sec="cred" data-tab="sec">🔒 安全</button>
+      </div>
+
+      <div class="sub-panel" id="cr-qq" data-tab="qq">
+        <div class="card" id="qqCard">
+          <h3>🤖 机器人凭据</h3>
+          <div class="row"><label>AppID</label><input id="cAppid" placeholder="QQ 开放平台 → 机器人 → 开发设置"></div>
+          <div class="row"><label>AppSecret</label><input id="cSecret" type="password" placeholder="留空 = 不修改">
+            <div class="hint">已加密存储，看不到原文</div></div>
+          <div class="row"><label>当前状态</label>
+            <div class="hint" id="credSaved" style="margin:0">读取中…</div></div>
+          <div class="row"><label>沙箱环境</label>
+            <div class="sw" style="border:none;padding:0">
+              <div><div class="nm">使用沙箱接口</div><div class="ds">正式环境请关闭</div></div>
+              <label class="sw-btn"><input type="checkbox" id="cSandbox" style="display:none"></label>
+            </div>
+          </div>
+          <div class="btns">
+            <button class="btn pri" data-act="save-cfg">💾 保存</button>
+            <button class="btn" data-act="diagnose">🔌 测试连接</button>
+          </div>
+          </div>
+      </div>
+
+      <div class="sub-panel" id="cr-bili" data-tab="bili">
+        <div class="card" id="biliCard">
+          <h3>🍪 B站登录</h3>
+          <div class="note" id="biliState">读取中…</div>
+
+          <!-- ⚠️ 只剩两种方式。原来还有「📷 获取二维码 / 🔄 重新扫码」，
+               那两个走 B站扫码接口，**经常拿不到 SESSDATA**（被风控）。
+               浏览器登录能绕开这个风控，是推荐方式。 -->
+          <div class="row"><label>登录 / 续期</label>
+            <div class="btns">
+              <button class="btn pri" data-act="bili-browser">🌐 浏览器登录（推荐）</button>
+              <button class="btn" data-act="bili-refresh">🔄 续期</button>
+              <button class="btn dg" data-act="bili-logout">🗑️ 清除登录</button>
+            </div>
+            <div class="hint">
+              浏览器登录会弹出一个真窗口，在里面登录完这里自动更新；
+              <b>已登录也能再点一次，用来续期</b>。
+              <br>第一次会装 playwright（约 1-2 分钟），也可双击 <code>获取Cookie.bat</code>
+            </div>
+          </div>
+
+          <!-- 浏览器登录的状态区：由 JS 动态填充 -->
+          <div id="browserBox"></div>
+
+          <!-- ⚠️ 「手动填 Cookie」和「SESSDATA」本来就是同一个东西 —— 
+               程序只存 SESSDATA 一段，粘整串 Cookie 也是从里面摘出来。
+               以前分成两个框，看着像两种不同配置，其实是同一个。
+
+               v1.62.0：手动填写默认收起 —— 绝大多数人用「浏览器登录」就够了，
+               两个大框常驻会把推荐路径挤到下面，也容易让人以为必须手填。
+               点一下「✍️ 手动填写」才展开。 -->
+          <div class="btns" style="margin-top:10px">
+            <button class="btn" id="cookieToggle" data-act="toggle-cookie"
+                    aria-expanded="false" aria-controls="cookieManual">✍️ 手动填写</button>
+          </div>
+          <div id="cookieManual" hidden>
+            <div class="row">
+              <label>Cookie / SESSDATA</label>
+              <textarea id="cookieText" placeholder="粘贴整串 Cookie，或只填 SESSDATA=... 一段"></textarea>
+              <div class="hint">粘整串也行 —— 程序只会从中取 <code>SESSDATA</code>，其余忽略</div>
+            </div>
+            <div class="btns"><button class="btn pri" data-act="save-cookie">💾 保存</button></div>
+          </div>
+          <div id="biliMsg" class="msg"></div>
+          <div id="biliMsg2" class="msg"></div>
+          <div class="hint" style="margin-top:8px">当前登录状态：<b id="sessState">读取中…</b></div>
+        </div>
+      </div>
+
+      <div class="sub-panel" id="cr-sec" data-tab="sec">
+        <div class="card" id="secCard">
+          <h3>🔒 安全体检</h3>
+          <div class="warn-box" style="margin-bottom:11px">
+            <span>⚠️ <b>安全功能从未实际测试过。</b>
+            下面这些防护只验证过「功能能跑通」（设了口令确实要登录、连错会锁定），
+            <b>从未做过真正的安全测试或代码审计</b>。能跑通 ≠ 挡得住攻击，
+            请勿在需要真实防护的场景依赖它，也不要把面板暴露到公网。</span>
+          </div>
+          <div class="hint" style="margin-bottom:11px">对照 security_report() 的五项检查；有问题的项可点击直达处理</div>
+          <div id="safeBox"></div>
+          <div class="warn-box" style="margin-top:12px">
+            <span>⚠️ 如果改成了 0.0.0.0 对外暴露，必须设置口令，否则同网段任何人都能操作面板</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>🔑 访问口令</h3>
+          <div class="row">
+            <label>新口令</label>
+            <input id="newPwd" type="password" placeholder="至少 6 位">
+            <div class="hint">填新口令后点「💾 设置口令」；明文输入 → 存成哈希，配置文件里不留明文</div>
+          </div>
+          <div class="btns">
+            <button class="btn pri" data-act="set-pwd">💾 设置口令</button>
+            <button class="btn dg" data-act="clear-pwd">🗑️ 清除口令</button>
+          </div>
+          <div id="pwdMsg" class="msg"></div>
+          <div class="hint" style="margin-top:9px">当前状态：<b id="pwdState">未设置</b></div>
+        </div>
+
+        <div class="card">
+          <h3>🛡️ 登录状态</h3>
+          <div class="grid g3">
+            <div class="kpi ok"><div class="lb">我的 IP</div><div class="vl" style="font-size:15px" id="secIp">–</div><div class="sb" id="secIpNote">–</div></div>
+            <div class="kpi"><div class="lb">失败次数</div><div class="vl" id="secFails">0</div><div class="sb">累计</div></div>
+            <div class="kpi ok"><div class="lb">锁定状态</div><div class="vl" style="font-size:15px" id="secLock">未锁定</div><div class="sb">连续输错会临时锁</div></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>🛡️ 加固状态</h3>
+          <div id="hardBox"></div>
+          <div class="btns" style="margin-top:12px">
+            <button class="btn dg" data-act="unban-ip">🔓 解封本机 IP</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>📜 最近安全事件</h3>
+          <div class="hint" style="margin-bottom:10px">记录登录、改配置、删订阅等敏感操作，最多 20 条</div>
+          <div id="auditBox"><div class="empty" style="padding:14px">读取中…</div></div>
+        </div>
+      </div>
+    </section>
+
+<section class="panel sec" id="sub" data-sec="subs">
+      <div class="hd"><h1>订阅</h1><p>群、UP 主、合集都在这里管</p></div>
+      <div class="tabs">
+        <button class="tab on" data-act="goto-tab" data-sec="subs" data-tab="list">群与订阅</button>
+        <button class="tab" data-act="goto-tab" data-sec="subs" data-tab="add">添加订阅</button>
+        <button class="tab" data-act="goto-tab" data-sec="subs" data-tab="mv">订阅迁移</button>
+        <button class="tab" data-act="goto-tab" data-sec="subs" data-tab="grp">登记群</button>
+      </div>
+
+      <!-- 群与订阅：群为容器，UP 主 / 合集并进群里 -->
+      <div class="sub-panel" id="sub-list" data-tab="list">
+        <!-- 群多了以后翻起来费劲：按群名 / UP 主名 / UID 搜一下就找到了 -->
+        <div class="card sub-search">
+          <div class="row"><label>🗂️ 筛选方式</label>
+            <select id="subFilterKind">
+              <option value="all">全部（群名 / UP 主 / UID / 合集）</option>
+              <option value="name">只按群名或群号</option>
+              <option value="up">按 UP 主筛群</option>
+              <option value="season">按合集筛群</option>
+            </select>
+            <div class="hint">选「按 UP 主 / 按合集」后，下面会列出已订阅的全部条目（同一条目被多个群订阅只列一次，并标出订了它的群有几个），挑一个就筛出订阅了它的群</div>
+          </div>
+          <div class="row" id="subFilterPickRow" hidden><label id="subFilterPickLabel">选择条目</label>
+            <select id="subFilterPick"></select>
+          </div>
+          <div class="row"><label>🔍 搜索</label>
+            <input id="subSearch" placeholder="群名 / UP 主名 / UID，留空显示全部">
+            <div class="hint">输完自动过滤，命中的群会自己展开；清空就恢复。关键词可与上面的筛选叠加使用</div>
+          </div>
+          <div class="btns">
+            <button class="btn" data-act="sub-search-clear">✖️ 清空</button>
+          </div>
+          <div id="subSearchTip" class="msg"></div>
+        </div>
+        <div id="groupsBox"></div>
+      </div>
+
+      <!-- 添加订阅 -->
+      <div class="sub-panel" id="sub-add" data-tab="add">
+        <div class="card">
+          <h3>➕ 添加订阅</h3>
+          <!-- ⚠️ 必须要有「目标群」选择：订阅是 群×UP主×类型 三元组 -->
+          <div class="row"><label>目标群</label><select id="addGroup"></select></div>
+          <div class="row"><label>UP 主 UID / 空间链接</label>
+            <input id="addUid" placeholder="填 UID，或粘 space.bilibili.com/xxx 链接">
+          </div>
+          <div class="btns" style="margin-bottom:12px">
+            <button class="btn pri" data-act="lookup">🔍 查询</button>
+          </div>
+          <div id="lookupInfo"></div>
+          <div class="row"><label>开启提醒</label>
+            <div class="btns">
+              <!-- ⚠️ 以前是 <label><input type=checkbox hidden>，
+                   没有任何 JS 去同步 .on 样式：点下去 checkbox 变了、
+                   界面却纹丝不动 → 看着就是「失灵、没反馈」。
+                   现在改成 data-act 按钮，样式和动作一起走。 -->
+              <button class="chip-tgl on" id="defLive" data-act="toggle-defkind" data-kind="live">🔴 直播</button>
+              <button class="chip-tgl on" id="defVideo" data-act="toggle-defkind" data-kind="video">📺 投稿</button>
+              <button class="chip-tgl on" id="defDyn" data-act="toggle-defkind" data-kind="dynamic">📝 动态</button>
+              <button class="chip-tgl" id="defTopCmt" data-act="toggle-defkind" data-kind="top_comment">💬 置顶评论</button>
+            </div>
+            <div class="hint">
+              先点「🔍 查询」—— 系统会根据该 UP 主的实际情况给出建议，不会无脑全勾。<br>
+              「置顶评论」默认不勾：它指置顶动态下的置顶评论，噪音相对大，需要的话再单独开。
+            </div>
+          </div>
+          <div class="btns"><button class="btn pri" data-act="add-sub">💖 添加</button></div>
+          <div id="addSubMsg" class="msg"></div>
+        </div>
+
+        <div class="card">
+          <h3>📦 订阅视频合集</h3>
+          <div class="note">合集和「上面的 UP 主订阅」是<b>两套独立的东西</b>：同一个 UP 主可以订阅多个合集，每个合集的文案也能单独设置。<br>
+            👉 更省事的做法：先在上面「🔍 查询」，结果里会分出「👤 UP 主 / 📦 合集」两栏，<b>点哪个加哪个</b>，不用自己找合集 ID。</div>
+          <div class="row"><label>目标群</label><select id="seasonGroup"></select></div>
+          <div class="row"><label>UP 主 UID</label><input id="seasonUid" placeholder="合集属于谁"></div>
+          <div class="row"><label>合集链接 或 合集 ID</label>
+            <input id="seasonRef" placeholder="space.bilibili.com/UID/lists/合集ID?type=season">
+            <div class="hint">长这样：<code>space.bilibili.com/UID/lists/合集ID?type=season</code><br>合集里<b>新增视频才推送</b>，首次订阅只静默记录现有内容，不会把历史视频补推一遍。</div>
+          </div>
+          <div class="btns"><button class="btn pri" data-act="add-season">📦 订阅合集</button></div>
+          <div id="seasonMsg" class="msg"></div>
+        </div>
+      </div>
+
+      <!-- 订阅迁移 -->
+      <div class="sub-panel" id="sub-mv" data-tab="mv">
+        <div class="card">
+          <h3>📦 订阅迁移</h3>
+          <div class="grid g2">
+            <div class="row"><label>从哪个群</label><select id="migSrc"></select></div>
+            <div class="row"><label>搬到哪个群</label><select id="migDst"></select></div>
+          </div>
+          <!-- 迁移范围：全体 = 整群照搬；选择 = 只搬勾中的「UP 主 × 提醒类型」 -->
+          <div class="row"><label>迁移范围</label>
+            <div class="btns" style="margin-top:2px">
+              <button class="btn on" data-act="mig-scope" data-scope="all">📦 全体迁移</button>
+              <button class="btn" data-act="mig-scope" data-scope="part">☑ 选择迁移</button>
+            </div>
+            <div class="hint" id="migScopeHint" style="margin-top:6px"></div>
+          </div>
+          <div id="migPick" style="display:none">
+            <div class="hint" style="margin-bottom:8px">
+              点整块卡片 = 选中（灰色就是不搬）；选中之后再点里面的小卡片挑提醒类型。
+              没勾的会留在源群
+              <span id="migPickStat"></span>
+            </div>
+            <div class="btns" style="margin-bottom:8px">
+              <button class="btn" data-act="mig-pick" data-all="1">全选</button>
+              <button class="btn" data-act="mig-pick" data-all="0">清空</button>
+              <button class="btn" data-act="mig-pick" data-all="on">只选已开启的</button>
+            </div>
+            <!-- 👤 UP 主 / 📦 合集 分两栏：跟群卡片里那套 mini-tab 一个样式。
+                 外层大卡片 = 选中（灰 = 不搬），里面的小卡片才是提醒开关 -->
+            <div class="mini-tabs">
+              <button class="mini-tab on" data-mv="mv-pick-up">👤 UP 主</button>
+              <button class="mini-tab" data-mv="mv-pick-season">📦 合集</button>
+            </div>
+            <div class="mini-view on" id="mv-pick-up"><div id="migPickList"></div></div>
+            <div class="mini-view" id="mv-pick-season"><div id="migSeaList"></div></div>
+            <div class="sw" style="margin-top:6px">
+              <div><div class="nm">一并带走合集订阅</div>
+                <div class="ds">关掉就一个合集都不搬；开着可以在「📦 合集」那栏挑哪几个</div></div>
+              <button class="sw-btn on" data-act="mig-seasons"></button>
+            </div>
+          </div>
+          <div class="btns">
+            <button class="btn pri" data-act="mig-copy">📋 复制</button>
+            <button class="btn dg" data-act="mig-move">📦 迁移</button>
+          </div>
+          <div id="migMsg" class="msg"></div>
+        </div>
+      </div>
+
+      <!-- 登记群 -->
+      <div class="sub-panel" id="sub-grp" data-tab="grp">
+        <div class="card">
+          <h3>💬 登记群</h3>
+          <div class="hint" style="margin-bottom:11px">新群 @ 一下机器人就会自动出现在这里</div>
+          <div class="row"><label>群 ID（openid）</label>
+            <input id="newGid" placeholder="群 openid">
+          </div>
+          <div class="row"><label>群名（可留空，自动向官方查询）</label>
+            <input id="newGname" placeholder="留空则自动获取">
+          </div>
+          <div class="btns"><button class="btn pri" data-act="add-group">➕ 登记</button></div>
+          <div id="addGroupMsg" class="msg"></div>
+          <div id="groupNameDetail"></div>
+        </div>
+
+        <!-- 已登记的群列表：和「群与订阅」用同一套头像，
+             看一眼就知道哪个群已经登记过、登记的是哪个 -->
+        <div class="card">
+          <h3>📋 已登记的群</h3>
+          <div class="hint" style="margin-bottom:11px">
+            点「🔄 刷新群列表」会向官方重新查一次群名，顺带把已经不在的群清掉
+          </div>
+          <div class="btns" style="margin-bottom:12px">
+            <button class="btn" data-act="refresh-names">🔄 刷新群列表</button>
+          </div>
+          <div id="grpListBox"></div>
+        </div>
+      </div>
+    </section>
+
+<section class="panel sec" id="dg" data-sec="diag">
+      <div class="hd"><h1>测试与诊断</h1><p>自检、各类推送测试、运行状态、日志都在这里</p></div>
+      <div class="tabs">
+        <button class="tab on" data-act="goto-tab" data-sec="diag" data-tab="push">推送测试</button>
+        <button class="tab" data-act="goto-tab" data-sec="diag" data-tab="chk">自检</button>
+        <button class="tab" data-act="goto-tab" data-sec="diag" data-tab="run">运行状态</button>
+        <button class="tab" data-act="goto-tab" data-sec="diag" data-tab="log">运行日志</button>
+        <button class="tab" data-act="goto-tab" data-sec="diag" data-tab="media">媒体缓存</button>
+      </div>
+
+      <div class="sub-panel" id="dg-push" data-tab="push">
+        <!-- 沙盒群没设时标红并给一键跳转 -->
+        <div class="warn-box" id="noSandbox" style="display:none">
+          <span>⚠️ 还没设置沙盒群，测试消息不知道发到哪里</span>
+          <button class="tb-btn" data-act="goto-sandbox">去设置 ›</button>
+        </div>
+        <div class="note">
+          测试消息发到沙盒群 <a class="note-link" id="sbBoxName" data-act="goto-sandbox">未设置</a>
+          ，卡片最上面会多一行「🧪 测试」，不会和真提醒搞混
+        </div>
+        <!-- ⚠️ 「模拟未设置沙盒群」已按用户要求移除：那是早期试功能时
+             加的假状态开关，点了会伪造"未设置"的显示，反而让人误判。 -->
+        <div class="card">
+          <h3>📤 各类推送测试</h3>
+          <div class="grid g3">
+            <button class="push" data-act="push-test" data-kind="live"><span class="ic">🔴</span><span class="nm">开播</span><span class="ds">直播提醒</span></button>
+            <button class="push" data-act="push-test" data-kind="offline"><span class="ic">⬛</span><span class="nm">已下播</span><span class="ds">下播提醒</span></button>
+            <button class="push" data-act="push-test" data-kind="video"><span class="ic">📺</span><span class="nm">新投稿</span><span class="ds">视频投稿</span></button>
+            <button class="push" data-act="push-test" data-kind="dynamic"><span class="ic">📝</span><span class="nm">新动态</span><span class="ds">普通动态</span></button>
+            <button class="push" data-act="push-test" data-kind="dynamic_pinned"><span class="ic">📌</span><span class="nm">置顶动态</span><span class="ds">UP 主置顶</span></button>
+            <button class="push" data-act="push-test" data-kind="top_comment"><span class="ic">💬</span><span class="nm">置顶评论</span><span class="ds">动态下评论</span></button>
+            <button class="push" data-act="push-test" data-kind="season"><span class="ic">📦</span><span class="nm">合集更新</span><span class="ds">合集新增视频</span></button>
+            <button class="push" data-act="push-test" data-kind="all"><span class="ic">🧪</span><span class="nm">全部跑一遍</span><span class="ds">依次发 7 条</span></button>
+          </div>
+        </div>
+        <div id="sbBox"></div>
+
+        <!-- 测试选项：决定测试消息长什么样、发到哪。存 localStorage，下次打开还是这样 -->
+        <div class="card">
+          <h3>⚙️ 测试选项</h3>
+          <div class="sw"><div><div class="nm">用真实数据</div><div class="ds">取测试 UID 的真实内容；关掉就是占位文字，卡片里没有封面/配图</div></div><button class="sw-btn on" data-act="toggle-testopt" data-opt="real"></button></div>
+          <div class="sw"><div><div class="nm">带 🧪 测试标记</div><div class="ds">卡片最上面加一行「🧪 测试」，便于区分</div></div><button class="sw-btn on" data-act="toggle-testopt" data-opt="mark"></button></div>
+          <div class="sw"><div><div class="nm">发到沙盒群</div><div class="ds">关掉后每次会让你手动选群</div></div><button class="sw-btn on" data-act="toggle-testopt" data-opt="sandbox"></button></div>
+        </div>
+        <!-- ⚠️ 上次发送详情：「实际发出的图片行」是诊断"比例不对 / 手机看不到图"
+             的唯一依据。以前只塞进 toast —— 几秒就消失，用户根本来不及看
+             （反馈："toast 是什么，后台看不到"）。现在固定显示在这张卡片里，
+             想看多久看多久，还能一键复制出来。 -->
+        <div class="card" id="tpLastCard" style="display:none">
+          <h3>🔍 上次发送详情</h3>
+          <div id="tpLastBody"></div>
+        </div>
+      </div>
+
+      <div class="sub-panel" id="dg-chk" data-tab="chk">
+        <div class="card" id="chkCard">
+          <h3>🧪 测试 UID</h3>
+          <!-- ⚠️ 这个框是**自检专用**，跟「添加订阅」的 UID 框完全独立 -->
+          <div class="row">
+            <label>自检时用哪个 UP 主来测</label>
+            <input id="chkUid" placeholder="填 UID，或粘 space.bilibili.com/xxx 链接">
+            <div class="hint">留空点保存 = 保留原值，不会清空；粘主页链接会自动解析出 UID</div>
+          </div>
+          <div class="btns">
+            <button class="btn pri" data-act="save-chk-uid">💾 保存并记住</button>
+            <button class="btn" data-act="reset-chk-uid">↩️ 恢复默认</button>
+          </div>
+          <div class="hint" style="margin-top:8px">已记住：<b id="chkUidNow">读取中…</b></div>
+        </div>
+        <div class="card">
+          <h3>🧪 全面自检</h3>
+          <div class="hint" style="margin-bottom:12px">自动跑完所有项，不用手填 UID</div>
+          <div id="diagBox"></div>
+          <div class="btns" style="margin-top:13px">
+            <button class="btn pri" data-act="diagnose">重新自检</button>
+          </div>
+          <div id="checkNowBox" class="check-now-out"></div>
+        </div>
+      </div>
+
+      <div class="sub-panel" id="dg-run" data-tab="run">
+        <div class="card" id="runCard">
+          <h3>📊 运行状态</h3>
+          <div id="runBox"></div>
+          <div class="btns" style="margin-top:13px">
+            <button class="btn pri" data-act="check-now">⚡ 立即检测</button>
+            <button class="btn" data-act="clean-procs">🧹 清理残留进程</button>
+            <button class="btn" data-act="refresh-state">🔄 刷新</button>
+          </div>
+          <div class="hint" style="margin-top:9px">「立即检测」不等下一轮，马上手动跑一次巡查；「清理残留进程」关掉重复的实例（多开会导致同一条动态推好几次）</div>
+        </div>
+      </div>
+
+      <div class="sub-panel" id="dg-log" data-tab="log">
+        <div class="card" id="logCard">
+          <h3>📋 运行日志</h3>
+          <div class="note" id="logTransNote" style="background:rgba(0,174,236,.10);border-color:rgba(0,174,236,.3);color: var(--blue-tx)">日志已翻译：类名、方法名、专业术语都翻成中文，时间只显示一次（开关在「设置 → 通用 → 提醒开关」）</div>
+          <div class="btns" style="margin-bottom:12px">
+            <!-- 「只看问题」是**按钮**不是开关：点一下亮起、再点熄灭，
+                 跟「排序」同款，不再是那种点不出变化的假开关 -->
+            <button class="btn" data-act="toggle-log-err" id="logErrBtn">🐞 只看问题</button>
+            <button class="btn" data-act="toggle-log-order" id="logOrderBtn">🔀 排序：新→旧</button>
+            <button class="btn" data-act="refresh-log">🔄 刷新</button>
+            <button class="btn dg" data-act="clear-log">🧹 清空</button>
+          </div>
+          <div id="logSummary"></div>
+          <div id="logBox" class="log-timeline"></div>
+        </div>
+      </div>
+
+      <div class="sub-panel" id="dg-media" data-tab="media">
+        <div class="card">
+          <h3>🖼️ 媒体缓存</h3>
+          <div class="grid g3">
+            <div class="kpi"><div class="lb">缓存图片</div><div class="vl" id="mdCount">–</div><div class="sb" id="mdSize">–</div></div>
+            <div class="kpi"><div class="lb">凭证有效期</div><div class="vl" id="mdTtl" style="font-size:15px">–</div><div class="sb">到期自动重传</div></div>
+            <div class="kpi"><div class="lb">失败</div><div class="vl" id="mdFail">0</div><div class="sb">最近 24 小时</div></div>
+          </div>
+          <div class="hint" style="margin-top:11px">
+            缓存位置：<b id="mdDir">读取中…</b> <span id="mdMode" style="opacity:.7"></span>
+          </div>
+          <div class="hint" style="margin-top:4px">
+            长期 <b id="mdLong">0</b> 张（UP 头像等复用，<span id="mdLongSize">0 KB</span>）
+            ・临时 <b id="mdTmp">0</b> 张（推送封面，保留 <span id="mdTmpTtl">300 秒</span>后再删，<span id="mdTmpSize">0 KB</span>）
+          </div>
+          <div id="mdRecent" style="margin-top:10px"></div>
+          <div id="mdHosts" class="hint" style="margin-top:8px"></div>
+          <div id="mdProbe" class="hint" style="margin-top:6px"></div>
+          <div class="btns" style="margin-top:13px">
+            <button class="btn" data-act="media-probe">🔎 检测图床（手机看不到图时点这个）</button>
+            <button class="btn pri" data-act="media-test-upload">🖼️ 测试上传</button>
+            <button class="btn dg" data-act="media-clear">🧹 清空缓存</button>
+            <button class="btn" data-act="refresh-media">🔄 刷新</button>
+          </div>
+          <div class="hint" style="margin-top:8px">「测试上传」会造一张纯色图，走完「上传 → 发送」全流程并发到沙盒群，群里真看到图才算链路通</div>
+          <div id="mediaMsg" class="msg"></div>
+        </div>
+      </div>
+    </section>
+
+<section class="panel sec" id="st" data-sec="setup">
+      <div class="hd"><h1>设置</h1><p>只剩全局参数：轮询、文案模板、开关</p></div>
+      <div class="tabs">
+        <button class="tab on" data-act="goto-tab" data-sec="setup" data-tab="gen">通用</button>
+        <button class="tab" data-act="goto-tab" data-sec="setup" data-tab="tpl">文案模板</button>
+        <button class="tab" data-act="goto-tab" data-sec="setup" data-tab="adv">高级</button>
+        <button class="tab" data-act="goto-tab" data-sec="setup" data-tab="log2">更新日志</button>
+        <button class="tab" data-act="goto-tab" data-sec="setup" data-tab="about">关于</button>
+      </div>
+
+      <div class="sub-panel" id="st-gen" data-tab="gen">
+        <div class="card" id="paceCard">
+          <h3>⚙️ 检查节奏</h3>
+          <!-- ⚠️ 范围按**后台真实值**渲染（poll_interval_min ~ poll_interval_max），
+               不再写死 8~120。改了「轮询上限」这里的上下限会跟着变。 -->
+          <div class="row"><label>检查间隔（秒）</label>
+            <input id="cPoll" type="number" min="8" step="1" value="12">
+            <div class="hint" id="pollRangeHint">撞风控会自动放慢，平稳后自动加快；顶部心跳波形的周期跟着这个值走</div>
+          </div>
+          <div class="row"><label>投稿/动态（每 N 轮，1=每轮）</label>
+            <input id="cSlow" type="number" min="1" max="60" step="1" value="1">
+            <div class="hint">直播每轮都查；投稿和动态没那么急，可以隔几轮查一次省请求。当前后台值：<b id="slowNow">1</b></div>
+          </div>
+        </div>
+
+        <!-- 图片这块有七八项参数，展开要拖很久才够到「提醒开关」。
+             折起来只占一行，摘要里还能看到当前的发送方式。 -->
+        <details class="card fold" id="imgCard">
+          <summary class="fold-hd">
+            <span class="fold-ic">▸</span>
+            <h3>🖼️ 图片</h3>
+            <span class="fold-sum" id="imgCardSum">（读取中…）</span>
+          </summary>
+          <div class="fold-bd">
+          <div class="sw"><div><div class="nm">提醒带图片</div><div class="ds">封面/头像随消息一起发，关掉则纯文字</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cImage" checked style="display:none"></label>
+          </div>
+          <div class="row"><label>图片发送方式</label>
+            <!-- ⚠️ 选项必须覆盖后端全部取值。
+                 以前这里只有 local/url/auto/off，缺 inline（v1.35.0 起的默认），
+                 于是 fillCfg 赋 "inline" 时 select 里没有这个 option，
+                 value 赋值失败变成空串 —— 表现就是"下拉框没有选中项"。 -->
+            <select id="cImgMode">
+              <option value="inline">内嵌在卡片里（默认，图和消息是一条）</option>
+              <option value="local">单独发一条：本地下载后直传</option>
+              <option value="url">单独发一条：平台拉取链接</option>
+              <option value="auto">自动（先本地后链接，图单独发一条）</option>
+              <option value="off">不发图片</option>
+            </select>
+            <div class="hint">内嵌：图就在卡片里，只有一条消息（图片由开放平台下载转存，<b>不需要域名报备</b>）。单独发一条：走富媒体（msg_type=7），图在文字上方且只能 1 张，代价是图是单独一条消息</div>
+          </div>
+          <div class="sw"><div><div class="nm">图片尺寸提示</div><div class="ds">内嵌图片必须带 <code>![#宽px #高px](url)</code>，否则<b>手机端看不到图</b>（电脑端却正常）</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cSizeHint" checked style="display:none"></label>
+          </div>
+          <div class="row"><label>提示尺寸（宽×高）</label>
+            <div style="display:flex;gap:8px">
+              <input id="cHintW" type="number" min="1" max="1920" step="1" value="672">
+              <input id="cHintH" type="number" min="0" max="1920" step="1" value="0" placeholder="0 = 自动">
+            </div>
+            <div class="hint">宽是<b>上限</b>，高填 <code>0</code> 表示<b>按原图比例自动算</b>（竖图、方图才不会被拉成 16:9）；高填了具体数就固定用它。原图比上限小则不放大。客户端只拿它预留空间，不是真的缩图。改完立即生效，不用重启</div>
+          </div>
+          <div class="row"><label>最大高度（超长图压到这个高度）</label>
+            <div style="display:flex;gap:8px">
+              <input id="cHintMaxH" type="number" min="0" max="4096" step="1" value="1200" placeholder="0 = 不限制">
+            </div>
+            <div class="hint">长图（比如 <code>672×2225</code>）整体<b>等比压小</b>到这个高度，比例不变、只是变小，免得手机上要滑好几屏。填 <code>0</code> 表示完全不限制</div>
+          </div>
+          <div class="row"><label>多图排版方式</label>
+            <div style="display:flex;gap:8px">
+              <select id="cGridMode">
+                <option value="box">固定方框 · 裁剪填充（格子一样大，点开是原图）</option>
+                <option value="ratio">原比例（点开是原图，高度不齐）</option>
+                <option value="square">图床裁剪（最整齐，点开是小方图）</option>
+              </select>
+            </div>
+            <div class="hint">一条动态/评论<b>有多张图</b>时怎么排。<b>固定方框</b>（推荐）：每格都是<b>一样大的正方形</b>，发的是<b>原图</b>——外面看着是方格、<b>点开是完整原图</b>；比例不够方时按<b>裁剪填充</b>处理：保持原图比例放大到铺满方框、多出来的部分裁掉，<b>不会拉伸变形、也不会补白边</b>。<b>原比例</b>：也是原图，但高度跟着原图走、各格高度不齐。<b>图床裁剪</b>：让图床真裁成小方图，最整齐，代价是点开看到的也是那张裁过的图。⚠️ 裁剪的<b>取景位置</b>（竖图取上/中、横图取中）由<b>客户端</b>决定，markdown 只能给"方框多大 + 图片地址"，无法指定裁哪一块——如果你手机上看到的是被<b>拉变形</b>的，说明该客户端是拉伸而非裁剪填充，改选<b>图床裁剪</b>即可。⚠️ markdown 图片是块级、一行一张，做不到真正的 3×3 并排方阵</div>
+          </div>
+          <div class="row"><label>多图格子尺寸</label>
+            <div style="display:flex;gap:8px">
+              <input id="cHintCell" type="number" min="0" max="1024" step="1" value="320" placeholder="0 = 跟单图一样">
+            </div>
+            <div class="hint">多图时每格的尺寸：<b>原比例</b>模式下是<b>统一宽度</b>（高度按原图算）；方块模式下是<b>边长</b>。<b>单图不受影响</b>，仍按原图比例。填 <code>0</code> = 多图也跟单图一样按「提示尺寸-宽」走</div>
+          </div>
+          <div class="row"><label>每条消息最多几张图</label>
+            <div style="display:flex;gap:8px">
+              <input id="cImgMax" type="number" min="0" max="9" step="1" value="0" placeholder="0 = 不限">
+            </div>
+            <div class="hint">一条动态/评论可能带多张图。填 <code>0</code> = <b>全都发</b>（动态最多 9 张）；嫌消息太长就填 <code>3</code> 或 <code>4</code>。多张图之间只换行、<b>不空行</b></div>
+          </div>
+          </div>
+        </details>
+
+        <details class="card fold" id="swCard">
+          <summary class="fold-hd">
+            <span class="fold-ic">▸</span>
+            <h3>🔔 提醒开关</h3>
+            <span class="fold-sum" id="swCardSum">（读取中…）</span>
+          </summary>
+          <div class="fold-bd">
+          <div class="sw"><div><div class="nm">下播也提醒</div><div class="ds">开播之外，下播时再推一条</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cOffline" style="display:none"></label>
+          </div>
+          <div class="sw"><div><div class="nm">只推 UP 主本人的置顶评论</div><div class="ds">粉丝刷上去的不推，噪音更少</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cOnlyUpCmt" checked style="display:none"></label>
+          </div>
+          <div class="sw"><div><div class="nm">纯文本消息</div><div class="ds">Markdown 没权限时勾选</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cPlainMsg" style="display:none"></label>
+          </div>
+          <!-- 「中文翻译」在最终版里就属于「提醒开关」这一块，
+               之前合并时漏掉了 —— 用户报的"缺少日志翻译功能"就是这个。
+               后端 /api/log 按这个开关决定要不要翻译。 -->
+          <div class="sw"><div><div class="nm">中文翻译</div><div class="ds">日志里的英文术语翻成白话</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cLogTrans" checked style="display:none"></label>
+          </div>
+          <!-- 界面音效：纯前端偏好（存在浏览器本地），不跟订阅数据混在一起。
+               默认「很轻」——能听见，但不抢戏。 -->
+          <div class="sw"><div><div class="nm">界面音效</div>
+            <div class="ds">保存成功、操作出错、展开卡片时轻轻响一声</div></div>
+            <select id="cSound" data-act="sound-change" style="max-width:120px">
+              <option value="off">关闭</option>
+              <option value="1">很轻（推荐）</option>
+              <option value="2">适中</option>
+              <option value="3">稍响</option>
+            </select>
+          </div>
+          </div>
+        </details>
+
+        <div class="card" id="sbCard">
+          <h3>🧪 沙盒群（测试专用，可不设）</h3>
+          <div class="row"><label>沙盒群</label>
+            <select id="cSandboxGroup"></select>
+            <div class="hint">指定一个群专门用来试东西：设了之后「📤 发条测试」会直接发到这个群。群需要先登记</div>
+          </div>
+          <div class="btns"><button class="btn pri" data-act="save-cfg">💾 保存设置</button></div>
+          <div id="cfgMsg" class="msg"></div>
+        </div>
+
+        <!-- 数据与备份：数据跟程序目录是分开的，这里把它的位置和备份入口摆到明面上，
+             免得「删掉文件夹换新版」时以为订阅没了。 -->
+        <details class="card fold" id="bkCard">
+          <summary class="fold-hd">
+            <span class="fold-ic">▸</span>
+            <h3>💾 数据与备份</h3>
+            <span class="fold-sum" id="bkCardSum">（读取中…）</span>
+          </summary>
+          <div class="fold-bd">
+          <div class="row"><label>数据文件</label>
+            <div class="hint" id="bkPath">（读取中…）</div>
+          </div>
+          <div class="hint">订阅、文案、推送基线都存在这个文件里。它<b>不在程序目录</b>里，所以删掉程序文件夹<b>不会</b>带走它；备份同样默认存到桌面，不留在程序目录。</div>
+          <div class="row"><label>当前内容</label>
+            <div class="hint" id="bkStats">（读取中…）</div>
+          </div>
+          <div class="row"><label>存放位置</label>
+            <input id="bkHome" type="text" placeholder="留空=默认位置">
+            <div class="hint" id="bkHomeNow">（读取中…）</div>
+          </div>
+          <div class="btns">
+            <button class="btn" data-act="datadir-apply">📂 搬到这个位置</button>
+          </div>
+          <div class="hint">数据（配置、订阅、密钥、日志、图片、备份）都在同一个目录里。想换盘或换文件夹就填上面的路径再点这个按钮——已有的东西会一起搬过去，不用重加订阅。<b>改完要重启机器人</b>才生效。填了程序目录里的位置也能用，但删文件夹换新版时会一起没掉。</div>
+          <div class="btns">
+            <button class="btn pri" data-act="backup-now">📦 立即备份</button>
+            <button class="btn" data-act="backup-download">⬇️ 下载最新</button>
+            <button class="btn" data-act="backup-restore">♻️ 从备份恢复</button>
+          </div>
+          <input type="file" id="bkFile" accept=".zip" style="display:none">
+          <div class="hint" id="bkInfo">（读取中…）</div>
+          <div id="bkMsg" class="msg"></div>
+          <!-- 旧版 data.db：v1.92 及更早用 SQLite 文件库存的订阅，
+               落到新版（JSON）之后那份文件就成了唯一的旧记录。 -->
+          <div class="row"><label>旧版数据</label>
+            <div class="hint" id="lgInfo">（读取中…）</div>
+          </div>
+          <div id="lgList"></div>
+          <div class="hint">把旧版的 <b>data.db</b> 放进程序文件夹（或数据目录），这里就会列出来。导入是<b>合并</b>：已有的群、订阅、文案一律不动，只补缺失的；旧库里的推送进度<b>不带过来</b>，免得把几个月前的历史内容当成新动态再推一遍。</div>
+          <div id="lgMsg" class="msg"></div>
+          </div>
+        </details>
+      </div>
+
+      <div class="sub-panel" id="st-tpl" data-tab="tpl">
+        <div class="card" id="tplCard">
+          <h3>✍️ 全局文案模板</h3>
+          <div class="hint" style="margin-bottom:12px">这是第二层；UP 主 / 合集专属文案在订阅卡片上改，优先级更高</div>
+          <!-- 预设按钮：整套文案一次套用，点完还能单独改某一条。
+               可用变量：{name}=UP主 {title}=标题 {season}=合集名 {section}=小节名 -->
+          <div class="row"><label>快速套用预设</label>
+            <div class="cl-tabs" id="tplPresets">
+              <button class="cl-tab" data-act="tpl-preset" data-preset="default">默认</button>
+              <button class="cl-tab" data-act="tpl-preset" data-preset="simple">简洁</button>
+              <button class="cl-tab" data-act="tpl-preset" data-preset="detail">详细</button>
+            </div>
+            <div class="hint">点一下整套文案一起换成该预设，之后仍可单独改某一条。可用变量：{name} {title} {season} {section}</div>
+          </div>
+          <div class="grid g2">
+            <div class="row"><label>🔴 开播提醒</label><textarea id="tLive"></textarea></div>
+            <div class="row"><label>⬛ 已下播</label><textarea id="tOffline"></textarea></div>
+            <div class="row"><label>📺 新视频投稿</label><textarea id="tVideo"></textarea></div>
+            <div class="row"><label>📝 新动态</label><textarea id="tDyn"></textarea></div>
+            <div class="row"><label>📝 新动态（无标题）</label><textarea id="tDynNo"></textarea></div>
+            <div class="row"><label>💬 置顶评论</label><textarea id="tTopCmt"></textarea></div>
+            <div class="row"><label>📌 置顶动态</label><textarea id="tDynPin"></textarea></div>
+            <div class="row"><label>📌 置顶动态（无标题）</label><textarea id="tDynPinNo"></textarea></div>
+            <div class="row"><label>🔴 开播动态</label><textarea id="tDynLive"></textarea></div>
+            <div class="row"><label>🔴 开播动态（无标题）</label><textarea id="tDynLiveNo"></textarea></div>
+            <div class="row"><label>📦 合集更新</label><textarea id="tSeason"></textarea></div>
+          </div>
+          <div id="tplPreview"></div>
+          <div class="btns">
+            <button class="btn pri" data-act="save-tpl">💾 保存</button>
+            <button class="btn" data-act="reset-tpl">↩️ 恢复默认</button>
+          </div>
+          <div id="tplMsg" class="msg"></div>
+        </div>
+      </div>
+
+      <div class="sub-panel" id="st-adv" data-tab="adv">
+        <div class="card" id="advCard">
+          <h3>🔧 高级</h3>
+          <div class="row"><label>请求超时（秒）</label>
+            <input id="cTimeout" type="number" min="3" max="60" step="1" value="10">
+            <div class="hint">单个请求最多等多久。网络差可调大，太小会大面积假失败</div>
+          </div>
+          <div class="row"><label>去重窗口（秒）</label>
+            <input id="cDedupe" type="number" min="0" max="86400" step="60" value="900">
+            <div class="hint">这段时间内同一条内容不会重复推。0 = 不去重</div>
+          </div>
+          <!-- ⚠️ 这两项是真实生效的配置（config.example.yaml 里有、代码也在读），
+               但面板上一直**没有入口** —— 只能手改 yaml。现在补上。 -->
+          <div class="row"><label>最小请求间隔（秒）</label>
+            <input id="cMinReqInt" type="number" min="0" max="30" step="0.5" value="2">
+            <div class="hint">两次 B站请求之间至少隔多久，防触发风控。太小容易被限流</div>
+          </div>
+          <div class="row"><label>轮询上限（秒）</label>
+            <input id="cPollMax" type="number" min="8" max="3600" step="10" value="120">
+            <div class="hint">撞风控自动放慢时的天花板。设再快也不会超过这个</div>
+          </div>
+          <div class="sw"><div><div class="nm">沙箱环境</div>
+            <div class="ds">用 QQ 平台的沙箱接口。⚠️ 和「沙盒群」是两回事，别搞混</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cSandbox2" style="display:none"></label>
+          </div>
+          <!-- 输出调试日志：最终版里**没有**这一项（当时因为配置里没这个键，
+               被判定成"虚构项"删掉了）。现在用户明确要，就把它做成**真功能**：
+               config.log_debug → bot.py 根 logger 级别 DEBUG/INFO。 -->
+          <div class="sw"><div><div class="nm">输出调试日志</div>
+            <div class="ds">把 DEBUG 级细节也写进 bot.log。排查问题时开，平时关（日志会长得很快）</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cDebugLog" style="display:none"></label>
+          </div>
+          <div class="btns">
+            <button class="btn pri" data-act="save-cfg">💾 保存</button>
+            <button class="btn" data-act="dump-debug">🩺 输出调试日志</button>
+          </div>
+          <div id="advMsg" class="msg"></div>
+        </div>
+      </div>
+
+      <div class="sub-panel" id="st-log2" data-tab="log2">
+        <div class="card">
+          <h3>📜 更新日志</h3>
+          <div class="row"><label>显示条数</label>
+            <!-- 三档：最新3 / 最新5 / 全部。
+                 ⚠️ 以前是一个 number 输入框，能填 1~50 任意值，
+                 但「全部」填不出来（后端还卡着 50 上限），
+                 而且填完还得靠 change 事件才生效，看着像坏了。 -->
+            <div class="cl-tabs" id="clCount">
+              <button class="cl-tab" data-cl="3">最新 3 条</button>
+              <button class="cl-tab on" data-cl="5">最新 5 条</button>
+              <button class="cl-tab" data-cl="all">全部</button>
+            </div>
+          </div>
+          <div id="changelogBox"></div>
+        </div>
+      </div>
+
+      <!-- 关于：项目名、版本、运行环境、声明与反馈方式。
+           反馈 bug 时最常被问"哪个版本 / 数据在哪 / 装了哪些依赖"，
+           全都摆在这里，还能一键复制去贴反馈。 -->
+      <div class="sub-panel" id="st-about" data-tab="about">
+        <div class="card">
+          <h3>ℹ️ 关于本工具</h3>
+          <div class="row"><label>项目名</label>
+            <div class="hint">
+              <b>OnOB站通知订阅工具</b><br>
+              英文：<b>OnO Bilibili Notifier</b>　·　缩写：<b>OnOBN</b><br>
+              作者 / 来源：<b>波萝Buono</b><br>
+              <a class="gh-link" href="https://github.com/XxBoLuoxX" target="_blank"
+                 rel="noopener noreferrer">🔗 GitHub 主页：github.com/XxBoLuoxX</a>
+            </div>
+          </div>
+          <div class="row"><label>版本</label>
+            <div class="hint" id="abVer">（读取中…）</div>
+          </div>
+          <div class="row"><label>运行环境</label>
+            <div class="hint" id="abEnv">（读取中…）</div>
+          </div>
+          <div class="row"><label>数据位置</label>
+            <div class="hint" id="abData">（读取中…）</div>
+          </div>
+          <div class="row"><label>依赖装在不在</label>
+            <div class="hint" id="abDeps">（读取中…）</div>
+          </div>
+          <div class="btns">
+            <button class="btn" data-act="about-copy">📋 复制版本信息</button>
+            <button class="btn pri" data-act="goto-tab" data-sec="setup" data-tab="log2">📜 看更新日志 ›</button>
+          </div>
+          <div id="abMsg" class="msg"></div>
+        </div>
+
+        <div class="card">
+          <h3>⚠️ 使用声明</h3>
+          <div class="note" style="margin-bottom:10px">
+            <b>服务器端从未测试过</b>：只在本机桌面环境开发调试过，
+            Linux 服务器 / Docker / 云主机上的部署路径<b>没有实测</b>。
+            在这类环境跑出问题，欢迎反馈。
+          </div>
+          <div class="note" style="margin-bottom:10px">
+            <b>代码由 AI 生成</b>：腾讯元宝「Hy4 preview」生成，作者负责整理、测试与维护。
+          </div>
+          <div class="note" style="margin-bottom:0">
+            <b>安全功能未做安全审计</b>：口令、登录限流等只验证过「功能能跑通」，
+            未经过安全测试、渗透测试或代码审计。
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>📮 反馈</h3>
+          <div class="hint">
+            遇到 bug 或想提建议，反馈时请带上：
+          </div>
+          <div class="hint" style="margin-top:8px">
+            ① <b>版本号</b>（上面「复制版本信息」一键拿到）<br>
+            ② <b>做了什么操作</b>、<b>期望是什么</b>、<b>实际是什么</b><br>
+            ③ 面板「日志」页末尾的报错，或数据目录里 <code>logs/bot.log</code> 的最后几十行
+          </div>
+          <div class="note" style="margin-top:10px;margin-bottom:0">
+            截图时请把群里号、Cookie、AppSecret 等敏感信息打码 ——
+            备份包里也含这些，别直接公开上传。
+          </div>
+        </div>
+      </div>
+    </section>
+
+</main>
+</div>
+
+
+<!-- 文案编辑弹层 -->
+<div id="tplSheet" aria-hidden="true">
+  <div class="tpl-box">
+    <div class="tpl-hd"><b id="tplSheetTitle">文案</b>
+      <button class="tb-btn" data-act="close-sheet">✕ 关闭</button></div>
+    <div id="tplSheetBody"></div>
+  </div>
+</div>
+<div id="toast"></div>
+<div id="tipLayer" role="tooltip" aria-hidden="true"></div>
+<script>window.__BE_VER = "{{ app_version }}";</script>
+<!-- 音效要早于 app.js：app.js 里的 toast / 折叠都可能马上用到它 -->
+<script src="/static/sound.js?v={{ app_version }}"></script>
+<script src="/static/app.js?v={{ app_version }}"></script>
+</body>
+</html>

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · OnOB站通知订阅工具（OnOBN）</title>
+<link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body>
+<div class="wrap" style="max-width:420px; padding-top:80px">
+  <div class="card">
+    <h2>🔒 请输入面板口令</h2>
+    <div id="err" class="msg err" style="display:none"></div>
+    <label class="f">口令</label>
+    <input type="password" id="pwd" autofocus
+           onkeydown="if(event.key==='Enter')doLogin()">
+    <div class="row" style="margin-top:14px">
+      <button class="btn-primary" id="btn" onclick="doLogin()">进入</button>
+    </div>
+    <div class="hint">
+      口令填在 config.yaml 的 <code>web_password</code> 里；不需要登录的话把它删掉即可。<br>
+      连续输错 5 次会临时锁定，防止被暴力破解。
+    </div>
+  </div>
+</div>
+
+<script>
+  if (window.matchMedia('(prefers-color-scheme: dark)').matches)
+    document.documentElement.setAttribute('data-theme', 'dark');
+
+  async function doLogin() {
+    const btn = document.getElementById('btn');
+    const err = document.getElementById('err');
+    err.style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = '验证中…';
+    try {
+      const r = await fetch('/api/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-Requested-With': 'bili-notify'},
+        body: JSON.stringify({password: document.getElementById('pwd').value})
+      });
+      const d = await r.json();
+      if (d.ok) {
+        location.href = '/';
+      } else {
+        err.textContent = d.msg || '登录失败';
+        err.style.display = 'block';
+      }
+    } catch (e) {
+      /* ⚠️ 不能直接把 e 拼出来给用户看：浏览器原生异常就是
+         "TypeError: Failed to fetch" —— 一串英文，既看不出是面板没在跑，
+         也不知道该怎么办。这里按情形说人话。 */
+      const s = String((e && e.message) || e || '');
+      if (/Failed to fetch|NetworkError|Load failed|TypeError/i.test(s)) {
+        err.innerHTML = '连不上管理面板：机器人可能没在跑，或正在重启。'
+          + '<br>先启动机器人，再刷新这个页面。';
+      } else if (/abort|timeout/i.test(s)) {
+        err.textContent = '请求超时——面板这会儿没响应，等几秒再试';
+      } else {
+        err.textContent = '请求失败：' + s;
+      }
+      err.style.display = 'block';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '进入';
+    }
+  }
+</script>
+</body>
+</html>
