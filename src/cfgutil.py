@@ -246,6 +246,37 @@ def python_exe() -> str:
     return exe
 
 
+# ------------------------------------------------------------------ exe 版
+
+
+def is_frozen() -> bool:
+    """是不是 exe 版（PyInstaller 打包）。
+
+    PyInstaller 运行时会设 sys.frozen = True，并把源码解压到 sys._MEIPASS。
+    源码版没有这两个属性。
+    """
+    return bool(getattr(sys, "frozen", False))
+
+
+def child_cmd(script: str, extra: list = None) -> list:
+    """构造拉起子进程的命令 —— 源码版与 exe 版都能用。
+
+    源码版：  [python.exe, <src>/webui.py, ...]
+    exe 版：  [OnOBN.exe, --child, webui, ...]
+
+    ⚠️ 为什么不能直接写 [sys.executable, "webui.py"]：
+        打包后 sys.executable 变成 exe 自己，而 webui.py 已经不存在于磁盘
+        （被编进 exe）。这条命令会变成"让 exe 再跑一遍 start"，界面套界面。
+        exe 版改走 main.py 的子命令模式：一个 exe 身兼 start / webui / bot 三职。
+
+    script 只写模块名，不带 .py（"webui" / "bot"）。
+    """
+    extra = list(extra or [])
+    if is_frozen():
+        return [sys.executable, "--child", script] + extra
+    return [python_exe(), os.path.join(BASE, script + ".py")] + extra
+
+
 def pick_port(start: int = 8088, tries: int = 12) -> int:
     """从 start 开始找一个空闲端口。"""
     for p in range(start, start + tries):

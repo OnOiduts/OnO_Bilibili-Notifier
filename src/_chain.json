@@ -1,0 +1,89 @@
+{
+ "group_templates": [],
+ "groups": [
+  {
+   "created_at": 1791118817.0527947,
+   "gid": "GROUP_A",
+   "name": "",
+   "updated_at": 1791118817.0527947
+  }
+ ],
+ "meta": [
+  {
+   "key": "schema_version",
+   "value": "1"
+  },
+  {
+   "key": "revision",
+   "value": "11"
+  }
+ ],
+ "season_templates": [],
+ "seasons": [],
+ "sub_baseline": [
+  {
+   "gid": "GROUP_A",
+   "kind": "live",
+   "uid": 111,
+   "updated_at": 1791118819.1405005,
+   "v1": "1",
+   "v2": "深夜歌回"
+  },
+  {
+   "gid": "GROUP_A",
+   "kind": "video",
+   "uid": 111,
+   "updated_at": 1791118818.5190153,
+   "v1": "BV1aa",
+   "v2": "0"
+  },
+  {
+   "gid": "GROUP_A",
+   "kind": "dyn",
+   "uid": 111,
+   "updated_at": 1791118818.8435824,
+   "v1": "100",
+   "v2": "0"
+  }
+ ],
+ "subs": [
+  {
+   "gid": "GROUP_A",
+   "kind": "live",
+   "on": 1,
+   "uid": 111,
+   "updated_at": 1791118817.0527947
+  },
+  {
+   "gid": "GROUP_A",
+   "kind": "video",
+   "on": 1,
+   "uid": 111,
+   "updated_at": 1791118817.199297
+  },
+  {
+   "gid": "GROUP_A",
+   "kind": "dynamic",
+   "on": 1,
+   "uid": 111,
+   "updated_at": 1791118817.3491561
+  }
+ ],
+ "up_templates": [],
+ "ups": [
+  {
+   "dyn_id": "",
+   "dyn_top_cmt": "",
+   "dyn_top_id": "",
+   "face": "",
+   "live_status": null,
+   "live_title": "",
+   "room_id": 7788,
+   "short_room_id": 0,
+   "uid": 111,
+   "uname": "测试UP",
+   "updated_at": 1791118816.8640914,
+   "video_bvid": ""
+  }
+ ]
+}

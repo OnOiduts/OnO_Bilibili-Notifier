@@ -19,8 +19,8 @@ import webbrowser
 
 import heartbeat
 from cfgutil import (BASE, cfg_path, creds_fingerprint, creds_ready,
-                     kill_process_tree, load_cfg, pick_port, python_exe,
-                     safe_print, safe_stdio)
+                     child_cmd, is_frozen, kill_process_tree, load_cfg,
+                     pick_port, python_exe, safe_print, safe_stdio)
 import version as _version
 from security import restrict_perms
 import paths
@@ -46,6 +46,11 @@ def missing_deps():
 
 
 def ensure_deps():
+    # exe 版：依赖已经编进程序里，而且机器上未必有 python/pip，
+    # 再去 pip install 只会卡住甚至报错。
+    if is_frozen():
+        safe_print("[1/4] 依赖已就绪（已随程序打包）")
+        return True
     miss = missing_deps()
     if not miss:
         safe_print("[1/4] 依赖已就绪")
@@ -379,9 +384,8 @@ def main():
     # 关窗口时本进程是被强杀的，finally 跑不到，
     # 只有面板自己发现"爹没了"才能真正退干净。
     web = subprocess.Popen(
-        [python_exe(), os.path.join(BASE, "webui.py"),
-         "--host", "127.0.0.1", "--port", str(port),
-         "--parent", str(os.getpid())],
+        child_cmd("webui", ["--host", "127.0.0.1", "--port", str(port),
+                            "--parent", str(os.getpid())]),
         **web_kwargs,
     )
     try:
@@ -503,8 +507,8 @@ def main():
                 safe_print()
                 safe_print("  ✅ 检测到凭据，正在启动机器人…")
                 bot = subprocess.Popen(
-                    [sys.executable, os.path.join(BASE, "bot.py"),
-                     "--parent", str(os.getpid())], cwd=BASE)
+                    child_cmd("bot", ["--parent", str(os.getpid())]),
+                    cwd=BASE)
                 try:
                     import cleanup as _cu
                     _cu.register_pid(bot.pid)

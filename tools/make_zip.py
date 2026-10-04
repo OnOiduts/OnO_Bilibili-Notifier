@@ -13,8 +13,11 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEEP_DIRS = ("src", "docs", "tests", "tools", "deploy")
-KEEP_FILES = ("启动机器人.bat", "启动机器人.sh", "备份全部数据.bat",
-              "安装依赖.bat", "恢复全部数据.bat",
+# 启动脚本属于「成品」：双击就跑的东西归 Releases 里的 exe / 成品包，
+# GitHub 仓库只展示源码，所以导出版不带它们（由 tools/build_exe.py 生成）。
+KEEP_FILES_RELEASE = ("启动机器人.bat", "启动机器人.sh", "备份全部数据.bat",
+                      "安装依赖.bat", "恢复全部数据.bat")
+KEEP_FILES = (
               # ⚠️ 许可文件必须进包：v2.0.6 之前一直漏了它，
               #    源码目录里有 LICENSE，但不在 KEEP_FILES 里，
               #    结果用户拿到的压缩包里根本没有许可文件（放 GitHub 会没有 License）。
@@ -25,7 +28,10 @@ KEEP_FILES = ("启动机器人.bat", "启动机器人.sh", "备份全部数据.b
               # ⚠️ .env.example 里只有占位符，可以进包；真 .env 绝不能进（见 EXCLUDE_FILES）。
               "README.md", ".env.example", ".gitignore", ".gitattributes")
 EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", "backups", "data",
-                ".git", "logs", "cache", "run", "dist", "dist_obf"}
+                ".git", "logs", "cache", "run", "dist", "dist_obf",
+                "build"}
+# 成品物后缀：exe 是打包产物（归 Releases），不放进源码包
+EXCLUDE_SUFFIX = (".exe", ".pyc", ".log")
 EXCLUDE_FILES = {"config.yaml", "data.db", "state.json", ".machine_key",
                  "_t_name.json", ".DS_Store",
                  # ⚠️ 真密钥文件：里面是用户填的真实 AppSecret / Cookie，
@@ -113,6 +119,31 @@ GITHUB_REQUIRED = ("README.md", "LICENSE", ".gitignore",
                    ".env.example", ".gitattributes")
 
 
+def _verify_github_pack(path):
+    """导出版回读校验：包里必须**只有源码**，一个成品物都不能有。
+
+    为什么打完还要回读一遍：KEEP_FILES 改一次容易、漏一次也容易，
+    而 .bat 混进源码仓库的后果是——GitHub 上看着像"可执行程序"，
+    跟"这里只是展示源码"的定位冲突。宁可多验一道。
+    """
+    bad = []
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+    for nm in names:
+        low = nm.lower()
+        if low.endswith((".bat", ".cmd", ".exe", ".msi", ".sh")):
+            bad.append("含成品脚本/执行文件：%s" % nm)
+        if low.startswith(("dist/", "build/")):
+            bad.append("含打包产物：%s" % nm)
+    for must in ("src/start.py", "src/VERSION", "docs/README.md"):
+        if must not in names:
+            bad.append("缺源码文件：%s" % must)
+    for f in GITHUB_REQUIRED:
+        if f not in names:
+            bad.append("缺 %s" % f)
+    return bad
+
+
 def main(github: bool = False):
     ver = open(os.path.join(ROOT, "src", "VERSION"), encoding="utf-8").read().strip()
     if github:
@@ -127,8 +158,10 @@ def main(github: bool = False):
     n = 0
     if os.path.exists(out):
         os.remove(out)
+    # 导出版不带启动脚本（成品物归 Releases），成品版带
+    keep = tuple(KEEP_FILES) + (() if github else tuple(KEEP_FILES_RELEASE))
     _entries = []
-    for name in KEEP_FILES:
+    for name in keep:
         p = os.path.join(ROOT, name)
         if os.path.isfile(p):
             _entries.append((p, name))
@@ -139,7 +172,7 @@ def main(github: bool = False):
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = [x for x in dirnames if x not in EXCLUDE_DIRS]
             for fn in filenames:
-                if fn in EXCLUDE_FILES or fn.endswith((".pyc", ".log")):
+                if fn in EXCLUDE_FILES or fn.endswith(EXCLUDE_SUFFIX):
                     continue
                 if _is_residue(fn):
                     continue
@@ -154,13 +187,13 @@ def main(github: bool = False):
         return None
 
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for name in KEEP_FILES:
+        for name in keep:
             p = os.path.join(ROOT, name)
             if os.path.isfile(p):
                 z.write(p, name)
                 n += 1
             else:
-                print("  ⚠️ 缺脚本 %s" % name)
+                print("  ⚠️ 缺文件 %s" % name)
         for d in KEEP_DIRS:
             base = os.path.join(ROOT, d)
             if not os.path.isdir(base):
@@ -169,7 +202,7 @@ def main(github: bool = False):
             for dirpath, dirnames, filenames in os.walk(base):
                 dirnames[:] = [x for x in dirnames if x not in EXCLUDE_DIRS]
                 for fn in filenames:
-                    if fn in EXCLUDE_FILES or fn.endswith((".pyc", ".log")):
+                    if fn in EXCLUDE_FILES or fn.endswith(EXCLUDE_SUFFIX):
                         continue
                     if _is_residue(fn):
                         print("  ⚠️ 挡下测试残留 %s" % fn)
@@ -178,6 +211,15 @@ def main(github: bool = False):
                     rel = os.path.relpath(full, ROOT)
                     z.write(full, rel)
                     n += 1
+    if github:
+        bad = _verify_github_pack(out)
+        if bad:
+            print("  \u274c 导出版校验失败（已删包）：")
+            for b in bad[:10]:
+                print("     %s" % b)
+            os.remove(out)
+            return None
+
     print("打包完成：%s（v%s，%d 个文件）" % (out, ver, n))
     print("  %d 个文件，%.0f KB" % (n, os.path.getsize(out) / 1024))
     return out

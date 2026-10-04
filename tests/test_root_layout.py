@@ -87,8 +87,9 @@ def main():
     sh = open(os.path.join(ROOT, "启动机器人.sh"), encoding="utf-8").read()
     ck("启动脚本指向 src/requirements.txt", "src/requirements.txt" in sh)
     bat = open(os.path.join(ROOT, "安装依赖.bat"), encoding="utf-8").read()
-    ck("安装脚本指向 src\\requirements-core.txt",
-       "src\\requirements-core.txt" in bat)
+    # v2.2.2 起改回全量清单：core 清单漏了 playwright，装完点登录会报缺依赖
+    ck("安装脚本指向 src\\requirements.txt",
+       "src\\requirements.txt" in bat)
 
     print()
     if FAILS:

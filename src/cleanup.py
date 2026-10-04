@@ -288,6 +288,22 @@ def _pids_from_file():
     return out
 
 
+def _proc_names() -> list:
+    """要扫描的进程名 —— 源码版与 exe 版不一样。
+
+    源码版：python.exe / pythonw.exe（脚本由解释器跑）
+    exe 版：主程序自己的名字（OnOBN.exe）。
+
+    ⚠️ 为什么必须分开：exe 里没有 python.exe，照旧只扫 python.*
+       的话，残留实例**一个都扫不到**，用户反复双击就会开出一堆
+       互相抢端口的进程，而"检测到残留"永远显示 0。
+    """
+    if getattr(sys, "frozen", False):
+        n = os.path.basename(sys.executable or "")
+        return [n] if n else []
+    return ["python.exe", "pythonw.exe"]
+
+
 def is_ours(cmdline: str) -> bool:
     """判断这条命令行是不是本项目的进程。
 
@@ -302,6 +318,11 @@ def is_ours(cmdline: str) -> bool:
     c = _norm(cmdline)
     if not c:
         return False
+    # exe 版：命令行形如 `C:\...\OnOBN.exe --child webui --host ...`，
+    # 里面既没有 start.py 也没有 bot.py，按下面的脚本名判会全部漏掉。
+    if getattr(sys, "frozen", False):
+        exe = _norm(os.path.basename(sys.executable or ""))
+        return bool(exe) and exe in c
     base = _norm(BASE_DIR)
     for t in TARGETS:
         if t not in c:
@@ -327,7 +348,7 @@ def _list_ps_wmic() -> list:
     try:
         r = subprocess.run(
             ["wmic", "process", "where",
-             "name='python.exe' or name='pythonw.exe'", "get",
+             " or ".join("name='%s'" % n for n in _proc_names()), "get",
              "ProcessId,CommandLine", "/format:list"],
             capture_output=True, text=True, timeout=25)
     except Exception:
@@ -365,8 +386,9 @@ def list_ours() -> list:
     if os.name == "nt":
         try:
             ps = (
-                "Get-CimInstance Win32_Process -Filter \"Name='python.exe' or "
-                "Name='pythonw.exe'\" | Select-Object ProcessId,CommandLine "
+                "Get-CimInstance Win32_Process -Filter \"" + " or ".join(
+                    "Name='%s'" % n for n in _proc_names()
+                ) + "\" | Select-Object ProcessId,CommandLine "
                 "| ConvertTo-Csv -NoTypeInformation"
             )
             r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
@@ -527,7 +549,7 @@ def all_ours() -> list:
             if pid == me or pid in pids:
                 continue
             cmd = _cmdline_of(pid)
-            if cmd and ("python" in cmd.lower()) and is_ours(cmd):
+            if cmd and is_ours(cmd):
                 pids.add(pid)
     except Exception:
         pass

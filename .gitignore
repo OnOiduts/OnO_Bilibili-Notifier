@@ -27,6 +27,7 @@ data/
 logs/
 **/logs/
 *.log
+botpy.log
 *.db
 *.db-journal
 *.sqlite
