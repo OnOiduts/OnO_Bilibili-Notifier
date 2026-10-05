@@ -73,12 +73,17 @@ def main():
     check("设置后能用该口令登录", bool(d2 and d2.get("ok")), f"返回 {d2}")
 
     # ── 3. 前端 clear-pwd 按钮实际发的字段 ────────────────────────
-    # app.js:  post('/api/security/password', { password: '', clear: true })
-    # 用上面那个 client（带着登录 cookie）
+    # app.js:  post('/api/security/password', { action:'clear', old: 原口令, password: 原口令 })
+    # ⚠️ 清除口令必须带原口令（跟修改口令同一标准），这也是前端弹框索要的原因。
     reset_cfg()
     c3 = webui.app.test_client()
     call(c3, {"action": "set", "new": "temp123456"})     # 先设上
-    d3 = call(c3, {"password": "", "clear": True}).get_json()
+    # ⚠️ 设完之后必须**真的登录一次**再清。以前首次设置会白送一枚登录令牌，
+    #    所以"设完直接清"能过；自从改成「首次设置不下发令牌 + 世代号 +1」
+    #    之后，没登录就是未登录 —— 清除口令这种改门锁的操作当然要验明身份。
+    c3.post("/api/login", json={"password": "temp123456"}, headers=HDR)
+    d3 = call(c3, {"action": "clear", "old": "temp123456",
+                   "password": "temp123456"}).get_json()
     check("clear-pwd 按钮的写法能清除", bool(d3 and d3.get("ok")), f"返回 {d3}")
     check("清除后配置里没有口令",
           not str(webui.load_cfg().get("web_password") or ""),
@@ -89,8 +94,17 @@ def main():
     c4 = webui.app.test_client()
     d4 = call(c4, {"action": "set", "new": "newpass123"}).get_json()
     check("{action:set, new:...} 写法仍可用", bool(d4 and d4.get("ok")), f"返回 {d4}")
-    d5 = call(c4, {"action": "clear"}).get_json()
-    check("{action:clear} 写法仍可用", bool(d5 and d5.get("ok")), f"返回 {d5}")
+    c4.post("/api/login", json={"password": "newpass123"}, headers=HDR)
+    # ⚠️ 清除口令 = 拆门锁，比修改更狠，所以同样要求验证原口令
+    # （此前这里断言"不带 old 也能清除"，守的正是那个漏洞本身）。
+    d5 = call(c4, {"action": "clear", "old": "newpass123"}).get_json()
+    check("{action:clear} 带原口令可清除", bool(d5 and d5.get("ok")), f"返回 {d5}")
+    reset_cfg()
+    c5 = webui.app.test_client()
+    call(c5, {"action": "set", "new": "another123"})
+    c5.post("/api/login", json={"password": "another123"}, headers=HDR)
+    d6 = call(c5, {"action": "clear"}).get_json()
+    check("{action:clear} 不带原口令要被拒绝", not (d6 and d6.get("ok")), f"返回 {d6}")
 
     # ── 5. 太短的口令必须拒绝 ─────────────────────────────────────
     reset_cfg()

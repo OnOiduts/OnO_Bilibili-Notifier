@@ -724,6 +724,24 @@ td { padding: 8px 7px; border-bottom: 1px solid var(--line-2); vertical-align: m
   background: color-mix(in srgb, var(--warn) 12%, transparent);
 }
 
+/* 使用声明专用：整块标红。
+   ⚠️ 为什么单独一个 class 而不是复用 .note.warn：
+      .note 本身是橙色（"留意"级别），而使用声明是**必须读完**的那类，
+      橙色会被旁边一堆普通提示淹没。这里连边框、底色、标题一起变红，
+      并且在浅色主题下也保持足够对比（用 danger 系变量，不是写死颜色）。 */
+.note.danger {
+  border-color: color-mix(in srgb, var(--danger) 42%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger-tx);
+  border-left: 3px solid var(--danger);
+}
+.note.danger b { color: var(--danger-tx); }
+.note.danger code {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+}
+/* 卡片标题也能标红：使用声明那一节用它，跟下面的红块成对 */
+h3.danger, .card h3.danger { color: var(--danger-tx); }
+
 /* ============================================================
    动效（v1.22.0）
    原则：只做"有物理感"的动效 —— 跟随指针的光、轻微 3D 倾斜、

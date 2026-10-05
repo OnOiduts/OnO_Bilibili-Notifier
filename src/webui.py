@@ -32,14 +32,15 @@ from cfgutil import (cfg_path as _cfg_path, creds_ready,
                      load_cfg as _load_cfg)
 from cfgutil import safe_stdio
 safe_stdio()
-from notify import (DEFAULT_TEMPLATES, HEAD_TITLE, MARK_LINE, TPL_VARS,
-                    TPL_GROUPS, VAR_LABEL, apply_test_mark, cover_of, render,
+from notify import (DEFAULT_TEMPLATES, MARK_LINE, TPL_GROUPS, TPL_LABEL,
+                    TPL_VARS, VAR_LABEL, apply_test_mark, cover_of, render,
                     strip_images)
 from qqapi import QQClient, build_keyboard
 from security import (Audit, LoginLimiter, bind_risk, client_ip, get_secret_key,
                       hash_password, is_hashed, is_loopback, issue_token, redact,
                       resolve_in_base, restrict_perms, validate_gid,
-                      validate_kind, validate_uid, verify_password, verify_token)
+                      validate_kind, validate_uid, verify_password, verify_token,
+                      bump_auth_gen, get_auth_gen)
 from db import KIND_LABEL, KINDS, Store, DEFAULT_KINDS
 import paths
 import db
@@ -51,6 +52,13 @@ app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"),
             static_folder=os.path.join(BASE_DIR, "static"))
 # 会话签名密钥持久化到 .webui_secret（600），重启后已登录状态不失效
 app.secret_key = get_secret_key()
+
+# 让 jsonify 直接输出中文，而不是 \uXXXX 转义。
+# 两者都是合法 JSON，但前端报错时若直接显示响应原文，用户看到的就是一串天书。
+try:
+    app.json.ensure_ascii = False
+except Exception:      # 老版本 Flask 没有这个属性，忽略即可
+    pass
 
 # 加固层：安全响应头 + 全局限流 + 自动封禁 + 请求体大小限制
 harden.init_app(app)
@@ -162,8 +170,13 @@ def need_auth() -> bool:
 
 
 def authed() -> bool:
-    """校验签名令牌，而不是拿 cookie 和口令做明文比对。"""
-    return verify_token(app.secret_key, request.cookies.get(COOKIE_NAME, ""))
+    """校验签名令牌，而不是拿 cookie 和口令做明文比对。
+
+    ⚠️ 必须带上当前令牌世代号。签名密钥是持久化的、令牌有效期 7 天，
+       少了世代号，服务端一旦签发就无法作废 —— 旧会话会一直有效。
+    """
+    return verify_token(app.secret_key, request.cookies.get(COOKIE_NAME, ""),
+                        get_auth_gen())
 
 
 def _auth_ok() -> bool:
@@ -183,7 +196,10 @@ def _auth_ok() -> bool:
 @app.before_request
 def guard():
     # 登录入口和静态资源永远可访问（登录接口内部自己做限流）
-    if request.path.startswith(("/login", "/static", "/api/login")):
+    # ⚠️ /api/brand/ 也必须放行：登录页自己要显示 logo，标签页图标更是
+    #    不带 cookie 也不带自定义头。设了口令之后如果把它们挡在门外，
+    #    登录页会显示成无图、标签页图标也永远取不到。
+    if request.path.startswith(("/login", "/static", "/api/login", "/api/brand")):
         return None
 
     # 写操作统一要求自定义头，阻断跨站表单提交（CSRF）
@@ -201,44 +217,204 @@ def guard():
     return redirect("/login")
 
 
-@app.route("/api/login", methods=["POST"])
-def api_login():
-    ip = client_ip()
+def _check_login(ip, pwd):
+    """校验一次登录尝试，返回 (ok, msg)。
+
+    JSON 接口和**原生表单提交**共用这一套判定 —— 否则会出现
+    "接口被限流了、但直接提交表单还能继续试"这种绕过。
+    """
     left = LIMITER.remaining(ip)
     if left > 0:
-        return jsonify({"ok": False, "msg": f"尝试太多次，请 {left} 秒后再试"}), 429
+        return False, f"尝试太多次，请 {left} 秒后再试"
 
-    pwd = (request.json or {}).get("password", "")
     stored = str(load_cfg().get("web_password") or "")
     if not verify_password(pwd, stored):
         lock = LIMITER.note_fail(ip)
         AUDIT.log("登录失败", ip, f"已失败 {LIMITER.fails(ip)} 次", "warn")
         msg = f"口令不对。{'已锁定，请 ' + str(lock) + ' 秒后再试。' if lock else ''}"
-        return jsonify({"ok": False, "msg": msg}), 401
+        return False, msg
 
     LIMITER.note_ok(ip)
     AUDIT.log("登录成功", ip, "", "info")
-    resp = make_response(jsonify({"ok": True}))
+    return True, ""
+
+
+SESSION_COOKIE = "onobn_sess"   # 标记"这次是临时登录"，用于滑动续期
+
+
+def _issue_login_cookie(resp, remember=True):
+    """签发登录 cookie。
+
+    ⚠️ 这里有个真实的坑，改的时候别再踩回去：
+    remember 必须同时决定 **cookie 寿命** 和 **令牌本身的寿命（ttl）**。
+    以前只用它设了 cookie 的 max_age，令牌却始终按默认的 7 天签发 ——
+    于是「不勾记住」只是让 cookie 变成会话级，而 Chrome 的「继续上次的
+    会话」会把会话 cookie 也恢复出来，令牌又是 7 天有效，结果勾不勾一个样。
+
+    现在：
+      - 勾了 → cookie max_age=7 天，令牌 ttl=7 天，持久登录；
+      - 没勾 → cookie 会话级 + 令牌 ttl=SESSION_TOKEN_TTL（默认 30 分钟），
+        并额外放一枚会话级标记 cookie，供 after_request 滑动续期。
+    """
+    import security as _sec
+    ttl = _sec.TOKEN_TTL if remember else _sec.SESSION_TOKEN_TTL
     resp.set_cookie(
-        COOKIE_NAME, issue_token(app.secret_key),
-        max_age=7 * 86400, httponly=True, samesite="Strict",
+        COOKIE_NAME,
+        issue_token(app.secret_key, ttl=ttl, gen=get_auth_gen()),
+        max_age=(7 * 86400 if remember else None),
+        httponly=True, samesite="Strict",
         secure=request.is_secure,
     )
+    if remember:
+        resp.set_cookie(SESSION_COOKIE, "", max_age=0, httponly=True,
+                        samesite="Strict", secure=request.is_secure)
+    else:
+        resp.set_cookie(SESSION_COOKIE, "1", max_age=None, httponly=True,
+                        samesite="Strict", secure=request.is_secure)
     return resp
+
+
+@app.after_request
+def _slide_session(resp):
+    """临时登录（没勾记住）滑动续期：还在操作就续，不动了到点自己失效。
+
+    为什么需要这个：单靠 cookie 寿命判断"浏览器关没关"是不可靠的，
+    浏览器会恢复会话 cookie。所以改成服务端空闲计时 —— 30 分钟没有任何
+    请求，令牌自然过期，下一次访问就得重新登录。
+    """
+    try:
+        if request.cookies.get(SESSION_COOKIE) != "1":
+            return resp
+        if not need_auth() or not authed():
+            return resp
+        resp.set_cookie(
+            COOKIE_NAME,
+            issue_token(app.secret_key, ttl=_sec_ttl(), gen=get_auth_gen()),
+            max_age=None, httponly=True, samesite="Strict",
+            secure=request.is_secure,
+        )
+    except Exception:
+        pass
+    return resp
+
+
+def _sec_ttl():
+    import security as _sec
+    return _sec.SESSION_TOKEN_TTL
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    ip = client_ip()
+    d = request.json or {}
+    pwd = d.get("password", "")
+    ok, msg = _check_login(ip, pwd)
+    if not ok:
+        code = 401 if "口令不对" in msg else 429
+        return jsonify({"ok": False, "msg": msg}), code
+
+    resp = make_response(jsonify({"ok": True}))
+    return _issue_login_cookie(resp, remember=bool(d.get("remember")))
 
 
 @app.route("/logout")
 def logout():
+    # 世代号 +1：登出要让所有已签发的会话作废，而不只是清掉自己
+    # 这一枚 cookie —— 否则别人手里的旧令牌照样能进。
+    bump_auth_gen()
     resp = make_response(redirect("/login"))
     resp.set_cookie(COOKIE_NAME, "", max_age=0)
     return resp
 
 
-@app.route("/login", methods=["GET"])
+@app.route("/api/lock", methods=["POST"])
+def api_lock():
+    """手动锁：立刻锁定面板，所有会话作废（不限当前这一枚）。
+
+    跟 logout() 的区别只在返回形态 —— 这个是给面板按钮调的，返回 JSON，
+    前端自己跳登录页。世代号 +1 是同一个动作，所以别人手里的旧令牌也失效。
+    """
+    if not need_auth():
+        return jsonify({"ok": False, "msg": "还没设置口令，无需锁定"})
+    bump_auth_gen()
+    resp = make_response(jsonify({"ok": True, "msg": "已锁定"}))
+    resp.set_cookie(COOKIE_NAME, "", max_age=0, httponly=True,
+                    samesite="Strict", secure=request.is_secure)
+    resp.set_cookie(SESSION_COOKIE, "", max_age=0, httponly=True,
+                    samesite="Strict", secure=request.is_secure)
+    return resp
+
+
+def _theme_from_cookie() -> str:
+    """登录页初始主题：读面板写下的 bili-theme cookie。
+
+    为什么需要服务端参与：登录页此前把主题完全交给 body 末尾的一段 JS
+    —— 脚本没跑到（被拦、被缓存、老内核报错）就是硬编码的 dark，用户看到
+    "锁死在夜间模式"；跑到也是先把深色画出来再切成浅色，闪一下。
+
+    现在两端都参与：服务端先按 cookie 定一次（JS 完全不执行也对），
+    前端 <head> 里的内联脚本再用 localStorage 校正一次（面板主要存那里）。
+
+    ⚠️ cookie 只是"尽力而为"：读不到就返回 dark，由前端兜底，不在这里猜。
+    """
+    try:
+        from flask import request
+        v = (request.cookies.get("bili-theme") or "").strip().lower()
+    except Exception:
+        v = ""
+    return v if v in ("light", "dark") else "dark"
+
+
+def _login_ctx(error="", authed_now=None):
+    """登录页模板变量，两条渲染路径（GET / POST 失败）共用，避免漏传。"""
+    if authed_now is None:
+        authed_now = authed()
+    return {
+        "error": error,
+        "authed": authed_now,
+        # ⚠️ 必须传：登录页用它拼 style.css?v= 和 ico?v= 的缓存串。
+        #    不传就渲染成空，换版本后浏览器继续用旧的 CSS，看着像"改了没生效"。
+        "app_version": _version.current(),
+        # 背景飘动用的**同目录同名字的 svg**；svg 取不到时前端会自动退回同名 png。
+        "bg_logo_svg": svg_variant(_logo_remote_url()),
+        "bg_ico_svg": svg_variant(_ico_remote_url()),
+        # 背景额外飘的两张装饰图（svg 取不到前端会退回同名 png）
+        # ⚠️ png 地址也必须传：装饰图此前只挂了 onerror="display:none"，
+        #    svg 一旦取不到就直接消失，于是"左下/右下两个角是空的"。
+        #    现在跟 logo/ico 一样走 svg → 同名 png → 隐藏 的降级链。
+        "bg1_svg": svg_variant(_bg1_remote_url()),
+        "bg2_svg": svg_variant(_bg2_remote_url()),
+        "bg1_png": _bg1_remote_url(),
+        "bg2_png": _bg2_remote_url(),
+        # 初始主题：后端读 cookie 先定一次，前端再用 localStorage 校正。
+        "theme": _theme_from_cookie(),
+    }
+
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
     if not need_auth():
         return redirect("/")
-    return render_template("login.html", error="", authed=authed())
+
+    # ⚠️ POST 这条路径是**保底登录**：登录页的提交是一个真正的
+    # <form method="post">，不走 JavaScript。以前只支持 JSON 接口，
+    # 脚本一旦没执行（老浏览器不认 ES6 语法、被插件或缓存拦掉），
+    # 点「进入」就毫无反应，连错误都显示不出来 —— 因为显示提示的代码也是 JS。
+    # 现在没有 JS 也能登录：浏览器原生提交 → 这里校验 → 成功直接跳转。
+    if request.method == "POST":
+        pwd = request.form.get("password", "")
+        # 原生表单提交：remember 是真正的 <input name="remember">，
+        # 浏览器会一起序列化进来，不用像 fetch 那条路那样手动塞。
+        remember = bool(request.form.get("remember"))
+        ok, msg = _check_login(client_ip(), pwd)
+        if ok:
+            return _issue_login_cookie(make_response(redirect("/")),
+                                       remember=remember)
+        # 失败就重新渲染登录页，把原因写进页面（服务端渲染，不依赖 JS）
+        return render_template("login.html", **_login_ctx(error=msg,
+                                                          authed_now=False)), 401
+
+    return render_template("login.html", **_login_ctx())
 
 
 # ---------------- 页面 ----------------
@@ -247,7 +423,12 @@ def index():
     # ⚠️ app_version 必须传：页面用它显示版本号，并且拼在
     # /static/style.css?v=... 后面当缓存串。不传就渲染成空，
     # 更新后浏览器会继续用旧的 CSS/JS，看着像"改了没生效"。
-    return render_template("index.html", app_version=_version.current())
+    # ⚠️ theme 必须传：面板首页此前硬编码 data-theme="dark"，
+    #    日间模式的用户登录成功后进面板会先闪一下夜间，等 app.js
+    #    加载执行才变回日间。服务端先按 cookie 定一次，
+    #    前端 <head> 里的内联脚本再用 localStorage 校正。
+    return render_template("index.html", app_version=_version.current(),
+                           theme=_theme_from_cookie())
 
 
 # ---------------- API ----------------
@@ -388,7 +569,7 @@ def api_state():
         # 自定义值单独给，前端才能区分「用户改过」和「用的默认」
         "tpl_custom": cfg.get("templates") or {},
         "tpl_defaults": DEFAULT_TEMPLATES,
-        "tpl_titles": HEAD_TITLE,
+        "tpl_titles": TPL_LABEL,
         "kinds": [{"key": k, "label": KIND_LABEL[k]} for k in KINDS],
         # 每个群对每个 UP 改了几条专属文案 → {gid: {uid: n}}
         "up_tpl_counts": {
@@ -704,7 +885,7 @@ def api_season_templates():
     POST {gid, uid, season_id, templates:{kind: content}}
     某项传空 = 取消覆盖，回落到群级 / 全局 / 内置默认。
     """
-    from notify import DEFAULT_TEMPLATES, HEAD_TITLE
+    from notify import DEFAULT_TEMPLATES, TPL_LABEL
     if request.method == "GET":
         try:
             gid = validate_gid(request.args.get("gid"))
@@ -719,7 +900,7 @@ def api_season_templates():
             "defaults": DEFAULT_TEMPLATES,
             "global": cfg.get("templates") or {},
             "custom": st.get_season_templates(gid, uid, season_id),
-            "titles": HEAD_TITLE,
+            "titles": TPL_LABEL,
             # 合集只显示「合集更新」这一类，变量也只给合集能用的
             "groups": [{"key": "season", "label": "📦 合集更新",
                         "keys": ["season"]}],
@@ -783,7 +964,7 @@ def api_up_templates():
             "defaults": DEFAULT_TEMPLATES,
             "global": cfg.get("templates") or {},
             "custom": st.get_up_templates(gid, uid),
-            "titles": HEAD_TITLE,
+            "titles": TPL_LABEL,
             "groups": want,
             "opened": sorted(opened),
             "vars": TPL_VARS,
@@ -2145,10 +2326,23 @@ def api_set_password():
     ip = client_ip()
 
     if action == "clear":
-        if not _auth_ok():
-            return jsonify({"ok": False, "msg": "请先登录"}), 401
+        # 清除口令 = 拆掉门锁，比改口令后果更严重，门槛只能更高不能更低。
+        # 以前这里只查「有没有登录态」，意思是"已登录就免验原口令"——谁手里
+        # 有一枚有效会话就能把口令拆掉。现在与修改口令同一标准：只要已经设过
+        # 口令，清除一律先验证原口令，不再看请求来源、也不再看是否登录。
+        if need_auth():
+            old_c = str(d.get("old") or d.get("password") or "")
+            if not verify_password(old_c, str(cfg.get("web_password") or "")):
+                LIMITER.note_fail(ip)
+                AUDIT.log("清除口令失败", ip, "原口令不正确", "warn")
+                return jsonify({
+                    "ok": False,
+                    "msg": "原口令不对（清除口令必须先验证原口令）"}), 401
         cfg.pop("web_password", None)
         save_cfg(cfg)
+        # 世代号 +1：既然改成免登录，此前凭口令进来的会话也该作废，
+        # 免得清完口令旧令牌还挂着。
+        bump_auth_gen()
         AUDIT.log("清除口令", ip, "面板改为免登录", "warn")
         return jsonify({"ok": True, "msg": "已清除口令，面板现在无需登录即可访问。"})
 
@@ -2162,22 +2356,54 @@ def api_set_password():
         AUDIT.log("设置口令被拒", client_ip(), "非本机首次设置", "warn")
         return jsonify({"ok": False, "msg": "首次设置口令只允许在本机操作"}), 403
 
-    if need_auth() and not authed():
-        # 已设口令但未登录：必须校验旧口令
+    # ⚠️ 只要已经设过口令，**就必须校验旧口令** —— 不管当前是不是登录状态。
+    # 以前写成 `if need_auth() and not authed()`，意思是"已登录就不用验旧口令"：
+    # 谁手里有一枚有效会话（比如别人用过的电脑、借去的令牌、清口令前的旧 cookie），
+    # 就能直接把口令改掉，把真正的主人锁在门外，而主人这边连个提示都没有。
+    # 改口令属于"改门锁"，必须证明自己知道原来的锁芯。
+    if need_auth():
         if not verify_password(old, str(cfg.get("web_password") or "")):
             LIMITER.note_fail(ip)
             AUDIT.log("改口令失败", ip, "旧口令不正确", "warn")
-            return jsonify({"ok": False, "msg": "原口令不对"}), 401
+            return jsonify({
+                "ok": False,
+                "msg": "原口令不对（修改口令必须先验证原口令，即使当前已登录）"}), 401
+
+    # 记下设置前的状态：True 表示这次是「首次设置」（此前面板免登录）
+    _was_open = not need_auth()
 
     cfg["web_password"] = hash_password(new)
     save_cfg(cfg)
     LIMITER.note_ok(ip)
     AUDIT.log("设置口令", ip, "已加密保存", "info")
+
+    # ⚠️ 首次设置**绝不能**下发登录令牌。
+    # 以前这里无条件 set_cookie(issue_token(...))，后果是：设完口令当场白拿一个
+    # 7 天有效的免登录会话 —— 登录页永远不会出现，口令形同虚设；连带把上面
+    # 「首次设置只允许本机操作」这道防护也抵消掉了（本机设完即刻拿到令牌）。
+    # 正确做法是让他用刚设的口令登录一次，证明确实是本人在设。
+    if _was_open:
+        # 世代号 +1：把此前面板免登录期间可能残留的任何令牌全部作废。
+        # 这一步对老用户尤其关键 —— 以前设置口令会白送一枚 7 天令牌，
+        # 光靠"这次不下发"治不了已经发出去的那些。
+        bump_auth_gen()
+        AUDIT.log("设置口令", ip, "首次设置，要求重新登录", "info")
+        return jsonify({
+            "ok": True,
+            "need_login": True,
+            "msg": "口令已设置并加密保存（配置文件里只会看到 pbkdf2 开头的哈希）。"
+                   "请刷新页面，用刚设的口令登录。请自己记住，忘了可以用 "
+                   "python security.py --hash 新口令 手动替换。"})
+
+    # 修改口令：前面已校验过旧口令，确认是本人，保持登录并续期。
     resp = make_response(jsonify({
         "ok": True,
-        "msg": "口令已设置并加密保存（配置文件里只会看到 pbkdf2 开头的哈希）。"
+        "msg": "口令已更新并加密保存（配置文件里只会看到 pbkdf2 开头的哈希）。"
                "请自己记住，忘了可以用 python security.py --hash 新口令 手动替换。"}))
-    resp.set_cookie(COOKIE_NAME, issue_token(app.secret_key),
+    # 世代号 +1：改口令之后，此前所有会话（含其他设备）立即失效，
+    # 再按新世代号给当前这个已验证身份的会话补发一枚。
+    resp.set_cookie(COOKIE_NAME,
+                    issue_token(app.secret_key, gen=bump_auth_gen()),
                     max_age=7 * 86400, httponly=True, samesite="Strict",
                     secure=request.is_secure)
     return resp
@@ -3223,13 +3449,58 @@ def api_data_info():
 #
 # ⚠️ 这里用 jsDelivr 而不是 raw.githubusercontent.com：
 #    指向的是同一个仓库、同一个分支、同一张图，但 raw 域名在国内经常被拦，
-#    实测 20 秒超时取不到；jsDelivr 是 GitHub 的公共 CDN 镜像，1 秒就返回。
+#    实测 20 秒超时取不到；jsDelivr 是 GitHub 的公共 CDN 镜像，实测 1 秒就返回。
 #    想换回官方 raw（或其它镜像）设环境变量 ONOBN_LOGO_URL 即可。
+#
+# 图床仓库：https://github.com/XxBoLuoxX/OnO-ImageHost-  （注意名字末尾有连字符）
+# 图片路径：Logo/logo.png（大写 L 的目录名，GitHub 路径大小写敏感）
 LOGO_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/XxBoLuoxX/"
-                    "xxboluoxx.github.io@main/images/logo.png")
+                    "OnO-ImageHost-@main/Logo/logo.png")
 
 # 设成这几个值 = 明确不要 logo（离线部署时用，省掉一次外部请求）
 LOGO_OFF_VALUES = ("off", "none", "disable", "disabled", "0")
+
+# 标签页小图标。同样走 jsDelivr，理由同上（raw 域名国内经常取不到）。
+# 图床仓库：https://github.com/XxBoLuoxX/OnO-ImageHost-  （名字末尾有连字符）
+# 图片路径：Web/OnOBN/ico.png（Web、OnOBN 两处都是大写开头，大小写敏感）
+ICO_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/XxBoLuoxX/"
+                   "OnO-ImageHost-@main/Web/OnOBN/ico.png")
+
+# 登录页背景装饰图：除 logo / ico 之外再飘两张，让背景不那么单调。
+# 图床路径：Web/OnOBN/bg1.svg、Web/OnOBN/bg2.svg（目录名大小写敏感）。
+# 同样可用环境变量 ONOBN_BG1_URL / ONOBN_BG2_URL 换，设 off 则不显示。
+#
+# ⚠️ 实测过这两张图的可达性：**两个 CDN 各有一张取不到**
+#    bg1.svg → raw 200(1.6KB/1.0s)，jsDelivr 502
+#    bg2.svg → raw 超时，jsDelivr 200(293KB/7.8s)
+#   所以两张图**分别走不同的源**，各自取最快的那条路。
+#   即便如此仍可能取不到（CDN 边缘节点抖动，之前 logo 就反复出现过），
+#   这没关系：登录页每张图都有降级链，取不到就隐藏，背景还有纯 CSS 光斑兜底。
+#
+# ⚠️⚠️ 这里的默认地址**必须是 .png**，不能是 .svg。
+#    背景 <img> 的 src 用 svg_variant(它) 换成 .svg，onerror 的回退地址用它本身。
+#    以前这里直接写成 .svg，结果 src 和回退地址**是同一个字符串** ——
+#    svg 取不到 → 用同一个取不到的地址再试一次 → 再失败 → 隐藏。
+#    降级链等于没做，表现就是"左下角和右下角是空的"（bg1/bg2 正是那两个角）。
+BG1_URL_DEFAULT = ("https://raw.githubusercontent.com/XxBoLuoxX/"
+                   "OnO-ImageHost-/main/Web/OnOBN/bg1.png")
+BG2_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/XxBoLuoxX/"
+                   "OnO-ImageHost-@main/Web/OnOBN/bg2.png")
+
+
+def svg_variant(url: str) -> str:
+    """同目录、同文件名，只把扩展名换成 .svg。
+
+    登录页背景飘的就是这两张图（放得很大），用矢量图放大不糊、体积也小得多。
+
+    ⚠️ 换完的地址**可能取不到**（图床里还没传 svg）。这没关系：登录页的
+       <img> 挂了降级链 —— svg 404 → 自动退回同名 png → 再失败才隐藏，
+       而且背景本身还有纯 CSS 光斑兜底，任何时候都"有东西在飘"。
+    """
+    if not url or "." not in url.rsplit("/", 1)[-1]:
+        return ""
+    base, _dot, _ext = url.rpartition(".")
+    return (base + ".svg") if base else ""
 
 
 def _logo_remote_url() -> str:
@@ -3243,6 +3514,45 @@ def _logo_remote_url() -> str:
     if raw and raw.lower() in LOGO_OFF_VALUES:
         return ""
     return raw or LOGO_URL_DEFAULT
+
+
+def _ico_remote_url() -> str:
+    """远程 favicon 地址；被显式关掉时返回空串。"""
+    raw = ""
+    try:
+        import envcfg
+        raw = envcfg.ico_url_from_env()
+    except Exception:
+        pass
+    if raw and raw.lower() in LOGO_OFF_VALUES:
+        return ""
+    return raw or ICO_URL_DEFAULT
+
+
+def _bg1_remote_url() -> str:
+    """登录页背景图 1；被显式关掉时返回空串。"""
+    raw = ""
+    try:
+        import envcfg
+        raw = envcfg.bg1_url_from_env()
+    except Exception:
+        pass
+    if raw and raw.lower() in LOGO_OFF_VALUES:
+        return ""
+    return raw or BG1_URL_DEFAULT
+
+
+def _bg2_remote_url() -> str:
+    """登录页背景图 2；被显式关掉时返回空串。"""
+    raw = ""
+    try:
+        import envcfg
+        raw = envcfg.bg2_url_from_env()
+    except Exception:
+        pass
+    if raw and raw.lower() in LOGO_OFF_VALUES:
+        return ""
+    return raw or BG2_URL_DEFAULT
 
 
 @app.route("/api/brand/logo")
@@ -3266,6 +3576,28 @@ def api_brand_logo():
     url = _logo_remote_url()
     if not url:
         return make_response("no logo", 404)
+    return redirect(url, code=302)
+
+
+@app.route("/api/brand/ico")
+def api_brand_ico():
+    """标签页小图标（favicon）：优先数据目录 images/ui/ico.png，否则走远程。
+
+    跟 logo 同源同规则：仓库里不放二进制图，换图改图床仓库或换环境变量
+    ONOBN_ICO_URL 即可；设成 off 就彻底不发这次请求（离线部署用）。
+
+    ⚠️ 这里**不能**加登录校验：浏览器取 favicon 的请求既不带 cookie 也不带
+    自定义头，登录页自己也要显示图标，加了校验就等于永远取不到。
+    """
+    try:
+        custom = os.path.join(paths.image_sub("ui"), "ico.png")
+        if os.path.exists(custom):
+            return send_file(custom, mimetype="image/png")
+    except Exception:
+        pass
+    url = _ico_remote_url()
+    if not url:
+        return make_response("no ico", 404)
     return redirect(url, code=302)
 
 
@@ -3452,6 +3784,27 @@ def api_backup_restore():
                     "stats": (r.get("meta") or {}).get("stats") or {}})
 
 
+# ── 依赖分类（「设置 → 关于」页显示）──────────────────────────────
+# 必装：缺一个就跑不起来。与 src/requirements.txt 保持一致。
+#   ⚠️ playwright 是必装，不是可选 —— 面板两条 B 站登录路线（浏览器登录 /
+#      手动粘贴 Cookie）最终都靠它把 Cookie 换成长效登录态。它曾一度被误
+#      降到可选，结果点了登录只会报「缺少依赖」，已移回。
+REQUIRED_MODULES = ("aiohttp", "botpy", "yaml", "flask", "playwright")
+# 可选：目前没有。qrcode / Pillow 随扫码登录整条链路一起删了；
+#       这份空列表保留，是为了页面能如实显示「目前没有可选依赖」，
+#       而不是让前端猜。
+OPTIONAL_MODULES: tuple = ()
+# import 用的模块名 → pip 安装时的包名。requirements.txt 里写的是 pip 名，
+# 页面显示 pip 名，用户照着补装才对得上（比如 import 是 botpy、装的是 qq-botpy）。
+PIP_NAMES = {
+    "aiohttp": "aiohttp",
+    "botpy": "qq-botpy",
+    "yaml": "PyYAML",
+    "flask": "Flask",
+    "playwright": "playwright",
+}
+
+
 @app.route("/api/about")
 def api_about():
     """「设置 → 关于」页的数据来源。
@@ -3478,14 +3831,15 @@ def api_about():
         "deps": {},
         "stats": {},
         "notes": [
-            "本机桌面环境开发调试；服务器端（Linux / Docker / 云服务器）"
-            "部署路径从未实测过",
-            "代码由 AI 生成（腾讯元宝「Hy4 preview」），"
-            "由作者 波萝Buono 整理、测试与维护",
-            "安全相关功能只做过「功能能跑通」的验证，未经过安全测试或代码审计",
+            "服务器端从未测试过：只在本机 Windows 桌面环境开发调试过，"
+            "Linux 服务器 / Docker / 云主机的部署路径没有实测，不保证能跑起来",
+            "代码由 AI 生成（腾讯元宝「Hy4 preview」），由作者 波萝Buono "
+            "整理、测试与维护；生成的代码未经人工逐行复核",
+            "安全功能未做安全审计：面板口令、登录限流、凭据加密等只验证过"
+            "「功能能跑通」，未经过安全测试、渗透测试或代码审计，请勿暴露到公网",
             "维护状态：项目已稳定，此后仅更新「功能更新」与「严重 bug 修复」"
             "（程序起不来 / 数据丢失 / 推送完全失效 / 凭据泄露）；"
-            "措辞、观感、代码风格类改动不再发布新版本，详见 README「维护政策」",
+            "文案措辞、界面观感、代码风格类改动不再发布新版本，详见 README「维护政策」",
         ],
     }
     try:
@@ -3496,12 +3850,21 @@ def api_about():
     except Exception:
         pass
     # 依赖装在不在：反馈时一眼看出是不是缺包
-    for mod in ("aiohttp", "botpy", "yaml", "flask", "playwright"):
+    #
+    # ⚠️ 分类只在这里定义一份，前端不再自己写死必装/可选清单。
+    #    以前前端硬编码 `opt = ['playwright']`，而 playwright 早已移回必装
+    #    （两条 B 站登录路线都要靠它），于是「关于」页一直显示
+    #    「可选：playwright」——和 requirements.txt 对不上，装漏了也会被
+    #    当成"只是少了个可选功能"。现在由后端给，两边不可能再不一致。
+    for mod in REQUIRED_MODULES + OPTIONAL_MODULES:
         try:
             __import__(mod)
             info["deps"][mod] = True
         except Exception:
             info["deps"][mod] = False
+    info["deps_required"] = list(REQUIRED_MODULES)
+    info["deps_optional"] = list(OPTIONAL_MODULES)
+    info["deps_pip"] = dict(PIP_NAMES)
     try:
         from tools import backup_all
         info["stats"] = backup_all._stats(info["state_path"])
@@ -3814,6 +4177,14 @@ def main():
         if f and os.path.exists(f):
             restrict_perms(f)
 
+    # ⚠️ 打印程序目录：登录页/面板"改了没生效"的最常见原因是机器人还在跑
+    #    另一个目录（旧的那份），或覆盖解压后没重启。Flask 默认不热加载模板
+    #    （jinja_env.auto_reload=False），不重启就拿不到新模板。
+    #    把这行打出来，用户一眼能比对"我解压到的目录"和"实际跑的目录"。
+    try:
+        print(f"面板程序目录 → {os.path.dirname(os.path.abspath(__file__))}")
+    except Exception:
+        pass
     print(f"管理面板已启动 → http://{host}:{args.port}")
     if str(cfg.get("web_password") or ""):
         print("访问需要口令（登录失败会被限流锁定）")

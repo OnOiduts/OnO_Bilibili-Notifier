@@ -38,6 +38,8 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 
 PBKDF2_ITER = 120_000
 TOKEN_TTL = 7 * 86400
+# 不勾「记住登录状态」时的令牌寿命（滑动续期，见 webui._issue_login_cookie）
+SESSION_TOKEN_TTL = 30 * 60
 
 # 允许出现在提醒卡片里的图片域名（防上游返回恶意地址）
 IMG_HOST_SUFFIXES = (
@@ -111,26 +113,105 @@ def _sign(key: str, payload: str) -> str:
                     hashlib.sha256).hexdigest()
 
 
-def issue_token(key: str, ttl: int = TOKEN_TTL) -> str:
+# ─────────────────── 进程世代号（关掉程序后旧令牌作废） ───────────────────
+# 每次进程启动随机生成，**只活在内存里、绝不落盘**。关掉程序再开，这个值
+# 就变了 —— 令牌里编了它，于是上一轮的令牌全部失效、必须重新登录。
+#
+# 为什么需要它：签名密钥必须持久化（否则重启一次就被登出一次），而密钥一
+# 持久化，已签发的令牌服务端就作废不掉。用户要的是「我把程序关了，再开就
+# 得重新输口令」—— 这是最朴素的预期，之前却做不到：关掉机器人再启动，
+# 浏览器里那枚令牌照样验得过。
+#
+# 进程世代号正好补上这一环：它的生命周期就是进程的生命周期，进程一退，
+# 它带走的那一批令牌一起作废。
+_BOOT_ID = secrets.token_hex(8)
+
+
+def boot_id() -> str:
+    """当前进程的世代号。进程重启即变，不落盘。"""
+    return _BOOT_ID
+
+
+def issue_token(key: str, ttl: int = TOKEN_TTL, gen: int = 0,
+                boot: str = "") -> str:
+    """签发登录令牌。
+
+    ⚠️ gen（令牌世代号）是这里的关键，别当成可选装饰。
+
+    签名密钥是**持久化**的（get_secret_key 写进文件，否则每次重启都被登出），
+    而令牌有效期 7 天。两者叠加的后果是：一旦签发，服务端就**再也作废不掉**
+    —— 只要密钥文件还在，那个 7 天令牌就一直验得过。
+
+    这曾造成一个真实漏洞：设置口令的接口以前会无条件下发令牌，用户设完口令
+    白拿一个 7 天会话。后来改成了"首次设置不下发令牌"，但**已经发出去的
+    旧令牌依然有效** —— 于是表现成「设完口令再打开还是不弹登录页，
+    换什么地址都能进」，而服务端对此毫无办法。
+
+    所以把世代号编进令牌：设置/清除口令时 +1，此后签发的令牌带新世代号，
+    旧的因对不上而全部失效。
+
+    ⚠️ boot（进程世代号）同理关键：它让「关掉程序就得重新登录」成立。
+    不传则用当前进程的 boot_id() —— 也就是说默认行为就是绑定本进程。
+
+    格式 admin:{exp}:{gen}:{boot}:{nonce}:{sig}
+    """
     exp = int(time.time()) + ttl
     nonce = secrets.token_hex(8)
-    sig = _sign(key, f"admin:{exp}:{nonce}")
-    return f"admin:{exp}:{nonce}:{sig}"
+    bid = boot or boot_id()
+    sig = _sign(key, f"admin:{exp}:{gen}:{bid}:{nonce}")
+    return f"admin:{exp}:{gen}:{bid}:{nonce}:{sig}"
 
 
-def verify_token(key: str, token: str) -> bool:
+def verify_token(key: str, token: str, gen: int = 0, boot: str = "") -> bool:
     if not token:
         return False
     try:
-        user, exp, nonce, sig = token.split(":", 3)
+        # 6 段：旧格式（4 段 / 5 段）在这里会 ValueError —— 正好，升级后
+        # 旧令牌一律失效、必须重新登录一次，这正是我们想要的。
+        user, exp, tgen, tboot, nonce, sig = token.split(":", 5)
     except ValueError:
         return False
-    if not hmac.compare_digest(sig, _sign(key, f"{user}:{exp}:{nonce}")):
+    if tgen != str(gen):
+        return False
+    if tboot != (boot or boot_id()):
+        return False
+    if not hmac.compare_digest(
+            sig, _sign(key, f"{user}:{exp}:{tgen}:{tboot}:{nonce}")):
         return False
     try:
         return int(exp) > time.time()
     except ValueError:
         return False
+
+
+# ────────────────────── 令牌世代号（让旧会话失效） ──────────────────────
+def _auth_gen_path() -> str:
+    return paths.key_file(".webui_authgen")
+
+
+def get_auth_gen() -> int:
+    """读当前令牌世代号。文件不存在/损坏都当作 0。"""
+    try:
+        with open(_auth_gen_path(), "r", encoding="utf-8") as f:
+            return int((f.read() or "0").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def bump_auth_gen() -> int:
+    """世代号 +1 并落盘，返回新值。此后此前签发的所有令牌立即失效。
+
+    调用时机：设置口令、修改口令、清除口令、登出。
+    这些动作的语义都是"此前的会话不再作数"。
+    """
+    gen = get_auth_gen() + 1
+    try:
+        fd = os.open(_auth_gen_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(gen))
+    except OSError:
+        pass
+    return gen
 
 
 # ────────────────────────── 登录限流 ──────────────────────────

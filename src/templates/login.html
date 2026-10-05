@@ -1,71 +1,615 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="{{ theme }}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>登录 · OnOB站通知订阅工具（OnOBN）</title>
 <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+<!-- ⚠️ 主题脚本必须紧跟 CSS、放在 <head> 里，且必须是 ES5（var / function）。
+     以前它在 body 末尾：浏览器已经用硬编码的 data-theme="dark" 把整页画完了
+     才轮到它改 —— 用户看到的是"锁死在夜间模式"，或者先深后浅闪一下。
+     放到 head 里则在渲染 body 之前就定好，两个毛病一起消失。
+     服务端会先按 cookie 定一次（见 webui._theme_from_cookie），
+     这里再用 localStorage 校正一次（面板主要存在 localStorage）。 -->
+<script nonce="{{ csp_nonce }}">
+(function () {
+  var t = null;
+  try { t = localStorage.getItem('bili-theme'); } catch (e) { t = null; }
+  if (t !== 'light' && t !== 'dark') {
+    t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          ? 'dark' : 'light';
+  }
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+<!-- 标签页小图标：不随包带图，地址由后端 /api/brand/ico 给出（远程读取，
+     可用环境变量 ONOBN_ICO_URL 换，设 off 则接口返回 404、浏览器静默不显示）。
+     ⚠️ 带版本号参数：换图后不用等浏览器自己想起去刷新那个顽固的 favicon 缓存。 -->
+<link rel="icon" href="/api/brand/ico?v={{ app_version }}">
+<style>
+  /* ⚠️ 这个页面是**独立模板**，拿不到 index.html 内联 <style> 里的任何东西。
+     面板那些 .card / .wrap / .f / .hint 的视觉样式全在 index.html 里定义，
+     登录页引用它们等于引用空气 —— 页面会渲染成裸 HTML（透明卡片、不居中、
+     标签和说明无样式）。所以这里必须自包含：只复用 style.css 里的 CSS 变量
+     （--bg / --card-solid / --line / --tx 等），其余自己写。 */
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  /* ⚠️ 登录页禁用文本选取。
+     整页除了一个口令框，其余全是装饰（背景图、标题、说明），
+     能被鼠标拖蓝的部分既没用又难看，误拖还会把卡片整块选中。
+     ⚠️ 输入框单独放开：口令需要能粘贴、能全选修改，
+        一刀切禁掉会让输入框点不出光标、也粘贴不进去。 */
+  html, body {
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+  }
+  .login-card input[type="password"] {
+    -webkit-user-select: text;
+    -moz-user-select: text;
+    -ms-user-select: text;
+    user-select: text;
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--tx);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 "Microsoft YaHei", "PingFang SC", sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  /* 背景层：两张图在卡片后面缓慢飘动。
+     ⚠️ 必须 fixed + pointer-events:none，否则会挡住输入框、也会跟着页面滚。
+        图取不到时 JS 会加 hidden，不留坏图图标也不留空白。 */
+  .login-bg {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    z-index: 0;
+    pointer-events: none;
+  }
+  .login-bg img {
+    position: absolute;
+    opacity: .10;
+    object-fit: contain;
+    /* 轻微阴影：让图"浮"起来，而不是贴死在背景上 */
+    filter: drop-shadow(0 8px 22px rgba(0, 0, 0, .38));
+    animation: loginFloat 18s ease-in-out infinite;
+    will-change: transform;
+  }
+  .login-bg img.hidden { display: none; }
+  /* ⚠️ 光斑是**纯 CSS 画**的，不依赖图片、不依赖网络、不依赖 JS。
+     原来的背景只有两张远程图（jsDelivr CDN）——国内访问经常取不到，
+     取不到就整块隐藏，用户看到的是空背景，等于这个效果压根没做。
+     光斑保证"一定有东西在飘"，远程图只是锦上添花：取到了更丰富，
+     取不到也不影响。 */
+  .login-bg .orb {
+    position: absolute;
+    border-radius: 50%;
+    opacity: .30;
+    filter: blur(2px) drop-shadow(0 10px 26px rgba(0, 0, 0, .40));
+    animation: loginFloat 18s ease-in-out infinite;
+    will-change: transform;
+  }
+  .login-bg .orb-1 {
+    width: 340px; height: 340px;
+    left: 4%; top: 8%;
+    background: radial-gradient(circle at 34% 30%,
+                rgba(120, 170, 255, .55), rgba(120, 170, 255, 0) 68%);
+    animation-duration: 17s;
+  }
+  .login-bg .orb-2 {
+    width: 250px; height: 250px;
+    right: 6%; bottom: 10%;
+    background: radial-gradient(circle at 62% 58%,
+                rgba(255, 150, 200, .48), rgba(255, 150, 200, 0) 66%);
+    animation-duration: 24s;
+    animation-delay: -7s;
+    animation-direction: reverse;
+  }
+  .login-bg .orb-3 {
+    width: 180px; height: 180px;
+    left: 46%; top: 62%;
+    background: radial-gradient(circle at 50% 50%,
+                rgba(150, 255, 220, .34), rgba(150, 255, 220, 0) 70%);
+    animation-duration: 21s;
+    animation-delay: -13s;
+  }
+  /* 四张图**各占一个角**：左上 / 右上 / 左下 / 右下。
+     ⚠️ 以前它们都从"页面中心偏一点"出发，飘起来就挤成一坨看着像叠在一起，
+        所以改成四角分散，中间留给卡片。
+     ⚠️ 下面这些数值只是**兜底**（JS 没跑起来时的静态布局）：必须本身就不重叠，
+        不能依赖 JS 才好看。正常情况由 randomizeBg() 每次随机分配角落、
+        随机大小、随机位置抖动与随机动画时长/方向 —— 每次打开都不一样。 */
+  .login-bg .bg-a {
+    width: 15vw;
+    left: 3%;
+    top: 4%;
+    animation-duration: 17s;
+  }
+  .login-bg .bg-b {
+    width: 9vw;
+    right: 3%;
+    top: 4%;
+    animation-duration: 24s;
+    animation-delay: -7s;
+    animation-direction: reverse;
+  }
+  /* 装饰图：比 logo/ico 更淡，只做底纹，不抢卡片的注意力 */
+  .login-bg .bg-deco { opacity: .07; }
+  .login-bg .bg-c {
+    width: 17vw;
+    left: 3%;
+    bottom: 4%;
+    animation-duration: 29s;
+    animation-delay: -3s;
+  }
+  .login-bg .bg-d {
+    width: 15vw;
+    right: 3%;
+    bottom: 4%;
+    animation-duration: 26s;
+    animation-delay: -11s;
+    animation-direction: reverse;
+  }
+  @keyframes loginFloat {
+    0%   { transform: translate3d(0, 0, 0) rotate(-2.5deg); }
+    50%  { transform: translate3d(22px, -30px, 0) rotate(3deg); }
+    100% { transform: translate3d(0, 0, 0) rotate(-2.5deg); }
+  }
+
+  .login-card {
+    width: 100%;
+    max-width: 420px;
+    /* 毛玻璃：半透明底 + 背后内容模糊。背景那两张图透过来会被柔化，
+       不会干扰卡片上文字的可读性。
+
+       ⚠️ 第一行 rgba 是**兜底**：color-mix() 是 2023 年才有的 CSS 函数，
+       Chrome 111 / Safari 16.2 / Firefox 113 之前的浏览器不认，
+       只写它的话整条 background 声明会被丢弃 —— 卡片变成全透明，
+       跟背景糊在一起。先写一条老浏览器也认的半透明色，
+       再让新浏览器用 color-mix 覆盖（不认的自动忽略第二行）。 */
+    background: rgba(24, 28, 38, .82);
+    background: color-mix(in srgb, var(--card-solid) 76%, transparent);
+    backdrop-filter: blur(16px) saturate(1.2);
+    -webkit-backdrop-filter: blur(16px) saturate(1.2);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    /* 轻微阴影，配合毛玻璃 */
+    box-shadow: 0 18px 48px rgba(0, 0, 0, .34);
+    padding: 30px 28px 26px;
+    /* ⚠️ 必须抬到背景层之上，否则卡片会被 .login-bg 盖住、点不到输入框 */
+    position: relative;
+    z-index: 1;
+    animation: loginIn .42s var(--ease) both;
+  }
+  @keyframes loginIn {
+    from { opacity: 0; transform: translateY(14px) scale(.985); }
+    to   { opacity: 1; transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .login-card { animation: none; }
+    /* 系统开了「减少动态效果」就停下飘动，只保留静态的图 */
+    .login-bg img { animation: none; }
+  }
+  .login-logo {
+    display: block;
+    max-height: 44px;
+    max-width: 180px;
+    margin: 0 auto 14px;
+    object-fit: contain;
+  }
+  .login-logo.hidden { display: none; }
+  .login-title {
+    margin: 0 0 6px;
+    font-size: 19px;
+    font-weight: 800;
+    text-align: center;
+    letter-spacing: .3px;
+  }
+  .login-sub {
+    margin: 0 0 20px;
+    font-size: 12.5px;
+    color: var(--tx2);
+    text-align: center;
+  }
+  .login-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--tx2);
+    margin-bottom: 7px;
+  }
+  .login-card input[type="password"] {
+    width: 100%;
+    padding: 11px 13px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    background: var(--input);
+    color: var(--tx);
+    font: inherit;
+    font-size: 13.5px;
+    transition: border-color .2s, box-shadow .2s;
+  }
+  .login-card input[type="password"]:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--tx) 45%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--tx) 12%, transparent);
+  }
+  .login-btn {
+    width: 100%;
+    margin-top: 15px;
+    padding: 11px 14px;
+    border: 0;
+    border-radius: var(--r-sm);
+    background: var(--tx);
+    color: var(--bg);
+    font: inherit;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform .18s var(--ease), opacity .18s;
+  }
+  .login-btn:hover:not(:disabled) { transform: translateY(-1px); }
+  .login-btn:disabled { opacity: .55; cursor: default; }
+  /* ⚠️ 错误提示必须自己带 padding / background / border。
+     style.css 里这三项挂在 .msg.show 上，而 .msg.err 只有 color 和
+     border-color —— 只靠 .msg.err 显示出来是一行没有框、没有底的红字，
+     看着像"提示没出来"。 */
+  .login-err {
+    display: none;
+    margin-bottom: 14px;
+    padding: 9px 12px;
+    border-radius: var(--r-sm);
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--danger-tx);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+  }
+  .login-err.show { display: block; }
+  .login-hint {
+    margin-top: 16px;
+    padding-top: 14px;
+    border-top: 1px solid var(--line);
+    font-size: 11.5px;
+    line-height: 1.75;
+    color: var(--tx2);
+  }
+  .login-hint code {
+    padding: 1px 5px;
+    border-radius: 5px;
+    background: var(--glass);
+    font-size: 11px;
+  }
+  /* 「记住登录状态」勾选框。
+     ⚠️ input 是原生 <input type="checkbox">，不自己画方框 —— 原生控件
+        在任何浏览器上都能点、能被键盘聚焦、读屏器也认。自己画一个假的
+        （比如 div + 背景图）就会出现"点了没反应"。 */
+  .login-remember {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    font-size: 12.5px;
+    color: var(--tx2);
+    cursor: pointer;
+    user-select: none;
+  }
+  .login-remember input[type="checkbox"] {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: var(--tx);
+    flex: 0 0 auto;
+  }
+  .login-remember:hover { color: var(--tx); }
+  .login-remhint {
+    margin: 6px 0 0 23px;
+    font-size: 11.5px;
+    line-height: 1.6;
+    color: var(--tx2);
+    opacity: .85;
+  }
+
+  /* 版本号：确认"浏览器里这份是不是刚装的那份"的唯一凭据，别删 */
+  .login-ver {
+    margin-top: 12px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--tx2);
+    opacity: .75;
+    font-variant-numeric: tabular-nums;
+  }
+</style>
+<script nonce="{{ csp_nonce }}">
+  /* 背景图降级链：svg 取不到 → 退回同名 png → 再取不到才隐藏。
+     ⚠️ 必须放在 <head> 里：背景 <img> 在 body 里，图片请求在解析阶段就发出去了，
+        失败回调可能早于 body 末尾那段脚本执行 —— 函数没定义，图就永远空着。 */
+  /* 内置兜底图形：纯 data URI 画的装饰线条，**不联网、不依赖图床**。
+     ⚠️ 为什么必须有这一层：背景四张图全靠远程 CDN，实测下来 jsDelivr 与
+        raw.githubusercontent.com 会交替 502/超时，一旦两张装饰图都取不到，
+        左下和右下两个角就是空的 —— 用户看到的正是"只有角上有图、另两角没有"。
+        有了内置图形，远程图取不到时由它顶上，四个角永远都有东西。 */
+  var BG_SHAPES = [
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Cg fill='none' stroke='%238ab4ff' stroke-width='3'%3E%3Ccircle cx='60' cy='60' r='52'/%3E%3Ccircle cx='60' cy='60' r='34'/%3E%3Ccircle cx='60' cy='60' r='16'/%3E%3C/g%3E%3C/svg%3E",
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Cg fill='none' stroke='%23ff9ec8' stroke-width='3'%3E%3Cpath d='M60 8 L112 60 L60 112 L8 60 Z'/%3E%3Cpath d='M60 34 L86 60 L60 86 L34 60 Z'/%3E%3C/g%3E%3C/svg%3E",
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Cg fill='none' stroke='%2396ffdc' stroke-width='4'%3E%3Cpath d='M4 40 Q30 10 56 40 T108 40'/%3E%3Cpath d='M4 70 Q30 40 56 70 T108 70'/%3E%3Cpath d='M4 100 Q30 70 56 100 T108 100'/%3E%3C/g%3E%3C/svg%3E",
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Cdefs%3E%3Cpattern id='p' width='20' height='20' patternUnits='userSpaceOnUse'%3E%3Ccircle cx='4' cy='4' r='3' fill='%23ffd479'/%3E%3C/pattern%3E%3C/defs%3E%3Crect width='120' height='120' fill='url(%23p)'/%3E%3C/svg%3E"
+  ];
+
+  /* 降级链：svg → 同名 png → 内置图形 → 才隐藏。
+     ⚠️ 以前只有两级，而且 bg1/bg2 的回退地址**就是它自己**（默认地址直接写成了
+        .svg），svg 取不到时用同一个取不到的地址再试一次，等于没有降级。 */
+  /* 用「捕获阶段」监听 document 的 error 事件来跑降级链。
+     ⚠️ 为什么不能写成内联的 onerror 属性：CSP 的 script-src 只允许
+        带随机数的内联脚本块，**不含** 'unsafe-inline'，而随机数对内联事件
+        属性无效 —— 浏览器会把它一并拦掉。于是图片取不到时没有任何回调，
+        四个角直接空着（正是"左下右下没图"那个现象）。
+        改成在脚本里注册监听就没事：脚本块带了随机数，能执行。
+     ⚠️ 为什么挂在 document 上、而且是捕获阶段：error 事件**不冒泡**，
+        只在捕获阶段从 window/document 往下传递。所以在 <head> 里注册，
+        就能接住后面 body 里**任意一张**图片的失败，不必等它解析出来，
+        也就没有"回调注册晚于图片失败"的时序问题。 */
+  document.addEventListener('error', function (ev) {
+    var el = ev.target;
+    if (!el || el.tagName !== 'IMG') { return; }
+    var step = parseInt(el.getAttribute('data-fb-step') || '0', 10);
+    var fb = el.getAttribute('data-fb');
+    var shape = el.getAttribute('data-shape');
+    if (step === 0 && fb) {                       /* svg → 同名 png / 本地接口 */
+      el.setAttribute('data-fb-step', '1');
+      el.src = fb;
+      return;
+    }
+    if (step === 1 && shape !== null) {           /* png → 内置图形（不联网） */
+      el.setAttribute('data-fb-step', '2');
+      el.src = BG_SHAPES[parseInt(shape, 10)] || BG_SHAPES[0];
+      return;
+    }
+    el.style.display = 'none';                    /* 都取不到才隐藏，不留坏图 */
+  }, true);
+</script>
 </head>
 <body>
-<div class="wrap" style="max-width:420px; padding-top:80px">
-  <div class="card">
-    <h2>🔒 请输入面板口令</h2>
-    <div id="err" class="msg err" style="display:none"></div>
-    <label class="f">口令</label>
-    <input type="password" id="pwd" autofocus
-           onkeydown="if(event.key==='Enter')doLogin()">
-    <div class="row" style="margin-top:14px">
-      <button class="btn-primary" id="btn" onclick="doLogin()">进入</button>
-    </div>
-    <div class="hint">
-      口令填在 config.yaml 的 <code>web_password</code> 里；不需要登录的话把它删掉即可。<br>
-      连续输错 5 次会临时锁定，防止被暴力破解。
-    </div>
-  </div>
+<!-- 背景飘动的两张图：logo 和标签页图标。
+     ⚠️ 用的是**同目录同名字的 svg**（Logo/logo.svg、Web/OnOBN/ico.svg）。
+     svg 是矢量，放大到背景这么大也不糊，体积还比 png 小得多。
+     图取不到 → 自动退回同名 png → 再取不到才隐藏，页面照常用。 -->
+<div class="login-bg" aria-hidden="true">
+  <!-- 纯 CSS 光斑：不看网络、不看 JS，保证背景一定有东西在飘 -->
+  <span class="orb orb-1"></span>
+  <span class="orb orb-2"></span>
+  <span class="orb orb-3"></span>
+  <img class="bg-a" id="bgLogo" alt="" src="{{ bg_logo_svg }}"
+       style="left:3%;top:4%;right:auto;bottom:auto"
+       data-fb="/api/brand/logo" data-shape="0">
+  <img class="bg-b" id="bgIco" alt="" src="{{ bg_ico_svg }}"
+       style="right:3%;top:4%;left:auto;bottom:auto"
+       data-fb="/api/brand/ico" data-shape="1">
+  <!-- 额外两张装饰图：背景只有 logo + ico 显得单调，再加两张错开飘。
+       ⚠️ 每张图各自独立的尺寸、位置、动画时长与方向：全都同步飘会像一整块
+          在动，错开才有层次。
+       ⚠️ bg2.svg 有 293KB（jsDelivr 实测 7.8 秒），所以它排在最后 ——
+          慢的图晚点加载，不挡住前面几张先出来。 -->
+  <img class="bg-c bg-deco" id="bg1" alt="" src="{{ bg1_svg }}"
+       style="left:3%;bottom:4%;right:auto;top:auto"
+       data-fb="{{ bg1_png }}" data-shape="2">
+  <img class="bg-d bg-deco" id="bg2" alt="" src="{{ bg2_svg }}"
+       style="right:3%;bottom:4%;left:auto;top:auto"
+       data-fb="{{ bg2_png }}" data-shape="3">
 </div>
+<!-- ⚠️ 这是一个**真正的表单**，按钮是 submit。
+     以前登录只走 JS 的 fetch：脚本一旦没执行（老浏览器不认 async/await/const，
+     或被插件、缓存拦掉），点下去就毫无反应 —— 连错误都显示不出来，
+     因为连显示错误的代码也是 JS。
+     现在没有 JS 也能登录：浏览器原生提交 → 服务端校验 → 成功直接跳转。
+     JS 只是"增强"，能跑就用 fetch 免刷新，跑不了自动退回原生提交。 -->
+<form class="login-card" id="form" method="post" action="/login">
+  <img class="login-logo" id="logo" alt="OnOBN" src="/api/brand/logo"
+       data-hide="1">
+  <h1 class="login-title">🔒 请输入面板口令</h1>
+  <p class="login-sub">OnOB站通知订阅工具（OnOBN）</p>
 
-<script>
-  if (window.matchMedia('(prefers-color-scheme: dark)').matches)
-    document.documentElement.setAttribute('data-theme', 'dark');
+  {% if error %}<div class="login-err show">{{ error|safe }}</div>{% endif %}
+  <div class="login-err" id="err"></div>
 
-  async function doLogin() {
-    const btn = document.getElementById('btn');
-    const err = document.getElementById('err');
-    err.style.display = 'none';
-    btn.disabled = true;
-    btn.textContent = '验证中…';
-    try {
-      const r = await fetch('/api/login', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json', 'X-Requested-With': 'bili-notify'},
-        body: JSON.stringify({password: document.getElementById('pwd').value})
-      });
-      const d = await r.json();
-      if (d.ok) {
-        location.href = '/';
+  <label class="login-label" for="pwd">口令</label>
+  <input type="password" name="password" id="pwd" autocomplete="current-password" autofocus>
+
+  <!-- 记住登录状态。
+       ✅ 勾上：下发 7 天的持久 cookie，关掉浏览器再开还是登录状态。
+       ⬜ 不勾：只发**会话 cookie**（不带 max_age），关掉浏览器即失效。
+       默认不勾 —— 登录态这种东西，默认给短的更安全。
+       ⚠️ 这是个真正的 <input name="remember">，原生提交时浏览器会一起带上；
+          JS 那条路则在 fetch 的 body 里单独塞 remember 字段。两条路都要能读到。 -->
+  <label class="login-remember" for="remember">
+    <input type="checkbox" name="remember" id="remember" value="1">
+    <span>记住登录状态（7 天内免登录）</span>
+  </label>
+  <!-- 说明必须写在页面上（而不是注释里）：不写清"不勾会怎样"，
+       用户不知道自己到底在选什么。 -->
+  <div class="login-remhint">不勾选则只在本次有效，关掉浏览器就要重新登录</div>
+
+  <button type="submit" class="login-btn" id="btn">进入</button>
+
+  <div class="login-hint">
+    口令填在 <code>config.yaml</code> 的 <code>web_password</code> 里；不需要登录的话把它删掉即可。<br>
+    连续输错 5 次会临时锁定，防止被暴力破解。
+  </div>
+
+  <!-- ⚠️ 这行版本号是刻意加的，别当成装饰删掉。
+       登录页是「改了没生效」的重灾区：Flask 默认**不热加载模板**
+       （jinja_env.auto_reload=False，已实测确认），覆盖解压之后如果不重启
+       机器人进程，浏览器里拿到的依然是旧模板 —— 用户看到旧样式、旧按钮，
+       却没有任何报错，无从判断到底加载了哪一份。
+       有了这行，一眼就能确认：页面上的版本 == 刚装的版本，才说明装对了。
+
+       ⚠️ 曾经在版本号后面挂过构建戳「· 背景4角随机」：版本号长期停在 2.3.3，
+          光看版本号分不清装的是哪一份登录页。四角随机确认生效后已移除，
+          版本行回到「品牌 + 版本」这一件事上。排查"改了没生效"时，
+          依然以这行版本号为准。
+
+     ⚠️ 品牌名必须是「OnOiduts工业」，跟面板左下角那行保持一致
+       （index.html 里写的是「OnOiduts工业 · v{{ app_version }}」）。
+       这里以前写的是缩写 OnOBN，同一个程序两个页面两个名字，
+       看着像跑的不是一个东西。 -->
+  <div class="login-ver">OnOiduts工业 v{{ app_version }}</div>
+</form>
+
+<script nonce="{{ csp_nonce }}">
+  /* ⚠️ 全篇刻意只用 ES5 语法（var / function，没有 const、let、箭头函数、
+     async/await）。登录页的脚本一旦用了 ES6+，老浏览器会整块语法报错 ——
+     结果是**所有** JS 都不执行：按钮点了没反应，连错误提示都显示不出来
+     （显示提示的代码本身也是 JS）。功能不该赌在浏览器版本上。 */
+  function showErr(html) {
+    var el = document.getElementById('err');
+    if (!el) { return; }
+    el.innerHTML = html;
+    el.classList.add('show');
+  }
+
+  /* 背景四张图：**每次打开都随机** —— 随机分到不同的角、随机大小、
+     随机位置抖动、随机动画时长与方向。
+     ⚠️ 为什么不写死在 CSS 里：写死后每次打开一模一样，看着就是张静态壁纸；
+        而且四张图若都从中心附近出发，飘起来会挤成一坨（以前正是这个毛病），
+        所以改成四角分散 + 每次重排。
+     ⚠️ 这段纯装饰，整段不执行也不影响登录：CSS 里那套四角定位就是兜底，
+        不依赖 JS 也已经是不重叠的四个角。 */
+  (function () {
+    var ids = ['bgLogo', 'bgIco', 'bg1', 'bg2'];
+    var nodes = [];
+    for (var i = 0; i < ids.length; i++) {
+      var n = document.getElementById(ids[i]);
+      if (n) { nodes.push(n); }
+    }
+    if (!nodes.length) { return; }
+
+    /* 四个角的基准中心（百分比）：左上 / 右上 / 左下 / 右下。
+       ⚠️ 这里的数值就是**真正的四个角**，不是"靠近四个角"。
+          以前写成 17/83 × 20/80，看着像四个方位，实际全挤在中间一大块里，
+          飘起来就叠在一起 —— 这正是被指出的毛病。现在推到边缘附近，
+          中间整块留给卡片。 */
+    var corners = [[11, 14], [89, 14], [11, 86], [89, 86]];
+    /* 洗牌 —— 哪张图落哪个角每次都不同，不会固定成一套位置 */
+    for (var k = corners.length - 1; k > 0; k--) {
+      var j = Math.floor(Math.random() * (k + 1));
+      var t = corners[k]; corners[k] = corners[j]; corners[j] = t;
+    }
+
+    for (var m = 0; m < nodes.length; m++) {
+      var el = nodes[m];
+      var c = corners[m % corners.length];
+      /* 大小随机 140~370px：四张不一样大才有层次感 */
+      /* 大小随机：用 vw 而不是 px，这样宽度随窗口缩放，小屏不会撑爆。
+         8~17vw —— 上限必须远小于角点到边缘的距离，否则图会占满整边。 */
+      var w = 8 + Math.random() * 9;
+      /* 角内抖动：不每张都贴死在角尖上，±4% / ±3%。
+         ⚠️ 幅度不能大：角点已经贴边了，抖太多会飘回中间，
+            又变成"四个方位"而不是"四个角"。 */
+      var jx = Math.round((Math.random() * 8 - 4) * 10) / 10;
+      var jy = Math.round((Math.random() * 6 - 3) * 10) / 10;
+      var px = c[0] + jx;
+      var py = c[1] + jy;
+      el.style.width = w.toFixed(1) + 'vw';
+      /* ⚠️ 这里**不做中心补偿**，改成按角锚定，原因是用真实分辨率复算过：
+             以前写 calc(角点% - 半个宽度)，把图片"中心"对准角点。
+             但角点百分比换算出的像素常常小于半个宽度 —— 1366×768 上
+             11% 只有 150px，减去 185px 就是 -35px，图片被推到屏幕外面。
+             实测 1920/1600/1366/1280 四种分辨率下有 12 种组合出屏，
+             表现就是"左下右下看不见、剩下的挤在左上角"。
+         现在改成：靠左的角用 left、靠右的角用 right（值 = 100 - 角点），
+         靠上用 top、靠下用 bottom —— 图片从角点朝屏幕内侧延伸，
+         数学上不可能出界，也不需要知道图片有多大。 */
+      if (px < 50) {
+        el.style.left = px + '%';
+        el.style.right = 'auto';
       } else {
-        err.textContent = d.msg || '登录失败';
-        err.style.display = 'block';
+        el.style.right = (100 - px).toFixed(1) + '%';
+        el.style.left = 'auto';
       }
-    } catch (e) {
-      /* ⚠️ 不能直接把 e 拼出来给用户看：浏览器原生异常就是
-         "TypeError: Failed to fetch" —— 一串英文，既看不出是面板没在跑，
-         也不知道该怎么办。这里按情形说人话。 */
-      const s = String((e && e.message) || e || '');
-      if (/Failed to fetch|NetworkError|Load failed|TypeError/i.test(s)) {
-        err.innerHTML = '连不上管理面板：机器人可能没在跑，或正在重启。'
-          + '<br>先启动机器人，再刷新这个页面。';
-      } else if (/abort|timeout/i.test(s)) {
-        err.textContent = '请求超时——面板这会儿没响应，等几秒再试';
+      if (py < 50) {
+        el.style.top = py + '%';
+        el.style.bottom = 'auto';
       } else {
-        err.textContent = '请求失败：' + s;
+        el.style.bottom = (100 - py).toFixed(1) + '%';
+        el.style.top = 'auto';
       }
-      err.style.display = 'block';
-    } finally {
+      /* 时长/方向/起点也随机：全都同步飘会像一整块在动 */
+      el.style.animationDuration = (16 + Math.random() * 16).toFixed(1) + 's';
+      el.style.animationDirection = Math.random() < 0.5 ? 'normal' : 'reverse';
+      el.style.animationDelay = '-' + Math.floor(Math.random() * 20) + 's';
+    }
+  })();
+
+  /* 登录：能用 fetch 就免刷新，不能用就**退回浏览器原生提交**。
+     表单本身是真正的 <form method="post" action="/login">，
+     所以即使这段脚本一行都没执行，点「进入」照样能登录。 */
+  (function () {
+    var form = document.getElementById('form');
+    var btn = document.getElementById('btn');
+    var pwd = document.getElementById('pwd');
+    var rm = document.getElementById('remember');
+    if (!form || !btn || !pwd) { return; }
+
+    var busy = false;
+
+    function restore() {
+      busy = false;
       btn.disabled = false;
       btn.textContent = '进入';
     }
-  }
+
+    /* 兜底：把提交交还给浏览器。form.submit() 不会再次触发 submit 事件，
+       所以不会绕回这里形成死循环。 */
+    function fallback() {
+      restore();
+      try { form.submit(); } catch (e) { /* 真不行就只能靠用户手动刷新了 */ }
+    }
+
+    form.addEventListener('submit', function (ev) {
+      if (busy) { ev.preventDefault(); return; }
+      /* 没有 fetch（老浏览器）就不拦 —— 让它原生提交，照样能登录 */
+      if (typeof window.fetch !== 'function') { return; }
+
+      ev.preventDefault();
+      busy = true;
+      btn.disabled = true;
+      btn.textContent = '验证中…';
+
+      try {
+        window.fetch('/api/login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'X-Requested-With': 'bili-notify'},
+          /* ⚠️ remember 必须单独塞进 body：fetch 提交不走浏览器原生表单序列化，
+             勾选框的值不会自动带上。服务端据此决定发持久 cookie 还是会话 cookie。 */
+          body: JSON.stringify({password: pwd.value,
+                                remember: !!(rm && rm.checked)})
+        }).then(function (r) {
+          return r.json().then(function (d) { return {r: r, d: d}; });
+        }).then(function (o) {
+          if (o.d && o.d.ok) {
+            window.location.href = '/';
+            return;
+          }
+          showErr((o.d && o.d.msg) || '登录失败');
+          restore();
+        }).catch(function () {
+          /* 网络异常或返回不是 JSON：退回原生提交，让服务端来给提示。
+             以前这里把 e.message 直接显示，浏览器原生异常就是一串英文
+             "TypeError: Failed to fetch"，看不出是面板没在跑。 */
+          fallback();
+        });
+      } catch (e) {
+        fallback();
+      }
+    });
+  })();
 </script>
 </body>
 </html>

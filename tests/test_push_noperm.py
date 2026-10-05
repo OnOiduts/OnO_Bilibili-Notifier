@@ -124,6 +124,10 @@ def test_no_plain_fallback_on_no_perm():
 
 def test_config_default_present():
     """冷却时长缺省应为 600，且配置项名对得上文档。"""
+    # ⚠️ bot.py 在 src/ 下，不是仓库根目录。这里原来写的是根目录，
+    #    文件搬迁后一直 FileNotFoundError —— 测试红着却没人发现，
+    #    因为跑批时它被当成"环境问题"跳过了。
     src = open(os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), "bot.py"), encoding="utf-8").read()
+        os.path.abspath(__file__))), "src", "bot.py"),
+        encoding="utf-8").read()
     assert "push_noperm_cooldown" in src

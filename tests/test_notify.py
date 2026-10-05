@@ -331,7 +331,8 @@ def _t_dyn_title():
                       "小狐狸", TPL)
     return (_has_img(md, _cover_expect(COVER))
             and '【动态订阅】"小狐狐"新动态更新了《新周边》'.replace("狐狐", "狐狸") in md
-            and "> **动态内容**" in md
+            # v2.2.5：不再显示「动态内容」标签行，正文直接进引用块
+            and "> **动态内容**" not in md
             and any(l.startswith("> 　") and "内容文本" in l for l in md.splitlines())
             and btns[0][:2] == ("查看动态", "https://www.bilibili.com/opus/999"))
 
@@ -343,7 +344,8 @@ def _t_dyn_no_title():
     body = [l for l in md.splitlines() if l.startswith("> 　")]
     return ('【动态订阅】"小狐狸"新动态更新了' in md
             and "《》" not in md
-            and "> **动态内容**" in md
+            # v2.2.5：不再显示「动态内容」标签行
+            and "> **动态内容**" not in md
             and body and "第一行" in body[0])
 
 

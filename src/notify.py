@@ -520,6 +520,31 @@ HEAD_TITLE = {
     "season": "📦 合集更新",
 }
 
+# 面板上「文案模板」输入框的名字 —— 和 HEAD_TITLE 分开，别混用
+#
+# ⚠️ 以前面板直接拿 HEAD_TITLE 当输入框标签用，而 HEAD_TITLE 是**发出去那条
+#    消息的卡片标题**，它只有 8 项（无标题变体没有独立卡片标题，复用
+#    dynamic / dynamic_pinned / dynamic_live 的）。于是前端 titles[k] || k
+#    拿不到就退回键名原文，用户在动态那一组里看到三行
+#    dynamic_no_title / dynamic_pinned_no_title / dynamic_live_no_title ——
+#    这就是"这里没汉化"的根因。
+#
+#    这里单独维护一份"面板显示名"，覆盖**全部**模板键，保证永远有中文名。
+#    改这里只影响面板显示，不影响推送出去的内容。
+TPL_LABEL = {
+    "live": "🔴 开播提醒",
+    "offline": "⬛ 已下播",
+    "video": "📺 新视频投稿",
+    "dynamic": "📝 新动态",
+    "dynamic_no_title": "📝 新动态（无标题）",
+    "dynamic_pinned": "📌 置顶动态",
+    "dynamic_pinned_no_title": "📌 置顶动态（无标题）",
+    "dynamic_live": "🔴 开播动态",
+    "dynamic_live_no_title": "🔴 开播动态（无标题）",
+    "top_comment": "💬 置顶评论",
+    "season": "📦 合集更新",
+}
+
 BUTTON_LABEL = {
     "live": "进入直播间",
     "video": "观看视频",
@@ -978,10 +1003,11 @@ def render_dynamic(info: DynamicInfo, name: str, tpls: dict) -> tuple:
 
     body = _esc(info.text)
     if body:
-        # ⚠️ 以前这里插了一个空的 ">" 行当分隔，渲染出来就是一条空白
-        #    —— 正是用户说的"换空的一行"。现在紧贴标签行，不留空。
-        quoted = ["> **动态内容**"] + _indent_body(body)
-        parts.append("\n".join(quoted))
+        # ⚠️ 用户要求：不再显示「动态内容」这个标签行（v2.2.5）。
+        #    它只是个标签，正文自己就说明了一切；而且它在部分客户端
+        #    会把引用块整体往下顶，看着像"多出来一行"。
+        #    同样不要插空的 ">" 行当分隔 —— 渲染出来就是一条空白。
+        parts.append("\n".join(_indent_body(body)))
 
     btns = [button("dynamic", BUTTON_LABEL["dynamic"], info.url)] if info.url else []
     # 开播动态：再给一个直达直播间的按钮 —— 这才是这条推送真正想让人点的

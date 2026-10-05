@@ -126,7 +126,11 @@ class T(unittest.TestCase):
     # ---------- ④ 其它用到 btn-primary 的地方同样受益 ----------
     def test_10_login_button_primary(self):
         """登录页的「进入」也是 btn-primary，尺寸一起修好。"""
-        self.assertIn('class="btn-primary"', self.login)
+        # ⚠️ 断言跟着登录页重写改过：登录页是独立模板，按钮类早就从
+        #    btn-primary（面板的类）换成了自包含的 login-btn ——
+        #    继续认 btn-primary 等于一直红，而且会误导人把面板的类加回来。
+        self.assertIn('class="login-btn"', self.login)
+        self.assertIn('type="submit"', self.login)
 
     def test_11_goto_setup_primary(self):
         """没填凭据时的「👉 现在去填写」。"""

@@ -323,7 +323,14 @@ def main():
             # ⚠️ 必须跟面板、机器人用同一个路径入口：这里写死
             #    DATA_FILE_DEFAULT 时补的是"机器人那份"，而面板读的是
             #    源码目录那份 —— 补完了面板照样空白（v1.98.3）。
-            _st = db.Store(db.data_path_from_cfg())
+            _dp = db.data_path_from_cfg()
+            # 清掉上次写失败留下的 .tmp-*.json —— 写数据被杀软拦下时
+            # 临时文件会留下来，越积越多，还会被"目录里有陌生文件"误报。
+            _stale = db.cleanup_stale_tmp(_dp)
+            if _stale:
+                safe_print(f"  [*] 已清掉 {_stale} 个残留临时文件"
+                           f"（上次写数据被拦下留下的，不是你的数据）")
+            _st = db.Store(_dp)
             # 先清测试残留假群，再补幽灵群 —— 顺序反了会把假群又补回来。
             _junk = _st.purge_test_groups()
             if _junk:

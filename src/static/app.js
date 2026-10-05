@@ -4,6 +4,17 @@
    元素缺失时返回替身而不是 null，一处出错不影响整页。
    ============================================================ */
 
+/* ---------- 图片加载失败的统一处理 ----------
+   ⚠️ 不能写成 onerror="..." 内联属性：面板的 CSP 只允许带随机数的内联脚本块，
+      内联事件属性会被拦掉，写了也不执行。统一用捕获阶段监听代替。
+      error 事件不冒泡，但在捕获阶段会经过 document，所以在这里挂一次
+      就能接住之后任意时刻创建的图片。 */
+document.addEventListener('error', function (ev) {
+  var el = ev.target;
+  if (!el || el.tagName !== 'IMG') { return; }
+  if (el.getAttribute('data-rm') === '1') { el.remove(); }
+}, true);
+
 /* ---------- 元素获取（带缺失保护） ---------- */
 const _MISSING = new Set();
 function _dummy(id) {
@@ -59,6 +70,32 @@ function sfx(name) {
     }
   } catch (_) { /* 出声失败不该影响任何功能 */ }
   return false;
+}
+
+/* 重播一次性动画。
+   ⚠️ 这是「动画只播一次，之后再也不出现」的根因修法：
+      CSS 动画是挂在 class 上的，元素一旦带过这个 class，
+      再 add 一次是**无效**的——浏览器认为 class 没变，动画不会重新跑。
+      所以必须 remove → 强制重排 → add，三步缺一不可；
+      少了中间那步 void offsetWidth，浏览器会把 remove/add 合并成
+      "什么都没发生"，表现正是"第一次有效果，之后就没了"。
+   另外要清掉上一次的定时器：否则旧的那个会在中途把新动画的 class 摘掉，
+   连点两次时第二次动画会提前消失。 */
+const _fxTimers = new WeakMap();
+function restartFx(el, cls, ms) {
+  if (!el || !el.classList) return;
+  try {
+    el.classList.remove(cls);
+    void el.offsetWidth;            // 强制重排，动画才会从头播
+    el.classList.add(cls);
+    const old = _fxTimers.get(el);
+    if (old) clearTimeout(old);
+    const h = setTimeout(() => {
+      try { el.classList.remove(cls); } catch (_) {}
+      _fxTimers.delete(el);
+    }, ms || 640);
+    _fxTimers.set(el, h);
+  } catch (_) { /* 动画失败不影响功能 */ }
 }
 
 /* 音效档位存浏览器本地（纯界面偏好，不占订阅数据）。
@@ -173,9 +210,18 @@ function api(path, opts) {
   return fetch(path, opts).then(r => {
     clear();
     if (!r.ok) {
-      // 非 2xx 时把正文片段带上，比只报一个状态码有用得多
+      // 非 2xx 时把正文里的提示带上，比只报一个状态码有用得多。
+      // ⚠️ 必须先按 JSON 解析取 msg：以前直接截响应原文，结果 429 限流提示
+      // 显示成 {"ok":false,"msg":"\u64cd\u4f5c\u592a\u5feb..."} 这种天书 ——
+      // 用户只看到一串转义符，还以为程序坏了。
       return r.text().then(t => {
-        const snip = String(t || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        const raw = String(t || '').replace(/\s+/g, ' ').trim();
+        let snip = '';
+        try {
+          const j = JSON.parse(raw);
+          if (j && typeof j.msg === 'string' && j.msg) snip = j.msg;
+        } catch (e) { /* 不是 JSON，走下面的截断 */ }
+        if (!snip) snip = raw.slice(0, 120);
         return { ok: false, msg: '面板返回 ' + r.status + (snip ? '：' + snip : '') };
       }, () => ({ ok: false, msg: '面板返回 ' + r.status }));
     }
@@ -227,6 +273,13 @@ function initTheme() {
       const doSwitch = () => {
         applyTheme(now);
         localStorage.setItem('bili-theme', now);
+        /* ⚠️ 同步写一份 cookie：登录页是独立页面，服务端渲染时要读它来定初始
+           主题（见 webui._theme_from_cookie）。只写 localStorage 的话，
+           服务端读不到，登录页会先按深色渲染再由前端改 —— 表现为闪一下，
+           或在脚本没跑起来时"锁死夜间模式"。 */
+        try {
+          document.cookie = 'bili-theme=' + now + '; path=/; max-age=31536000; samesite=lax';
+        } catch (e) { /* 写不了就只靠 localStorage，前端仍会校正 */ }
         if (icon) {
           icon.textContent = now === 'dark' ? '☀️' : '🌙';
           icon.style.transform = 'rotate(360deg)';
@@ -387,6 +440,7 @@ function openSheet(title, html) {
   if (body && !body._missing) body.innerHTML = html;
   sheet.classList.add('show');
   sheet.setAttribute('aria-hidden', 'false');
+  sfx('panel');
   if (body && !body._missing) body.scrollTop = 0;
   LAST_VAR_INPUT = null;
   bindVarInputs();
@@ -504,7 +558,11 @@ function initSheets() {
   document.querySelectorAll('.nav-i').forEach(btn => {
     btn.addEventListener('click', () => {
       const sec = btn.getAttribute('data-sec');
-      if (sec) openSec(sec);
+      /* 侧栏不走 data-act 委托（它自己直接调 openSec），
+         所以这里单独配音效，不然点侧栏是静悄悄的。
+         ⚠️ 若这个按钮同时带 data-act="goto-sec"，会走到委托里再响一次同名音效，
+            但 sound.js 的 140ms 节流会挡掉第二次，不会叠成两声。 */
+      if (sec) { sfx('page'); openSec(sec); }
     });
   });
   // ESC：先关文案弹层，再关主面板（一次只关一层）
@@ -723,12 +781,22 @@ async function loadAbout() {
   const pEl = document.getElementById('abDeps');
   if (pEl) {
     const deps = d.deps || {};
-    const must = ['aiohttp', 'botpy', 'yaml', 'flask'];
-    const opt = ['playwright'];
-    const fmt = (ks) => ks.map(k => `${k} ${deps[k] ? '✅' : '❌'}`).join('　');
-    pEl.innerHTML = `必需：${fmt(must)}<br>可选：${fmt(opt)}`
-      + '<br><span class="hint">必需项缺了会导致启动失败，跑一次「安装依赖」；'
-      + '可选项只影响浏览器登录（装不了就用手动粘贴 Cookie）</span>';
+    const pip = d.deps_pip || {};
+    /* ⚠️ 必装/可选清单由后端给（webui.REQUIRED_MODULES / OPTIONAL_MODULES），
+       这里**不要**再自己写死 —— 以前写死成 `opt = ['playwright']`，
+       而 playwright 早已移回必装，页面就一直显示「可选：playwright」，
+       和 requirements.txt 对不上。 */
+    const must = d.deps_required || Object.keys(deps);
+    const opt = d.deps_optional || [];
+    const nm = (k) => pip[k] || k;
+    const fmt = (ks) => ks.length
+      ? ks.map(k => `${nm(k)} ${deps[k] ? '✅' : '❌'}`).join('　')
+      : '无';
+    pEl.innerHTML = `必装：${fmt(must)}<br>可选：${fmt(opt)}`
+      + '<br><span class="hint">必装项缺了会导致启动失败，跑一次「安装依赖」；'
+      + 'playwright 装完还要再执行一次 <code>playwright install chromium</code>'
+      + '（下载浏览器内核，第一次较慢）。'
+      + (opt.length ? '' : '目前没有可选依赖。') + '</span>';
   }
 }
 
@@ -1679,6 +1747,11 @@ async function openSeasonTpl(gid, uid, sid) {
     '&uid=' + encodeURIComponent(uid) + '&season_id=' + encodeURIComponent(sid));
   if (!d.ok) { toast(d.msg || '读取失败'); return; }
   const own = d.custom || {}, defs = d.defaults || {}, titles = d.titles || {};
+  // ⚠️ 以前只认 titles（后端给的是 HEAD_TITLE，只有 8 项，不含三种"无标题"
+  //    变体），拿不到就 `|| k` 退回键名原文 —— 页面上于是冒出
+  //    dynamic_no_title 这种英文。后端现在返回的是 TPL_LABEL（覆盖全部键），
+  //    这里再兜一层 labels，并保留 titles 兼容。
+  const labels = d.labels || titles;
   const grp = d.group || {};
   // ⚠️ 合集编辑页**只给「合集更新」这一类**。
   // 以前是 Object.keys(defs) 全部铺出来 —— 于是合集的弹层里会冒出
@@ -1688,7 +1761,7 @@ async function openSeasonTpl(gid, uid, sid) {
     // 占位优先显示：合集自己的 → 群级的 → 全局的 → 内置默认
     const ph = own[k] != null ? own[k] : (grp[k] != null ? grp[k] : defs[k]);
     const val = own[k] != null ? own[k] : '';
-    return '<label class="fld"><span>' + esc(titles[k] || k) + '</span>' +
+    return '<label class="fld"><span>' + esc(labels[k] || titles[k] || k) + '</span>' +
       '<input type="text" class="stpl-in" data-stpl="' + esc(k) + '"' +
       ' value="' + esc(val) + '" placeholder="' + esc(ph || '') + '"></label>';
   }).join('');
@@ -1747,6 +1820,7 @@ async function openUpTpl(gid, uid) {
     '&uid=' + encodeURIComponent(uid));
   if (!d.ok) { toast(d.msg || '读取失败'); return; }
   const own = d.custom || {}, defs = d.defaults || {}, titles = d.titles || {};
+  const labels = d.labels || titles;
   const groups = d.groups || [];
   const varsMap = d.vars || {}, labelMap = d.var_label || {};
   const blocks = groups.map(g => {
@@ -1754,7 +1828,7 @@ async function openUpTpl(gid, uid) {
       const val = own[k] != null ? own[k] : '';
       const ph = own[k] != null ? own[k]
         : ((d.group && d.group[k] != null) ? d.group[k] : (defs[k] || ''));
-      return '<label class="fld"><span>' + esc(titles[k] || k) +
+      return '<label class="fld"><span>' + esc(labels[k] || titles[k] || k) +
         (val ? ' <span class="mini-label">已改</span>' : '') + '</span>' +
         '<input type="text" class="utpl-in" data-utpl="' + esc(k) + '"' +
         ' value="' + esc(val) + '" placeholder="' + esc(ph) + '"></label>';
@@ -2302,7 +2376,7 @@ async function loadBili() {
       : '<div class="face" style="display:grid;place-items:center;font-size:26px">🍮</div>';
     const pendant = A.pendant
       ? '<img class="pendant" src="' + esc(A.pendant) +
-        '" alt="" referrerpolicy="no-referrer" onerror="this.remove()">'
+        '" alt="" referrerpolicy="no-referrer" data-rm="1">'
       : '';
     const lv = Math.max(0, Math.min(6, parseInt(A.level, 10) || 0));
     const vipCls = (A.vip_type === 2) ? 'vip-badge annual' : 'vip-badge';
@@ -2484,6 +2558,11 @@ async function loadSecurity() {
     ps.textContent = d.has_password ? '已设置' : '未设置';
     ps.style.color = d.has_password ? 'var(--ok)' : 'var(--tx3)';
   }
+  /* 已经设过口令 → 显示「原口令」输入框。
+     改口令必须验证原口令（即使当前已登录），所以这个框不能省；
+     没设过口令时它没意义，藏起来。 */
+  const orow = document.getElementById('oldPwdRow');
+  if (orow) orow.style.display = d.has_password ? '' : 'none';
 }
 
 /* ---------- 最近安全事件 ---------- */
@@ -3020,6 +3099,63 @@ function fmtAgo(ts) {
 }
 
 /* ---------- 操作分发 ---------- */
+/* 动作 → 音效。
+   为什么集中在一张表里：音效名散在各处既难维护，也容易漏。
+   这里按**动作在做什么**配音，而不是按它叫什么名字——
+   「保存类」统一一声上行，「删除类」统一一声下行，
+   用户不看界面也能听出刚才那一下是"写进去了"还是"删掉了"。
+
+   ⚠️ 两条纪律：
+     1. 轮询类动作（自动刷新、心跳）**不在此表**，否则界面会自己不停地响；
+     2. 表里的名字必须是 sound.js 里真实存在的音效名，
+        写错只会静默不响（tests/test_sound_sfx.py 会核对）。 */
+const ACT_SFX = {
+  /* 写入类：上行，表示"进去了" */
+  'save-cfg': 'save', 'save-tpl': 'save', 'save-cookie': 'save',
+  'save-chk-uid': 'save', 'set-pwd': 'save', 'backup-now': 'save',
+  'add-sub': 'add', 'add-season': 'add', 'add-group': 'add',
+  /* 移除类：下行，但不像出错那么重 */
+  'del-sub': 'del', 'del-season': 'del', 'del-group': 'del',
+  'remove-sub': 'remove', 'remove-season': 'remove',
+  'bili-logout': 'disconnect',
+  /* 清空 / 重置类 */
+  'clear-log': 'clear', 'clear-pwd': 'clear', 'media-clear': 'clear',
+  'sub-search-clear': 'clear', 'reset-tpl': 'clear', 'reset-chk-uid': 'clear',
+  'unban-ip': 'clear', 'clean-procs': 'clear',
+  /* 复制 / 导出 / 下载 */
+  'about-copy': 'copy', 'copy-debug': 'copy',
+  'backup-download': 'download', 'dump-debug': 'download',
+  'backup-restore': 'import',
+  /* 刷新 / 检测：一声短促上滑，配合按钮转圈 */
+  'refresh-state': 'refresh', 'refresh-log': 'refresh',
+  'refresh-names': 'refresh', 'refresh-media': 'refresh',
+  'bili-refresh': 'refresh', 'check-now': 'refresh',
+  'diagnose': 'refresh', 'restart-bot': 'refresh',
+  'media-probe': 'connect', 'media-test-upload': 'connect',
+  'bili-browser': 'connect',
+  /* 跳转：大板块一声"翻页"，小选项卡更短更轻 */
+  'goto-sec': 'page', 'goto-tab': 'tab', 'goto-card': 'tab',
+  'goto-sandbox': 'tab',
+  /* 弹层关闭 */
+  'close-sheet': 'panelClose'
+};
+
+/* 按动作名查音效：先查全名，再按前缀回退。
+   前缀规则让以后新加的 save-xxx / del-xxx 之类自动就有声，不用改表。 */
+function actSfx(act) {
+  if (!act) return '';
+  if (ACT_SFX[act]) return ACT_SFX[act];
+  if (/^refresh-/.test(act)) return 'refresh';
+  if (/^(save|set)-/.test(act)) return 'save';
+  if (/^(del|remove)-/.test(act)) return 'del';
+  if (/^add-/.test(act)) return 'add';
+  if (/^(clear|reset)-/.test(act)) return 'clear';
+  if (/copy/.test(act)) return 'copy';
+  if (/download|dump/.test(act)) return 'download';
+  if (/close/.test(act)) return 'panelClose';
+  return '';
+}
+
 const ACTIONS = {
   // 关闭全屏面板（返回主页）
   async 'close-sheet'() { closeSheet(); },
@@ -3614,9 +3750,20 @@ const ACTIONS = {
   },
   async 'set-pwd'() {
     const v = $('newPwd').value;
-    const d = await post('/api/security/password', { action: 'set', new: v });
+    /* ⚠️ old 无条件一起发：后端只在"已经设过口令"时才去校验它，
+       首次设置时发了也会被忽略。这里不用判断显示与否，省得两边逻辑分叉。 */
+    const o = $('oldPwd') ? $('oldPwd').value : '';
+    const d = await post('/api/security/password', { action: 'set', new: v, old: o });
+    // 首次设置时后端不会下发登录令牌（否则登录页永远不会出现），
+    // 这里要主动跳登录页，让他用刚设的口令登录一次。
+    if (d.ok && d.need_login) {
+      $('newPwd').value = '';
+      showMsg('pwdMsg', '口令已设置。正在跳转到登录页…', 'ok');
+      setTimeout(() => { location.href = '/login'; }, 800);
+      return;
+    }
     showMsg('pwdMsg', d.ok ? '口令已保存' : (d.msg || '失败'), d.ok ? 'ok' : 'err');
-    if (d.ok) { $('newPwd').value = ''; loadSecurity(); }
+    if (d.ok) { $('newPwd').value = ''; if ($('oldPwd')) $('oldPwd').value = ''; loadSecurity(); }
   },
   'refresh-log': () => loadLog(),
 
@@ -3952,6 +4099,11 @@ function initDelegates() {
        控制台里那行报错用户根本不会去看。这里兜住并弹提示，
        顺便记进 window.__ACT_FAILS，方便把原文发过来定位。 */
     try {
+      /* 按动作配音效。放在动作执行**之前**：声音要跟点击同步，
+         等异步动作跑完再响就慢半拍了；结果音（成功/出错）由 toast 单独给。
+         ⚠️ 只有表里登记了的才响，未登记的（以及轮询类）保持安静。 */
+      const _s = actSfx(act);
+      if (_s) sfx(_s);
       if (ROW_ACTIONS[act]) {
         e.preventDefault();
         _guardAct(act, el, ROW_ACTIONS[act]);
@@ -4258,8 +4410,9 @@ function initSpinRefresh() {
   document.addEventListener('click', (e) => {
     const t = e.target.closest && e.target.closest('button[data-act^="refresh"]');
     if (!t || t._missing) return;
-    t.classList.add('spin-once');
-    setTimeout(() => { try { t.classList.remove('spin-once'); } catch (err) {} }, 660);
+    /* ⚠️ 用 restartFx 而不是直接 add：连点刷新时 class 还在，
+       直接 add 不会重新播动画，看起来就是"只转了一次圈"。 */
+    restartFx(t, 'spin-once', 660);
   }, { passive: true });
 }
 
@@ -4298,8 +4451,7 @@ function countUp(el, to) {
   // ⚠️ .fx-pulse 以前定义了却没有任何元素用（死样式），这里才真正接上；
   //    跑完自删，不然每次重画都会再抖一遍。
   if (el.classList && el.classList.add) {
-    el.classList.add('fx-pulse');
-    setTimeout(() => { try { el.classList.remove('fx-pulse'); } catch (e) {} }, 660);
+    restartFx(el, 'fx-pulse', 660);
   }
   const t0 = performance.now(), dur = 520;
   const step = (t) => {
@@ -4848,6 +5000,40 @@ var PUSH_KINDS = [
   { key: 'top_comment', nm: '置顶评论' }, { key: 'season', nm: '合集更新' },
 ];
 
+/* ---------- 「全部跑一遍」期间的按钮锁 ----------
+   跑批要连发 7 条，期间那 7 个单独按钮必须全部点不动：
+   边跑边点会把消息插进同一批里，顺序和内容全乱。
+   ⚠️ 返回被锁住的按钮列表，交给 unlockPushBtns 恢复 ——
+      调用方必须放在 finally 里，中途抛异常也要解锁，
+      否则按钮永久置灰，只能刷新页面。 */
+function lockPushBtns(exceptBtn) {
+  var all = [];
+  try {
+    all = Array.prototype.slice.call(
+      document.querySelectorAll('[data-act="push-test"]'));
+  } catch (e) { all = []; }
+  var locked = [];
+  for (var i = 0; i < all.length; i++) {
+    var b = all[i];
+    if (b === exceptBtn) continue;   // 触发者自己由 runAct 管，别重复锁
+    try {
+      b.disabled = true;
+      if (b.classList) b.classList.add('is-busy');
+      locked.push(b);
+    } catch (e) { /* 单个按钮失败不影响其余 */ }
+  }
+  return locked;
+}
+
+function unlockPushBtns(locked) {
+  for (var i = 0; i < (locked || []).length; i++) {
+    try {
+      locked[i].disabled = false;
+      if (locked[i].classList) locked[i].classList.remove('is-busy', 'is-busy-on');
+    } catch (e) { /* 兜底不能再抛 */ }
+  }
+}
+
 async function pushTest(btn, kind) {
   var cfg = STATE.config || {};
   var gid = cfg.sandbox_group || '';
@@ -4857,10 +5043,16 @@ async function pushTest(btn, kind) {
     return;
   }
   if (kind === 'all') {
-    /* 七条都发，详情里汇总：每条一行，图片行各归各的。
-       以前只 toast 一句"已发送 7 条"，哪条有图、比例对不对完全看不到。 */
+    /* ⚠️ 跑批期间把 7 个单独按钮全部锁死（v2.2.5）。
+       以前只有"全部跑一遍"自己被 runAct 锁住，其余 7 个照样能点 ——
+       边跑边点会把消息插进同一批里，发出去的顺序和内容全乱，
+       也看不出哪条是"全部跑一遍"发出的。
+       ⚠️ 用 try/finally 解锁：中途抛异常也必须恢复，
+          否则按钮永久置灰，只能刷新页面。 */
+    var locked = lockPushBtns(btn);
     var rows = [];
     var last = null;
+    try {
     for (var i = 0; i < PUSH_KINDS.length; i++) {
       var r = await post('/api/test', { gid: gid, kind: PUSH_KINDS[i].key,
         real: testOpt('real', true), mark: testOpt('mark', true) });
@@ -4885,13 +5077,15 @@ async function pushTest(btn, kind) {
         return s.replace(/<[^>]*>/g, ''); }).join('\n');
     }
     toast('已发送 ' + PUSH_KINDS.length + ' 条测试消息到沙盒群', 'ok');
+    } finally {
+      unlockPushBtns(locked);
+    }
     return;
   }
   var d = await post('/api/test', { gid: gid, kind: kind,
     real: testOpt('real', true), mark: testOpt('mark', true) });
   if (d && d.ok) {
-    if (btn) { btn.classList.add('push-ok');
-               setTimeout(function () { btn.classList.remove('push-ok'); }, 1800); }
+    if (btn) { restartFx(btn, 'push-ok', 1800); }
     /* ⚠️ 详情写进「上次发送详情」卡片，不再只靠 toast ——
        toast 几秒就消失，用户根本来不及看（反馈："toast 是什么，后台看不到"）。 */
     renderTpLast(d, kind);
@@ -5233,7 +5427,12 @@ Object.assign(ACTIONS, {
       '数据文件：' + ((d && d.state_path) || '?'),
       '订阅规模：群 ' + (s.groups || 0) + ' · 订阅 ' + (s.subs || 0)
         + ' · UP 主 ' + (s.ups || 0) + ' · 合集 ' + (s.seasons || 0),
-      '依赖：' + Object.keys(deps).map(k => k + (deps[k] ? '✅' : '❌')).join(' '),
+      '依赖（必装）：' + ((d && d.deps_required) || Object.keys(deps))
+        .map(k => (((d && d.deps_pip) || {})[k] || k) + (deps[k] ? '✅' : '❌')).join(' '),
+      '依赖（可选）：' + (((d && d.deps_optional) || []).length
+        ? ((d && d.deps_optional) || [])
+            .map(k => (((d && d.deps_pip) || {})[k] || k) + (deps[k] ? '✅' : '❌')).join(' ')
+        : '无'),
     ].join('\n');
     function fallback() {
       try {
@@ -5362,9 +5561,24 @@ Object.assign(ACTIONS, {
 
   async 'clear-pwd'() {
     if (!confirm('清除面板口令？之后打开面板不用输密码。')) return;
-    const d = await post('/api/security/password', { action: 'clear' });
+    /* ⚠️ 清除口令 = 拆掉门锁，后端要求先验证原口令（跟修改口令同一标准）。
+       前端必须弹框索要，否则用户没有地方填，只会拿到一句"原口令不对"。
+       已设口令时 oldPwd 输入框是显示的，但直接读它可能为空（用户没填），
+       所以这里显式弹一次，比静默失败好。 */
+    const cur = $('oldPwd') ? $('oldPwd').value : '';
+    const o = cur || prompt('请输入当前口令以确认清除：');
+    if (o === null) return;
+    const d = await post('/api/security/password', { action: 'clear', old: o, password: o });
     showMsg('pwdMsg', d.ok ? '口令已清除' : (d.msg || '失败'), d.ok ? 'ok' : 'err');
     if (d.ok) { const i = $('newPwd'); if (i) i.value = ''; loadSecurity(); }
+  },
+  /* 手动锁：立刻退出登录态。跟自动锁（关程序 / 空闲超时）互补 ——
+     自动锁管的是"我离开了"，手动锁管的是"我现在就要锁"。 */
+  async 'lock-now'() {
+    const d = await post('/api/lock', {});
+    if (!d.ok) { showMsg('pwdMsg', d.msg || '锁定失败', 'err'); return; }
+    showMsg('pwdMsg', '已锁定，正在跳登录页…', 'ok');
+    setTimeout(function () { location.href = '/login'; }, 600);
   },
   async 'media-clear'() {
     if (!confirm('清空图片缓存？下次推送会重新下载，不影响订阅数据。')) return;

@@ -1,10 +1,40 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="{{ theme }}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>B站消息订阅工具 · 控制台</title>
 <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+<!-- ⚠️ 主题脚本必须紧跟 CSS、放在 <head> 里，且必须是 ES5（var / function）。
+     以前这一页是硬编码 data-theme="dark"，真正的切换逻辑在 app.js 里
+     —— 而 app.js 是外部脚本，加载执行时浏览器早就按深色把整页画完了。
+     日间模式的用户登录成功后进面板，就会"先闪一下夜间、再变回日间"。
+
+     现在两端都参与：服务端先按 cookie 定一次（见 webui._theme_from_cookie），
+     这里再用 localStorage 校正一次（面板主要存在 localStorage 里）。
+     放在 head 里、渲染 body 之前执行，就不会有那一帧深色。
+
+     ⚠️ 兜底逻辑必须与 app.js 的 initTheme **完全一致**
+     （prefers dark → dark，否则 light）。不一致的话 head 定成 light、
+     app.js 随后又改成 dark，等于闪第二次。 -->
+<script nonce="{{ csp_nonce }}">
+(function () {
+  var t = null;
+  try { t = localStorage.getItem('bili-theme'); } catch (e) { t = null; }
+  if (!t) {
+    t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          ? 'dark' : 'light';
+  }
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+<!-- 标签页小图标：不随包带图，地址由后端 /api/brand/ico 给出（远程读取，
+     可用环境变量 ONOBN_ICO_URL 换，设 off 则接口返回 404、浏览器静默不显示）。
+     ⚠️ 带版本号参数：换图后不用等浏览器自己想起去刷新那个顽固的 favicon 缓存。 -->
+<link rel="icon" href="/api/brand/ico?v={{ app_version }}">
+<!-- 标签页小图标：不随包带图，地址由后端 /api/brand/ico 给出（远程读取，
+     可用环境变量 ONOBN_ICO_URL 换，设 off 则接口返回 404、浏览器静默不显示）。
+     ⚠️ 带版本号参数：换图后不用等浏览器自己想起去刷新那个顽固的 favicon 缓存。 -->
 <!-- 布局样式：以确认过的最终版草稿为准，放在 style.css 之后以保证优先级 -->
 <style>
   :root {
@@ -2270,6 +2300,14 @@
 
         <div class="card">
           <h3>🔑 访问口令</h3>
+          <!-- 原口令：已经设过口令时**必须**填。以前没有这个框，后端又因为
+               "已登录就不验旧口令"而放行，等于谁拿着会话都能改门锁。
+               这个框只在「当前状态：已设置」时显示（JS 控制显隐）。 -->
+          <div class="row" id="oldPwdRow" style="display:none">
+            <label>原口令</label>
+            <input id="oldPwd" type="password" placeholder="修改口令必须先验证原口令">
+            <div class="hint">改口令要证明你知道原来的口令 —— 即使现在已经是登录状态</div>
+          </div>
           <div class="row">
             <label>新口令</label>
             <input id="newPwd" type="password" placeholder="至少 6 位">
@@ -2278,6 +2316,12 @@
           <div class="btns">
             <button class="btn pri" data-act="set-pwd">💾 设置口令</button>
             <button class="btn dg" data-act="clear-pwd">🗑️ 清除口令</button>
+            <button class="btn" data-act="lock-now">🔒 立即锁定</button>
+          </div>
+          <div class="hint" style="margin-top:6px">
+            「立即锁定」= 立刻退出登录状态，下次打开要重新输口令；
+            其它设备/浏览器手里的旧令牌同时作废。
+            关闭机器人再启动，也会自动要求重新登录。
           </div>
           <div id="pwdMsg" class="msg"></div>
           <div class="hint" style="margin-top:9px">当前状态：<b id="pwdState">未设置</b></div>
@@ -2889,24 +2933,78 @@
         </div>
       </div>
 
-      <!-- 关于：项目名、版本、运行环境、声明与反馈方式。
-           反馈 bug 时最常被问"哪个版本 / 数据在哪 / 装了哪些依赖"，
-           全都摆在这里，还能一键复制去贴反馈。 -->
+      <!-- 关于：这是什么、使用声明、运行环境、维护状态、反馈方式。
+           ⚠️ 使用声明刻意写成**静态 HTML**，不由 JS 渲染：
+              万一后端没起来、接口报错或 JS 出错，声明也必须在页面上 ——
+              这类信息不能依赖任何东西"正常跑起来"才看得见。 -->
       <div class="sub-panel" id="st-about" data-tab="about">
         <div class="card">
-          <h3>ℹ️ 关于本工具</h3>
+          <h3>ℹ️ 这是什么</h3>
           <div class="row"><label>项目名</label>
             <div class="hint">
               <b>OnOB站通知订阅工具</b><br>
-              英文：<b>OnO Bilibili Notifier</b>　·　缩写：<b>OnOBN</b><br>
-              作者 / 来源：<b>波萝Buono</b><br>
-              <a class="gh-link" href="https://github.com/XxBoLuoxX" target="_blank"
-                 rel="noopener noreferrer">🔗 GitHub 主页：github.com/XxBoLuoxX</a>
+              英文：<b>OnO Bilibili Notifier</b>　·　缩写：<b>OnOBN</b>
+            </div>
+          </div>
+          <div class="row"><label>做什么的</label>
+            <div class="hint">
+              盯着 B 站的<b>开播、投稿、动态、置顶评论、合集更新</b>，
+              有变化就推到指定的 QQ 群。<br>
+              机器人用的是 <b>QQ 开放平台官方机器人</b>接口，
+              <b>不是</b>第三方协议实现，也不需要挂自己的 QQ 号。
             </div>
           </div>
           <div class="row"><label>版本</label>
             <div class="hint" id="abVer">（读取中…）</div>
           </div>
+          <div class="row"><label>署名</label>
+            <div class="hint">
+              作者 / 来源：<b>波萝Buono</b>　（提出需求、整理、测试与维护）<br>
+              <a class="gh-link" href="https://github.com/XxBoLuoxX" target="_blank"
+                 rel="noopener noreferrer">🔗 GitHub：github.com/XxBoLuoxX</a><br>
+              <a class="gh-link" href="https://space.bilibili.com/259149243" target="_blank"
+                 rel="noopener noreferrer">🌐 B 站：space.bilibili.com/259149243</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3 class="danger">⚠️ 使用声明（请务必读完）</h3>
+          <div class="note danger" style="margin-bottom:10px">
+            <b>① 服务器端从未测试过</b><br>
+            只在本机 Windows 桌面环境开发调试过。Linux 服务器、Docker、云主机
+            上的部署路径<b>没有实测</b>，不保证能跑起来。这类环境出问题欢迎反馈，
+            但请理解它可能根本没被跑通过。
+          </div>
+          <div class="note danger" style="margin-bottom:10px">
+            <b>② 代码由 AI 生成</b><br>
+            程序代码由腾讯元宝「Hy4 preview」生成，作者负责整理、测试与维护。
+            生成的代码<b>没有经过人工逐行复核</b>。
+          </div>
+          <div class="note danger" style="margin-bottom:0">
+            <b>③ 安全功能未做安全审计</b><br>
+            面板口令、登录限流、凭据加密等只验证过「功能能跑通」，
+            <b>未经过安全测试、渗透测试或代码审计</b>。请不要把它暴露到公网。
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>🛠️ 维护状态</h3>
+          <div class="note" style="margin-bottom:10px">
+            项目已趋于稳定，此后<b>只更新两类内容</b>：
+            <b>功能更新</b>，以及<b>严重 bug 修复</b>（程序起不来、数据丢失、
+            推送完全失效、凭据泄露）。
+          </div>
+          <div class="note" style="margin-bottom:0">
+            文案措辞、界面观感、代码风格、性能优化这类不影响实际使用的改动，
+            <b>不再发布新版本</b>。由 AI 生成代码、作者一人维护，每次改动都要
+            重跑全量回归并重新打包；把改动收窄到「真正影响使用」的范围，
+            才能保证每次发布都可靠。详见 README 的「维护政策」。
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>🖥️ 运行环境与数据位置</h3>
           <div class="row"><label>运行环境</label>
             <div class="hint" id="abEnv">（读取中…）</div>
           </div>
@@ -2924,22 +3022,6 @@
         </div>
 
         <div class="card">
-          <h3>⚠️ 使用声明</h3>
-          <div class="note" style="margin-bottom:10px">
-            <b>服务器端从未测试过</b>：只在本机桌面环境开发调试过，
-            Linux 服务器 / Docker / 云主机上的部署路径<b>没有实测</b>。
-            在这类环境跑出问题，欢迎反馈。
-          </div>
-          <div class="note" style="margin-bottom:10px">
-            <b>代码由 AI 生成</b>：腾讯元宝「Hy4 preview」生成，作者负责整理、测试与维护。
-          </div>
-          <div class="note" style="margin-bottom:0">
-            <b>安全功能未做安全审计</b>：口令、登录限流等只验证过「功能能跑通」，
-            未经过安全测试、渗透测试或代码审计。
-          </div>
-        </div>
-
-        <div class="card">
           <h3>📮 反馈</h3>
           <div class="hint">
             遇到 bug 或想提建议，反馈时请带上：
@@ -2949,9 +3031,9 @@
             ② <b>做了什么操作</b>、<b>期望是什么</b>、<b>实际是什么</b><br>
             ③ 面板「日志」页末尾的报错，或数据目录里 <code>logs/bot.log</code> 的最后几十行
           </div>
-          <div class="note" style="margin-top:10px;margin-bottom:0">
-            截图时请把群里号、Cookie、AppSecret 等敏感信息打码 ——
-            备份包里也含这些，别直接公开上传。
+          <div class="note danger" style="margin-top:10px;margin-bottom:0">
+            <b>截图前请先打码</b>：群号、Cookie、AppSecret 等敏感信息都要遮住。
+            备份包里也含这些内容，<b>不要直接公开上传</b>。
           </div>
         </div>
       </div>
@@ -2971,7 +3053,7 @@
 </div>
 <div id="toast"></div>
 <div id="tipLayer" role="tooltip" aria-hidden="true"></div>
-<script>window.__BE_VER = "{{ app_version }}";</script>
+<script nonce="{{ csp_nonce }}">window.__BE_VER = "{{ app_version }}";</script>
 <!-- 音效要早于 app.js：app.js 里的 toast / 折叠都可能马上用到它 -->
 <script src="/static/sound.js?v={{ app_version }}"></script>
 <script src="/static/app.js?v={{ app_version }}"></script>

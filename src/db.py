@@ -21,7 +21,9 @@
 """
 import json
 import os
+import shutil
 import sqlite3
+import stat as _stat
 import threading
 import time
 
@@ -267,6 +269,98 @@ def data_path_from_cfg(cfg=None) -> str:
     return p
 
 
+def _clear_readonly(path: str) -> None:
+    """清掉 Windows 只读属性。
+
+    ⚠️ 为什么需要：Windows 上**目标文件带只读属性时，os.replace 会直接
+       报 WinError 5（拒绝访问）**。文件可能因为从只读介质复制、被某次
+       操作改过属性、或云端同步盘回写而带上只读位。清掉就能写。
+       POSIX 下靠目录权限管控，chmod 语义不同，这里只处理 Windows。
+    """
+    if os.name != "nt":
+        return
+    try:
+        mode = os.stat(path).st_mode
+        if not (mode & _stat.S_IWRITE):
+            os.chmod(path, mode | _stat.S_IWRITE | _stat.S_IREAD)
+    except OSError:
+        pass
+
+
+def _replace_file(tmp: str, path: str) -> None:
+    """把临时文件换成目标文件，逐级降级 —— 绝不轻易放弃数据。
+
+    Windows 上 os.replace 可能抛 WinError 5（拒绝访问），常见原因：
+
+      1. **目标带只读属性**      → 清掉就好（_clear_readonly）
+      2. **目标被别的进程独占**  → 另一实例 / 编辑器 / 云同步客户端，
+                                   只能等它松开，退避重试通常能过
+      3. **杀软 / 受控文件夹访问** → 桌面、文档这类受保护目录尤其常见，
+                                   正在扫描时短暂锁住，等一下就好
+
+    前两种能绕，第三种只能等。所以顺序是：重试 → 换 move → 直接写。
+
+    ⚠️ 最后一步会放弃原子性（直接写目标文件）。这不是理想做法，但比起
+       「数据全丢」，冒一点半截文件的险更划算 —— 何况调用方在写之前
+       已经用 maybe_backup 留了旧副本，真写坏了还能回滚。
+    """
+    last = None
+    # 第一轮：退避重试，覆盖"扫描锁 / 瞬时占用"这类会自己消失的失败
+    for attempt in range(4):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError as e:
+            last = e
+            _clear_readonly(path)          # 只读属性：清掉下次就成了
+            time.sleep(0.05 * (attempt + 1))
+
+    # 第二轮：shutil.move 内部会换策略（rename → 复制后删源）
+    try:
+        shutil.move(tmp, path)
+        return
+    except OSError as e:
+        last = e
+
+    # 第三轮（兜底）：放弃原子性，直接写目标。tmp 可能已被 move 部分处理，
+    # 所以先读它的内容；读不到就说明 move 其实成功了。
+    try:
+        with open(tmp, "r", encoding="utf-8") as f:
+            data = f.read()
+        _clear_readonly(path)
+        # ⚠️ open(path,'w') 会**立刻截断**旧文件。写到一半失败的话，
+        #    新数据没进去、旧数据也清空了 —— 两头空。所以先留一份旧内容，
+        #    失败就写回去，宁可保住旧数据，也不能让它变空。
+        old = None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                old = f.read()
+        except OSError:
+            old = None
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            if old is not None:
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(old)
+                except OSError:
+                    pass
+            raise
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return
+    except FileNotFoundError:
+        return          # tmp 已不在 = 上一轮的 move 其实成功了
+    except OSError as e:
+        raise e from last
+
+
 def _atomic_write_json(path: str, obj) -> None:
     """原子写：先写临时文件，再 os.replace 整体替换。
 
@@ -282,7 +376,7 @@ def _atomic_write_json(path: str, obj) -> None:
             json.dump(obj, f, ensure_ascii=False, indent=1, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_file(tmp, path)
     except Exception:
         try:
             os.unlink(tmp)
@@ -293,6 +387,37 @@ def _atomic_write_json(path: str, obj) -> None:
         restrict_perms(path)
     except Exception:
         pass
+
+
+def cleanup_stale_tmp(path: str, max_age: int = 3600) -> int:
+    """清掉数据目录里残留的 .tmp-*.json，返回清理数量。
+
+    ⚠️ 为什么需要：写临时文件时被杀软拦下 / 进程被杀，临时文件会留在
+       数据目录里。它们既不是数据也清不掉，越积越多，还会被"数据目录
+       里有陌生文件"这类检查当成异常报出来。
+
+    只删超过 max_age 秒的 —— 正在写的临时文件（同进程或另一实例）不能被误删。
+    """
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    if not os.path.isdir(d):
+        return 0
+    now = time.time()
+    n = 0
+    try:
+        for name in os.listdir(d):
+            if not (name.startswith(".tmp-") and name.endswith(".json")):
+                continue
+            fp = os.path.join(d, name)
+            try:
+                if now - os.stat(fp).st_mtime <= max_age:
+                    continue        # 可能是别的实例正在写的，跳过
+                os.unlink(fp)
+                n += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return n
 
 
 def backup_dir(path: str) -> str:

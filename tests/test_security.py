@@ -194,7 +194,13 @@ def t_harden():
 
     ck("请求体上限已设", harden.MAX_CONTENT_LENGTH == 256 * 1024)
     hdr = harden.SECURITY_HEADERS
-    ck("CSP 已配置", "default-src 'self'" in hdr["Content-Security-Policy"])
+    # ⚠️ 断言改过：CSP 不再放在 SECURITY_HEADERS 里 —— 它必须带每次请求
+    #    生成的随机数（否则模板里的内联脚本全被拦），所以用 _csp_header()。
+    #    保留两处定义迟早改一处漏一处，已改为单一来源。
+    ck("CSP 已配置", "default-src 'self'" in harden._csp_header())
+    ck("CSP 不带 unsafe-inline（脚本）",
+       "'unsafe-inline'" not in harden._csp_header().split("script-src")[1])
+    ck("CSP 脚本策略带随机数", "'nonce-" in harden._csp_header())
     ck("禁止 iframe 嵌套", hdr["X-Frame-Options"] == "DENY")
     ck("禁用缓存", hdr["Cache-Control"] == "no-store")
     ck("nosniff 已设", hdr["X-Content-Type-Options"] == "nosniff")

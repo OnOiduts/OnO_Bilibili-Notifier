@@ -46,6 +46,10 @@ ENV_DATA_DIR = "ONOBN_DATA_DIR"
 ENV_PANEL_PORT = "ONOBN_PANEL_PORT"
 ENV_PANEL_PASSWORD = "ONOBN_PANEL_PASSWORD"
 ENV_LOGO_URL = "ONOBN_LOGO_URL"
+ENV_ICO_URL = "ONOBN_ICO_URL"
+# 登录页背景装饰图（除 logo / ico 之外额外飘的两张）
+ENV_BG1_URL = "ONOBN_BG1_URL"
+ENV_BG2_URL = "ONOBN_BG2_URL"
 
 # 占位符：填了等于没填，不做特殊判断会把示例值当成真密钥
 PLACEHOLDERS = ("", "xxx", "xxxx", "your_appid", "your_app_secret",
@@ -172,3 +176,18 @@ def panel_password_from_env() -> str:
 def logo_url_from_env() -> str:
     """品牌 logo 的远程地址：ONOBN_LOGO_URL。没配返回空串（用内置默认）。"""
     return env_value(ENV_LOGO_URL)
+
+
+def ico_url_from_env() -> str:
+    """标签页小图标（favicon）的远程地址：ONOBN_ICO_URL。没配返回空串。"""
+    return env_value(ENV_ICO_URL)
+
+
+def bg1_url_from_env() -> str:
+    """登录页背景装饰图 1：ONOBN_BG1_URL。没配返回空串（用内置默认）。"""
+    return env_value(ENV_BG1_URL)
+
+
+def bg2_url_from_env() -> str:
+    """登录页背景装饰图 2：ONOBN_BG2_URL。没配返回空串（用内置默认）。"""
+    return env_value(ENV_BG2_URL)

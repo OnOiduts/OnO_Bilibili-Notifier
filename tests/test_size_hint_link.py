@@ -79,7 +79,15 @@ def test_img_line_format_unchanged():
 
 
 # ── 面板进程联动 ──────────────────────────────────────────────
+SRC = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "src")
+
+
 def _read(p):
+    # ⚠️ 原来直接用相对路径 'webui.py'，只有把工作目录切到 src/ 才找得到。
+    #    从仓库根跑就全是 FileNotFoundError —— 这些用例其实一直没真跑过。
+    if not os.path.isabs(p):
+        p = os.path.join(SRC, p)
     return io.open(p, encoding="utf-8").read()
 
 

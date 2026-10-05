@@ -22,6 +22,18 @@
 jsDelivr 是 GitHub 的公共 CDN 镜像，指向的是**同一个仓库同一张图**，
 只是多了层加速。想换回官方 raw 或其它镜像，设 ONOBN_LOGO_URL 即可。
 
+图床仓库与路径
+--------------
+v2.2.6 起默认图改到专用图床仓库：
+
+    https://github.com/XxBoLuoxX/OnO-ImageHost-/blob/main/Logo/logo.png
+    → cdn.jsdelivr.net/gh/XxBoLuoxX/OnO-ImageHost-@main/Logo/logo.png
+
+两个易错点，断言里专门盯住：
+1. 仓库名 **OnO-ImageHost-** 末尾有个连字符，漏了就 404；
+2. 目录名是 **Logo**（大写 L），GitHub 路径大小写敏感，写成 logo/ 取不到。
+
+
 取不到图时会怎样
 ----------------
 app.js 的 initLogo 是「探测式」加载：CSS 里 `--logo` 默认 `none`，
@@ -92,6 +104,39 @@ def test_default_url_is_https_and_points_to_repo():
     assert "XxBoLuoxX" in url, "应指向作者仓库"
     assert url.lower().endswith("logo.png"), "应指向 logo.png"
 
+    # 图床仓库名末尾有连字符，且目录名 Logo 是大写 L —— 两处写错都会 404
+    assert "OnO-ImageHost-" in url, (
+        f"图床仓库名是 OnO-ImageHost-（末尾带连字符），实际：{url}")
+    assert "/Logo/logo.png" in url, (
+        f"路径是 Logo/logo.png（大写 L 的目录名），实际：{url}")
+
+    # 不能还指着旧图床（xxboluoxx.github.io 那个仓库已不再用作图床）
+    assert "xxboluoxx.github.io" not in url, "旧图床地址已废弃"
+
+
+def test_no_stale_imagehost_reference():
+    """源码与文档里不能残留旧图床地址 xxboluoxx.github.io。"""
+    import re
+    pat = re.compile(r"xxboluoxx\.github\.io")
+    # ⚠️ 只扫**代码**和**对外文档**，CHANGELOG 要跳过：
+    #    它是一条历史记录，v2.2.6 那条条目正是要写清"从旧图床换到新图床"，
+    #    "旧地址"三个字本身就是条目内容。把历史记录也禁掉的话，
+    #    以后没人能从日志里看出图床换过。真正在跑的是代码里的地址。
+    skip_files = {os.path.abspath(os.path.join(ROOT, "docs", "CHANGELOG.md"))}
+    for base in (SRC, os.path.join(ROOT, "docs")):
+        if not os.path.isdir(base):
+            continue
+        for p in _walk(base):
+            if os.path.abspath(p) in skip_files:
+                continue
+            if not p.endswith((".py", ".js", ".html", ".css", ".md")):
+                continue
+            try:
+                text = open(p, encoding="utf-8").read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            assert not pat.search(text), f"{p} 里仍有旧图床地址"
+
 
 def test_env_override(monkeypatch):
     """ONOBN_LOGO_URL 能换成任意直链。"""
@@ -153,18 +198,24 @@ def test_frontend_degrades_silently():
 
 
 def main():
-    """不用 pytest 也能跑：python tests/test_brand_logo.py"""
+    """不用 pytest 也能跑：python tests/test_brand_logo.py
+
+    ⚠️ 这里原来写的是 `pytest.importorskip` —— 那只是**引用了一下属性**，
+       而模块里根本没 import pytest，于是直接 NameError，被下面 except 抓成
+       [ERR]，看起来像"失败"，其实是需要 monkeypatch 的用例没被正确跳过。
+       带 monkeypatch 的用例请用 `python -m pytest` 跑，脚本模式正确跳过。
+    """
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]
-    ok = fail = 0
+    ok = fail = skip = 0
     for fn in fns:
         n = fn.__code__.co_argcount
         try:
             if n == 0:
                 fn()
             else:
-                pytest.importorskip
-                print(f"  （跳过 {fn.__name__}：需要 monkeypatch）")
+                print(f"  （跳过 {fn.__name__}：需要 monkeypatch，请用 pytest 跑）")
+                skip += 1
                 continue
             print(f"  [OK] {fn.__name__}")
             ok += 1
@@ -174,7 +225,7 @@ def main():
         except Exception as e:
             print(f"  [ERR] {fn.__name__}: {type(e).__name__}: {e}")
             fail += 1
-    print(f"\n{ok} 通过 / {fail} 失败")
+    print(f"\n{ok} 通过 / {fail} 失败 / {skip} 跳过")
     return 1 if fail else 0
 
 

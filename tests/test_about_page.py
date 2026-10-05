@@ -80,7 +80,11 @@ ok("loadAbout 接进了 safe() 调度", re.search(r"safe\('about',\s*loadAbout\)
 ok("有 about-copy 动作", "'about-copy'" in JS)
 ok("复制内容含版本号", "OnOBN 版本：" in JS)
 ok("复制内容含数据目录", "数据目录：" in JS)
-ok("复制内容含依赖", "依赖：" in JS)
+# ⚠️ 前缀从「依赖：」改成了「依赖（必装）：/ 依赖（可选）：」——
+#    分类由后端给，复制出去的反馈文本也要分得清哪个是必装。
+ok("复制内容含依赖（必装）", "依赖（必装）：" in JS)
+ok("复制内容含依赖（可选）", "依赖（可选）：" in JS)
+ok("复制内容不再用不分类的旧前缀", "'依赖：' + Object.keys" not in JS)
 
 # ---------- 6. 发布包名必须带版本号 ----------
 ok("包名模板带 %s（版本号占位）", "OnO_Bilibili-Notifier_v%s.zip" in MKZIP, MKZIP[:0])
