@@ -324,8 +324,11 @@ def main():
             bad(WARN, "B 站 cookie：未登录（投稿/动态接口可能报 -352 风控）",
                 "解决：面板「🍮 B站登录」→ 打开浏览器登录")
         else:
-            exp = float(cfg.get("bili_cookie_expires") or 0)
+            exp, _est = bili_login.effective_expires(
+                cookie, float(cfg.get("bili_cookie_expires") or 0))
             info = bili_login.expired_info(exp) if exp else {"text": "未知", "expired": False, "soon": False}
+            if _est and info.get("text"):
+                info = dict(info, text=info["text"] + "（估算）")
             if info.get("expired"):
                 bad(BAD, "B 站 cookie 已过期，请重新登录或续期",
                     "解决：面板「🍮 B站登录」→ 重新登录")

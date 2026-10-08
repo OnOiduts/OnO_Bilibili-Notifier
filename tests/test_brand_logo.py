@@ -26,8 +26,8 @@ jsDelivr 是 GitHub 的公共 CDN 镜像，指向的是**同一个仓库同一�
 --------------
 v2.2.6 起默认图改到专用图床仓库：
 
-    https://github.com/XxBoLuoxX/OnO-ImageHost-/blob/main/Logo/logo.png
-    → cdn.jsdelivr.net/gh/XxBoLuoxX/OnO-ImageHost-@main/Logo/logo.png
+    https://github.com/OnOiduts/OnO-ImageHost-/blob/main/Logo/logo.png
+    → cdn.jsdelivr.net/gh/OnOiduts/OnO-ImageHost-@main/Logo/logo.png
 
 两个易错点，断言里专门盯住：
 1. 仓库名 **OnO-ImageHost-** 末尾有个连字符，漏了就 404；
@@ -101,7 +101,7 @@ def test_default_url_is_https_and_points_to_repo():
     import webui
     url = webui.LOGO_URL_DEFAULT
     assert url.startswith("https://"), f"logo 地址必须 https，实际：{url}"
-    assert "XxBoLuoxX" in url, "应指向作者仓库"
+    assert "OnOiduts" in url, "应指向图床仓库所在组织"
     assert url.lower().endswith("logo.png"), "应指向 logo.png"
 
     # 图床仓库名末尾有连字符，且目录名 Logo 是大写 L —— 两处写错都会 404

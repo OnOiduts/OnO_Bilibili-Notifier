@@ -53,12 +53,22 @@ html = _read(os.path.join(SRC, "templates", "index.html"))
 ck("页脚品牌名是 OnOiduts工业", ">OnOiduts工业<" in html)
 ck("页脚品牌是链接（a.sf-brand）", 'class="sf-brand"' in html
    and re.search(r'<a[^>]*class="sf-brand"', html) is not None)
-ck("品牌链接指向 GitHub", 'href="https://github.com/XxBoLuoxX"' in html)
+# ⚠️ 品牌名叫 OnOiduts，点开就该是【组织】主页。
+#    注意：关于页「署名」那条仍指向个人账号（见下），是许可证要求的作者署名，
+#    两者刻意不同，别统一成一个。所以这里必须精确匹配 a.sf-brand 的 href，
+#    不能只判"html 里有没有组织 URL"。
+_m_brand_href = re.search(r'<a[^>]*class="sf-brand"[^>]*href="([^"]+)"', html)
+ck("品牌链接指向 OnOiduts 组织主页",
+   _m_brand_href is not None and _m_brand_href.group(1) == "https://github.com/OnOiduts",
+   (_m_brand_href.group(1) if _m_brand_href else "没找到 a.sf-brand 的 href"))
+ck("品牌链接不再指向个人账号",
+   _m_brand_href is not None and _m_brand_href.group(1) != "https://github.com/XxBoLuoxX")
 ck("品牌链接新窗口打开且防反向劫持",
    'target="_blank"' in html and 'rel="noopener noreferrer"' in html)
 # 项目正式名（OnOBN 系列）不能因为页脚回退就整个消失
 ck("仍保留缩写 OnOBN", "OnOBN" in html)
-ck("关于页也给了 GitHub 链接", "github.com/XxBoLuoxX" in html)
+# 署名仍必须是个人账号（许可证条款要求标注作者）
+ck("关于页署名仍指向个人账号", "github.com/XxBoLuoxX" in html)
 
 # ---- 全站兜底扫描 ----
 hits = []

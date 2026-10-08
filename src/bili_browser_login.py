@@ -78,6 +78,35 @@ def _pick_from_cookies(cookies: list) -> dict:
     return out
 
 
+def _expires_from_cookies(cookies: list) -> float:
+    """从 cookie 列表里读出 SESSDATA 的真实过期时间（Unix 秒）。
+
+    ⚠️ 为什么必须读真值而不是写死 30 天：
+        B 站 SESSDATA 的名义有效期约 1 个月，但**实际会短很多**
+        （服务端主动踢、长期不活跃、风控都会让它提前失效）。
+        以前这里一律写 `time.time() + 30*86400`，面板于是永远显示
+        "还剩 29 天"——到期提醒的阈值（2~5 天）永远进不去，
+        等于提醒功能整体失效。所以必须以 cookie 自带的时间为准。
+
+    Playwright 给的是秒级时间戳（-1 或 0 表示会话 cookie，没有明确过期）；
+    浏览器 DOM 里取到的则是毫秒，两种都兼容一下。
+    """
+    best = 0.0
+    for c in cookies or []:
+        if (c.get("name") or "") != "SESSDATA":
+            continue
+        try:
+            raw = float(c.get("expires") or 0)
+        except (TypeError, ValueError):
+            continue
+        if raw > 1e12:          # 毫秒
+            raw = raw / 1000.0
+        if raw <= 0:            # 会话 cookie：没有明确过期时间
+            continue
+        best = max(best, raw)
+    return best
+
+
 def _has_login(cookies: dict) -> bool:
     return all(cookies.get(k) for k in NEED)
 
@@ -158,13 +187,16 @@ async def browser_login(timeout: int = 180, headless: bool = False,
             # 检测到 SESSDATA 立刻返回，不会干等到 timeout。
             deadline = time.time() + timeout
             found = {}
+            found_raw = []
             waited = 0
             while time.time() < deadline:
                 if should_cancel and should_cancel():
                     raise BrowserLoginError("已取消登录")
-                cookies = _pick_from_cookies(await ctx.cookies())
+                raw = await ctx.cookies()
+                cookies = _pick_from_cookies(raw)
                 if _has_login(cookies):
                     found = cookies
+                    found_raw = raw
                     break
                 await asyncio.sleep(1)
                 waited += 1
@@ -186,9 +218,11 @@ async def browser_login(timeout: int = 180, headless: bool = False,
                 # 只等 cookie 落定，不等整页
                 await asyncio.sleep(0.6)
                 # 再次取一次，确保拿到主页种下的 cookie
-                cookies2 = _pick_from_cookies(await ctx.cookies())
+                raw2 = await ctx.cookies()
+                cookies2 = _pick_from_cookies(raw2)
                 if _has_login(cookies2):
                     found = cookies2
+                    found_raw = raw2
             except Exception:
                 pass
 
@@ -209,8 +243,9 @@ async def browser_login(timeout: int = 180, headless: bool = False,
                 "cookie_str": cs,
                 "uname": uname,
                 "account": acc,
-                # B 站 cookie 有效期约 1 个月，保守按 30 天算
-                "expires": time.time() + 30 * 86400,
+                # 真实过期时间；取不到（会话 cookie）才退回保守估计
+                "expires": (_expires_from_cookies(found_raw)
+                            or time.time() + 30 * 86400),
             }
         finally:
             try:

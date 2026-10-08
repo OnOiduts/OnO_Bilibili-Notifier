@@ -109,8 +109,13 @@ def _is_residue(fn):
 #    v2.0.1 那版我把版本号去掉了，结果打出来的包跟上一版同名、
 #    又不能从文件名看出是哪一版，用户没法判断自己装的是哪个。
 #    现在统一成 OnO_Bilibili-Notifier_v2.0.3.zip 这种。
-OUT_NAME = "OnO_Bilibili-Notifier_v%s.zip"
-OUT_NAME_GITHUB = "OnO_Bilibili-Notifier_v%s_github.zip"
+OUT_NAME = "OnO_Bilibili-Notifier[v%s].zip"
+OUT_NAME_GITHUB = "OnO_Bilibili-Notifier[v%s]_github.zip"
+
+# 解压后必须是一个固定名字的文件夹 OnO_Bilibili-Notifier ——
+# 用户是"覆盖解压"升级的，顶层目录名一变就会装出两份，越装越乱。
+# 所以包里每条都加一层这个前缀，不能跟着源码目录名（bili-notify）走。
+TOP_DIR = "OnO_Bilibili-Notifier"
 
 # GitHub 导出版必须的几件套：缺任何一个，传到 GitHub 都会出问题
 # （没 LICENSE = 显示 No license，没 .env.example = 别人不知道配什么，
@@ -129,17 +134,20 @@ def _verify_github_pack(path):
     bad = []
     with zipfile.ZipFile(path) as z:
         names = z.namelist()
-    for nm in names:
+    # 包里每条都带了顶层目录前缀，比对前先剥掉
+    rel = [n[len(TOP_DIR) + 1:] if n.startswith(TOP_DIR + "/") else n
+           for n in names]
+    for nm in rel:
         low = nm.lower()
         if low.endswith((".bat", ".cmd", ".exe", ".msi", ".sh")):
             bad.append("含成品脚本/执行文件：%s" % nm)
         if low.startswith(("dist/", "build/")):
             bad.append("含打包产物：%s" % nm)
     for must in ("src/start.py", "src/VERSION", "docs/README.md"):
-        if must not in names:
+        if must not in rel:
             bad.append("缺源码文件：%s" % must)
     for f in GITHUB_REQUIRED:
-        if f not in names:
+        if f not in rel:
             bad.append("缺 %s" % f)
     return bad
 
@@ -190,7 +198,7 @@ def main(github: bool = False):
         for name in keep:
             p = os.path.join(ROOT, name)
             if os.path.isfile(p):
-                z.write(p, name)
+                z.write(p, TOP_DIR + "/" + name)
                 n += 1
             else:
                 print("  ⚠️ 缺文件 %s" % name)
@@ -209,7 +217,7 @@ def main(github: bool = False):
                         continue
                     full = os.path.join(dirpath, fn)
                     rel = os.path.relpath(full, ROOT)
-                    z.write(full, rel)
+                    z.write(full, TOP_DIR + "/" + rel)
                     n += 1
     if github:
         bad = _verify_github_pack(out)

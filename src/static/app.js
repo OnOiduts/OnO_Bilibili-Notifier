@@ -684,7 +684,50 @@ async function loadState() {
   safe('subfilterpick', renderSubFilterPick);
   safe('backup', loadBackupInfo);
   safe('about', loadAbout);
+  safe('expiry', renderExpiryBanner);
   return d;
+}
+
+/* ---------- B 站登录态到期横幅 ----------
+   机器人每轮把自己的判断写进 heartbeat，面板读来显示。
+   ⚠️ 机器人没在跑时读不到（字段不存在）—— 当作"不提醒"，
+      不能显示个空横幅在那儿吓人。
+   两档：ui（2~5 天，橙色）/ qq（<2 天或已过期，红色 + 跳登录）。
+   横幅是这里动态建的，不去改 index.html —— 少一处模板改动就少一处
+   打包时忘了同步的坑。 */
+function renderExpiryBanner() {
+  try {
+    var box = (STATE && STATE.config && STATE.config.bili_expiry) || null;
+    var lv = box && box.level;
+    var old = document.getElementById('expiryBanner');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    if (!lv || lv === 'ok') return;
+    var txt = box.text || 'B 站登录态快到期了';
+    var el = document.createElement('div');
+    el.id = 'expiryBanner';
+    var danger = (lv === 'qq');
+    el.style.cssText = 'position:fixed;left:50%;top:14px;transform:translateX(-50%);'
+      + 'z-index:9999;max-width:92vw;padding:10px 16px;border-radius:10px;'
+      + 'font-size:13px;line-height:1.5;box-shadow:0 6px 24px rgba(0,0,0,.35);'
+      + (danger
+        ? 'background:rgba(180,40,40,.95);color:#fff;border:1px solid #ff6b6b;'
+        : 'background:rgba(190,120,20,.95);color:#fff;border:1px solid #ffc46b;');
+    el.textContent = (danger ? '🔴 ' : '🟠 ') + txt;
+    var btn = document.createElement('a');
+    btn.href = '#';
+    btn.textContent = '去处理';
+    btn.style.cssText = 'margin-left:10px;color:#fff;text-decoration:underline;'
+      + 'cursor:pointer;font-weight:600;';
+    btn.onclick = function (e) {
+      e.preventDefault();
+      try { showSec('cred'); showTab('cred', 'bili'); } catch (_) { }
+      var t = document.getElementById('biliCard');
+      if (t) { try { t.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) { } }
+      return false;
+    };
+    el.appendChild(btn);
+    document.body.appendChild(el);
+  } catch (_) { /* 横幅不能把整页刷新带崩 */ }
 }
 
 /* ---------- 数据与备份 ----------

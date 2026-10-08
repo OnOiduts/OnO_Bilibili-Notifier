@@ -236,12 +236,12 @@ def test_first_set_password_still_no_old_needed(isolated):
 def test_svg_variant_same_dir_same_name():
     """同目录、同文件名，只换扩展名。"""
     got = webui.svg_variant(
-        "https://cdn.jsdelivr.net/gh/XxBoLuoxX/OnO-ImageHost-@main/Logo/logo.png")
-    assert got == ("https://cdn.jsdelivr.net/gh/XxBoLuoxX/"
+        "https://cdn.jsdelivr.net/gh/OnOiduts/OnO-ImageHost-@main/Logo/logo.png")
+    assert got == ("https://cdn.jsdelivr.net/gh/OnOiduts/"
                    "OnO-ImageHost-@main/Logo/logo.svg"), got
 
     got2 = webui.svg_variant(
-        "https://cdn.jsdelivr.net/gh/XxBoLuoxX/"
+        "https://cdn.jsdelivr.net/gh/OnOiduts/"
         "OnO-ImageHost-@main/Web/OnOBN/ico.png")
     assert got2.endswith("/Web/OnOBN/ico.svg"), got2
 

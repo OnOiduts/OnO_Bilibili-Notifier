@@ -2,10 +2,10 @@
  "group_templates": [],
  "groups": [
   {
-   "created_at": 1791118817.0527947,
+   "created_at": 1791348986.8086412,
    "gid": "GROUP_A",
    "name": "",
-   "updated_at": 1791118817.0527947
+   "updated_at": 1791348986.8086412
   }
  ],
  "meta": [
@@ -15,7 +15,7 @@
   },
   {
    "key": "revision",
-   "value": "11"
+   "value": "18"
   }
  ],
  "season_templates": [],
@@ -25,7 +25,7 @@
    "gid": "GROUP_A",
    "kind": "live",
    "uid": 111,
-   "updated_at": 1791118819.1405005,
+   "updated_at": 1791348995.149521,
    "v1": "1",
    "v2": "深夜歌回"
   },
@@ -33,15 +33,15 @@
    "gid": "GROUP_A",
    "kind": "video",
    "uid": 111,
-   "updated_at": 1791118818.5190153,
-   "v1": "BV1aa",
+   "updated_at": 1791348995.6304696,
+   "v1": "BV2bb",
    "v2": "0"
   },
   {
    "gid": "GROUP_A",
    "kind": "dyn",
    "uid": 111,
-   "updated_at": 1791118818.8435824,
+   "updated_at": 1791348994.684205,
    "v1": "100",
    "v2": "0"
   }
@@ -52,21 +52,21 @@
    "kind": "live",
    "on": 1,
    "uid": 111,
-   "updated_at": 1791118817.0527947
+   "updated_at": 1791348986.8086412
   },
   {
    "gid": "GROUP_A",
    "kind": "video",
    "on": 1,
    "uid": 111,
-   "updated_at": 1791118817.199297
+   "updated_at": 1791348987.1084754
   },
   {
    "gid": "GROUP_A",
    "kind": "dynamic",
    "on": 1,
    "uid": 111,
-   "updated_at": 1791118817.3491561
+   "updated_at": 1791348987.4753225
   }
  ],
  "up_templates": [],
@@ -82,7 +82,7 @@
    "short_room_id": 0,
    "uid": 111,
    "uname": "测试UP",
-   "updated_at": 1791118816.8640914,
+   "updated_at": 1791348986.4696102,
    "video_bvid": ""
   }
  ]

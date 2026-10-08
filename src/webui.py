@@ -564,6 +564,10 @@ def api_state():
 
             "bili_cookie": cfg.get("bili_cookie", ""),
             "web_password": bool(cfg.get("web_password")),
+            # 机器人写的「登录态到期提醒」：level=ok/ui/qq，面板顶部横幅会读。
+            # 机器人不在跑时读不到，前端当作"不提醒"，不显示横幅。
+            "bili_expiry": ((heartbeat.read() or {}).get("bili_expiry")
+                            or {"level": "ok"}),
         },
         "templates": {**DEFAULT_TEMPLATES, **(cfg.get("templates") or {})},
         # 自定义值单独给，前端才能区分「用户改过」和「用的默认」
@@ -2478,7 +2482,9 @@ def _run_browser_login(epoch: int):
                        msg="没读到 cookie")
         return
 
-    exp = float(res.get("expires") or (time.time() + 30 * 86400))
+    # 浏览器给的过期时间只作备选：SESSDATA 里那个才是 B 站自己写的准信儿
+    exp, _est = bili_login.effective_expires(
+        cs, float(res.get("expires") or 0))
     cfg = load_cfg()
     cfg["bili_cookie"] = cs
     cfg["bili_cookie_ts"] = time.time()
@@ -2634,7 +2640,17 @@ def api_bili_cookie():
     """当前 cookie 状态：是否有效、是谁、还剩多久。"""
     cfg = load_cfg()
     cookie = str(cfg.get("bili_cookie") or "")
-    exp = float(cfg.get("bili_cookie_expires") or 0)
+    # 真实过期时间优先从 cookie 自带的 SESSDATA 解 —— 配置里那个可能是
+    # 旧版留下的 30 天估算，那样面板会一直显示"还剩 29 天"却永远不动。
+    # 解到的真值回写一份，之后离线也能用。
+    exp, estimated = bili_login.effective_expires(
+        cookie, float(cfg.get("bili_cookie_expires") or 0))
+    if exp > 0 and abs(exp - float(cfg.get("bili_cookie_expires") or 0)) > 60:
+        try:
+            cfg["bili_cookie_expires"] = exp
+            save_cfg(cfg)
+        except Exception:
+            pass
     info = bili_login.expired_info(exp) if exp else None
     has_login = "SESSDATA=" in cookie
 
@@ -2655,7 +2671,10 @@ def api_bili_cookie():
         "reason": reason,
         "suspicious": _sessdata_suspicious(cookie),
         "expires_str": info["expires_str"] if info else "",
-        "expires_text": info["text"] if info else "未知",
+        # 估算值要标明，否则"还剩 29 天"会被当成准信儿
+        "expires_estimated": bool(estimated),
+        "expires_text": (info["text"] + "（估算）") if (info and estimated)
+                        else (info["text"] if info else "未知"),
         "expired": info["expired"] if info else False,
         "soon": info["soon"] if info else False,
         "days_left": info["days_left"] if info else None,
@@ -2730,15 +2749,22 @@ def api_bili_cookie_save():
     cfg = load_cfg()
     cfg["bili_cookie"] = cs
     cfg["bili_cookie_ts"] = time.time()
-    # 手动填的拿不到明确过期时间，按保守的 30 天估
-    cfg["bili_cookie_expires"] = time.time() + bili_login.DEFAULT_TTL_DAYS * 86400
+    # 过期时间先从 SESSDATA 里解真值（大多数情况下解得到），
+    # 解不到才退回 30 天估算 —— 以前这里一律写 30 天，于是面板永远
+    # 显示"还剩 29 天"，到期提醒也就永远进不了 2~5 天那个区间。
+    _exp, _est = bili_login.effective_expires(cs, 0.0)
+    cfg["bili_cookie_expires"] = _exp
     save_cfg(cfg)
     AUDIT.log("手动填写B站cookie", client_ip(), "", "info")
     if st == "unknown":
         return jsonify({"ok": True,
                         "msg": "已保存，但这会儿没能向 B站 求证成功（" + (why or "未知") +
                                "）。如果之后接口仍报 -352，说明这段 cookie 其实没生效。"})
-    return jsonify({"ok": True, "msg": "已保存（过期时间为保守估计，以实际为准）"})
+    return jsonify({"ok": True,
+                    "msg": ("已保存（这段 cookie 里读不到明确到期时间，"
+                            "按 30 天估算，以 B 站实际为准）" if _est
+                            else "已保存（到期时间已从 SESSDATA 读出："
+                                 + bili_login.expired_info(_exp)["expires_str"] + "）")})
 
 
 @app.route("/api/bili/logout", methods=["POST"])
@@ -3452,18 +3478,18 @@ def api_data_info():
 #    实测 20 秒超时取不到；jsDelivr 是 GitHub 的公共 CDN 镜像，实测 1 秒就返回。
 #    想换回官方 raw（或其它镜像）设环境变量 ONOBN_LOGO_URL 即可。
 #
-# 图床仓库：https://github.com/XxBoLuoxX/OnO-ImageHost-  （注意名字末尾有连字符）
+# 图床仓库：https://github.com/OnOiduts/OnO-ImageHost-  （注意名字末尾有连字符）
 # 图片路径：Logo/logo.png（大写 L 的目录名，GitHub 路径大小写敏感）
-LOGO_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/XxBoLuoxX/"
+LOGO_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/OnOiduts/"
                     "OnO-ImageHost-@main/Logo/logo.png")
 
 # 设成这几个值 = 明确不要 logo（离线部署时用，省掉一次外部请求）
 LOGO_OFF_VALUES = ("off", "none", "disable", "disabled", "0")
 
 # 标签页小图标。同样走 jsDelivr，理由同上（raw 域名国内经常取不到）。
-# 图床仓库：https://github.com/XxBoLuoxX/OnO-ImageHost-  （名字末尾有连字符）
+# 图床仓库：https://github.com/OnOiduts/OnO-ImageHost-  （名字末尾有连字符）
 # 图片路径：Web/OnOBN/ico.png（Web、OnOBN 两处都是大写开头，大小写敏感）
-ICO_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/XxBoLuoxX/"
+ICO_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/OnOiduts/"
                    "OnO-ImageHost-@main/Web/OnOBN/ico.png")
 
 # 登录页背景装饰图：除 logo / ico 之外再飘两张，让背景不那么单调。
@@ -3482,9 +3508,9 @@ ICO_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/XxBoLuoxX/"
 #    以前这里直接写成 .svg，结果 src 和回退地址**是同一个字符串** ——
 #    svg 取不到 → 用同一个取不到的地址再试一次 → 再失败 → 隐藏。
 #    降级链等于没做，表现就是"左下角和右下角是空的"（bg1/bg2 正是那两个角）。
-BG1_URL_DEFAULT = ("https://raw.githubusercontent.com/XxBoLuoxX/"
+BG1_URL_DEFAULT = ("https://raw.githubusercontent.com/OnOiduts/"
                    "OnO-ImageHost-/main/Web/OnOBN/bg1.png")
-BG2_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/XxBoLuoxX/"
+BG2_URL_DEFAULT = ("https://cdn.jsdelivr.net/gh/OnOiduts/"
                    "OnO-ImageHost-@main/Web/OnOBN/bg2.png")
 
 

@@ -127,6 +127,27 @@ def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def os_free_port(host: str = "127.0.0.1") -> int:
+    """让操作系统分配一个当前空闲的端口（绑定端口 0 再读回来）。
+
+    给 pick_port 兜底用：候选区间全被占时不至于返回一个正在用的端口。
+    拿到手要立刻用，中间隔太久可能被别人抢走（这是 TCP 的固有时序问题，
+    真撞上了 Flask 会报"地址已在使用"，启动时看得到）。
+    """
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, 0))
+        return int(s.getsockname()[1])
+    except Exception:
+        return 0
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 def safe_stdio():
     """把 stdout/stderr 换成 UTF-8，且遇到不能编码的字符就替换而不是崩溃。
 
@@ -278,11 +299,16 @@ def child_cmd(script: str, extra: list = None) -> list:
 
 
 def pick_port(start: int = 8088, tries: int = 12) -> int:
-    """从 start 开始找一个空闲端口。"""
+    """从 start 开始找一个空闲端口。
+
+    ⚠️ 以前这里最后一行是 `return start` —— 候选区间全被占时，返回的正是
+       那个肯定被占着的起始端口，Flask 一绑就报"地址已在使用"，面板起不来。
+       现在改成让系统自己挑一个空的，再不行才退回 start。
+    """
     for p in range(start, start + tries):
         if not port_in_use(p):
             return p
-    return start
+    return os_free_port() or start
 
 
 _EMOJI_MAP = {

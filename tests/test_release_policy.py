@@ -57,7 +57,8 @@ CL = read(os.path.join(_ROOT, "docs", "CHANGELOG.md"))
 print("== 版本发布规则（当前 v%s）==" % VER)
 
 # ---------- 1. 首条即当前版本 ----------
-ok("VERSION 是合法语义化版本", re.match(r"^\d+\.\d+\.\d+$", VER) is not None, VER)
+ok("VERSION 是合法版本号（允许 fix 后缀）",
+   re.match(r"^\d+\.\d+\.\d+(fix)?$", VER) is not None, VER)
 ok("CHANGELOG 首条就是当前版本", CL.startswith("## v" + VER + "（"), CL[:44])
 
 # ---------- 切分条目 ----------

@@ -80,6 +80,63 @@ def parse_cookie(text: str) -> Dict[str, str]:
     return out
 
 
+def sessdata_expires(cookie: str) -> float:
+    """从 SESSDATA 本身解出 B 站给的过期时间戳（Unix 秒）。
+
+    SESSDATA 长这样（存进 cookie 时做过 URL 编码，逗号是 %2C）：
+        <签名>,<过期时间戳>,<校验值>*<序号>
+    中间那一段就是真正的到期时刻，而且是**跟着登录那一次写死的**——
+    续期会变，重新登录会变，但它是唯一不依赖"我们猜"的来源。
+
+    这样已经登录着的用户也能立刻看到真实剩余天数：配置文件里那个
+    bili_cookie_expires 可能还是旧版的 30 天估算，而 cookie 自己带着
+    准信儿，不用重新登录就能纠正过来。
+
+    解不出来返回 0（比如 SESSDATA 是占位符、格式变了），调用方退回估算。
+    """
+    c = parse_cookie(cookie or "")
+    raw = (c.get("SESSDATA") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        from urllib.parse import unquote
+        cands = [raw, unquote(raw), unquote(unquote(raw))]
+    except Exception:
+        cands = [raw]
+    # 合理区间：2020-01-01 ~ 2100-01-01，避免把签名/校验段误当时间戳
+    lo, hi = 1577836800, 4102444800
+    for text in cands:
+        parts = text.split(",")
+        # 优先取第 2 段（约定位置）；它不行再扫一遍其余段
+        ordered = ([parts[1]] if len(parts) >= 3 else []) + parts
+        for seg in ordered:
+            seg = (seg or "").strip()
+            if not seg.isdigit() or not (9 <= len(seg) <= 11):
+                continue
+            v = int(seg)
+            if lo <= v <= hi:
+                return float(v)
+    return 0.0
+
+
+def effective_expires(cookie: str, saved: float = 0.0) -> tuple:
+    """定一个能用的过期时间：真实值优先，其次已记录的，最后才估算。
+
+    返回 (expires, estimated)。estimated=True 表示这个数是猜的，
+    UI 上要标明，免得用户被"还剩 29 天"骗了 —— 那正是估算值露馅的样子。
+    """
+    real = sessdata_expires(cookie)
+    if real > 0:
+        return real, False
+    try:
+        sv = float(saved or 0)
+    except Exception:
+        sv = 0.0
+    if sv > 0:
+        return sv, True
+    return time.time() + DEFAULT_TTL_DAYS * 86400, True
+
+
 def expired_info(expires: float, now: float = None) -> dict:
     """把过期时间戳变成人话。"""
     now = now or time.time()
@@ -158,15 +215,44 @@ async def refresh_cookie(cookie: str) -> dict:
     if data.get("code") != 0:
         return {"ok": False, "msg": f"续期失败：{data.get('message')}"}
     new = {}
+    real_exp = 0.0
     for ck in s.cookie_jar:
-        if ck.key:
-            new[ck.key] = ck.value
+        if not ck.key:
+            continue
+        new[ck.key] = ck.value
+        if ck.key == "SESSDATA":
+            real_exp = max(real_exp, _cookie_item_expires(ck))
     merged = dict(c)
     merged.update(new)
     if not merged.get("SESSDATA"):
         return {"ok": False, "msg": "续期后没拿到新的 SESSDATA"}
-    return {"ok": True, "cookie": cookie_str(merged),
-            "expires": time.time() + DEFAULT_TTL_DAYS * 86400}
+    # 用 B站 真正给的过期时间；解析不出来才退回保守估计
+    expires = real_exp or (time.time() + DEFAULT_TTL_DAYS * 86400)
+    return {"ok": True, "cookie": cookie_str(merged), "expires": expires}
+
+
+def _cookie_item_expires(ck) -> float:
+    """从 aiohttp 的 cookie 项里读出过期时间（Unix 秒），读不到返回 0。
+
+    不同 aiohttp 版本给的形态不一样（Morsel 的 expires 是 HTTP 日期串，
+    也有直接给 max-age 的），两种都试着解析，都不行就返回 0 让调用方兜底。
+    """
+    try:
+        from email.utils import parsedate_to_datetime
+        raw = ck.get("expires") if hasattr(ck, "get") else None
+        if raw:
+            dt = parsedate_to_datetime(str(raw))
+            if dt:
+                return dt.timestamp()
+    except Exception:
+        pass
+    try:
+        ma = ck.get("max-age") if hasattr(ck, "get") else None
+        if ma:
+            return time.time() + float(ma)
+    except Exception:
+        pass
+    return 0.0
 
 
 def save_cookie(cookie: str, expires: float):

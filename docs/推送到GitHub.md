@@ -1,6 +1,6 @@
 # 推送到 GitHub —— 一步一步
 
-> 本文档对应仓库：<https://github.com/XxBoLuoxX/OnO_Bilibili-Notifier>
+> 本文档对应仓库：<https://github.com/OnOiduts/OnO_Bilibili-Notifier>
 > 面向第一次把本项目传上 GitHub 的情况。**按顺序执行即可**，每一步都写了"做完了该看到什么"。
 
 ---
@@ -86,7 +86,7 @@ B 站更新提醒机器人：开播 / 投稿 / 动态 / 置顶评论自动推送
 ## 第 5 步：关联并推送
 
 ```bash
-git remote add origin https://github.com/XxBoLuoxX/OnO_Bilibili-Notifier.git
+git remote add origin https://github.com/OnOiduts/OnO_Bilibili-Notifier.git
 git branch -M main
 git push -u origin main
 ```

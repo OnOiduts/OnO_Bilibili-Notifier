@@ -15,8 +15,8 @@ favicon 有两条自己的约束，是 logo 没有的：
 
 图床与路径
 ----------
-    https://github.com/XxBoLuoxX/OnO-ImageHost-/blob/main/Web/OnOBN/ico.png
-    → cdn.jsdelivr.net/gh/XxBoLuoxX/OnO-ImageHost-@main/Web/OnOBN/ico.png
+    https://github.com/OnOiduts/OnO-ImageHost-/blob/main/Web/OnOBN/ico.png
+    → cdn.jsdelivr.net/gh/OnOiduts/OnO-ImageHost-@main/Web/OnOBN/ico.png
 
 三个易错点，断言里专门盯住：
 1. 仓库名 **OnO-ImageHost-** 末尾有连字符；
@@ -43,7 +43,7 @@ def test_default_url_points_to_imagehost():
     import webui
     url = webui.ICO_URL_DEFAULT
     assert url.startswith("https://"), f"必须 https，实际：{url}"
-    assert "XxBoLuoxX" in url, "应指向作者仓库"
+    assert "OnOiduts" in url, "应指向图床仓库所在组织"
     assert url.lower().endswith("ico.png"), "应指向 ico.png"
 
     # 仓库名末尾带连字符；路径两处目录名都是大写开头

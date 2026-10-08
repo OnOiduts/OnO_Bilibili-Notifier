@@ -1937,16 +1937,20 @@
      伪装两端淡出 —— 内联版是"无背景 + mask 真透明"，把这两个旧的关掉。 */
   .hb-frame::before, .hb-frame::after { display:none !important; }
 
-  /* ② 等级徽章：app.js 侧边栏账户卡用的是 .lv-badge.lv-N，
-     而 style.css 里那套是**渐变**（LV6 = 橙粉 #FF8A5B→#FB7299），
-     不是 B站官方色。这里覆盖成官方配色（与 .acc-lv.lvN 一致）。
+  /* ② 等级徽章：B站登录卡（.acc-card）用的是 .lv-badge.lv-N。
+     ⚠️ 类名必须**带连字符**：app.js 生成的是 "lv-badge lv-5"（lv- + 数字），
+        之前这里写成了 .lv-badge.lv-5（无连字符），六条覆盖**一条都没匹配上**，
+        于是回落到 style.css 的 .lv-5 粉色渐变；而下面那行又把渐变图干掉，
+        底色也没补回来 —— 结果徽章是透明底白字，在深色卡上等于没底色。
+     style.css 里那套是**渐变**（LV6 = 橙粉 #FF8A5B→#FB7299），不是官方色，
+     这里覆盖成官方配色（与 .acc-lv.lvN 一致）。
        LV0/1 灰 · LV2 绿 · LV3 蓝 · LV4 橙黄 · LV5 橙红 · LV6 红 */
-  .lv-badge.lv0, .lv-badge.lv1 { background:#C0C0C0; color:#2B2B2B; }
-  .lv-badge.lv2 { background:#8BD29B; color:#12331F; }
-  .lv-badge.lv3 { background:#7BCDEF; color:#0E2F3E; }
-  .lv-badge.lv4 { background:#FEBB8B; color:#4A2A0B; }
-  .lv-badge.lv5 { background:#EE672A; color:#FFFFFF; }
-  .lv-badge.lv6 { background:#F04C49; color:#FFFFFF; }
+  .lv-badge.lv-0, .lv-badge.lv-1 { background:#C0C0C0; color:#2B2B2B; }
+  .lv-badge.lv-2 { background:#8BD29B; color:#12331F; }
+  .lv-badge.lv-3 { background:#7BCDEF; color:#0E2F3E; }
+  .lv-badge.lv-4 { background:#FEBB8B; color:#4A2A0B; }
+  .lv-badge.lv-5 { background:#EE672A; color:#FFFFFF; }
+  .lv-badge.lv-6 { background:#F04C49; color:#FFFFFF; }
   /* LV2~LV5 底色偏浅，白字对比度不够 → 每级单独配深色字；
      只有 LV6 底色够深才用白字。 */
   .lv-badge { background-image:none !important; font-weight:700; }
@@ -2120,12 +2124,16 @@
          ⚠️ 品牌名回退到最早那版「OnOiduts工业」：v2.0.1 正式更名时把它换成了
             缩写 OnOBN，作者要求原样留在左下角这个位置，只把整块做成可点的
             GitHub 链接。位置和排版都不动，只是 span 换成 a。
+         ⚠️ 这里指向【组织】主页（github.com/OnOiduts），因为品牌名叫 OnOiduts，
+            点开就该是组织页。但关于页「署名」那块仍指向【个人】账号
+            （github.com/XxBoLuoxX）—— 那是许可证要求的作者署名，不是品牌链接。
+            两者刻意不同，别统一成一个。
          ⚠️ 别在注释里写别的旧名：品牌名检查是全站朴素扫描，
             注释里出现旧名会被误判成"还在用旧名"（踩过一次）。 -->
     <div class="side-foot"><a class="sf-brand" id="sfBrand"
-        href="https://github.com/XxBoLuoxX" target="_blank"
+        href="https://github.com/OnOiduts" target="_blank"
         rel="noopener noreferrer"
-        title="OnOB站通知订阅工具（OnO Bilibili Notifier）· 打开 GitHub 主页">OnOiduts工业</a><span class="sf-sep">·</span><span class="ver">v{{ app_version }}</span></div>
+        title="OnOB站通知订阅工具（OnO Bilibili Notifier）· 打开 OnOiduts 组织主页">OnOiduts工业</a><span class="sf-sep">·</span><span class="ver">v{{ app_version }}</span></div>
   </aside>
 
   <!-- ═══ 主区 ═══ -->

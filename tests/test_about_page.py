@@ -87,7 +87,7 @@ ok("复制内容含依赖（可选）", "依赖（可选）：" in JS)
 ok("复制内容不再用不分类的旧前缀", "'依赖：' + Object.keys" not in JS)
 
 # ---------- 6. 发布包名必须带版本号 ----------
-ok("包名模板带 %s（版本号占位）", "OnO_Bilibili-Notifier_v%s.zip" in MKZIP, MKZIP[:0])
+ok("包名模板带 %s（版本号占位）", "OnO_Bilibili-Notifier[v%s].zip" in MKZIP, MKZIP[:0])
 ok("打包时把版本号填进文件名", "OUT_NAME % ver" in MKZIP)
 # ⚠️ 不能又退回写死无版本号的名字
 ok("没有写死成不带版本号的名字",
@@ -105,7 +105,7 @@ try:
     out = (r.stdout or "") + (r.stderr or "")
     ok("打包脚本能跑通", r.returncode == 0, out[-300:])
     m = re.search(r"打包完成：(\S+OnO_Bilibili-Notifier\S*\.zip)", out)
-    ok("输出名带版本号", bool(m) and (("_v%s" % VER) in (m.group(1) if m else "")),
+    ok("输出名带版本号", bool(m) and (("[v%s]" % VER) in (m.group(1) if m else "")),
        out[-300:])
     if m and os.path.exists(m.group(1)):
         ok("包确实落在磁盘上", True)

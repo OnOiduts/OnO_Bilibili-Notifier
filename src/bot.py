@@ -569,6 +569,12 @@ class NotifyBot(botpy.Client):
         self._poll_task: Optional[asyncio.Task] = None
         self._hb_task: Optional[asyncio.Task] = None
         self._round = 0
+        # B 站登录态到期提醒的状态机（防重复推送，见 bili_expiry_alert）
+        try:
+            import bili_expiry_alert
+            self._expiry_alert = bili_expiry_alert.ExpiryAlert()
+        except Exception:
+            self._expiry_alert = None
         # 合集连续取不到的次数，(uid, season_id) -> n，用来抑制刷屏
         self._season_fail = {}
         # 合集连续临时失败时还要再歇几轮，(uid, season_id) -> 剩余轮数
@@ -1534,6 +1540,67 @@ class NotifyBot(botpy.Client):
                              acc.get("msg") or "未知")
             # state=unknown（连不上 / 查询失败）不吓唬人，下一轮还会再验
 
+    async def _check_bili_expiry(self):
+        """登录态快到期 / 已过期时提醒：面板告警 + 往沙盒群推一条。
+
+        ⚠️ 为什么放在这里而不是面板里：
+            面板打开时才检查的话，不开面板就永远不知道。轮询是常驻的，
+            而且机器人自己就要用这个 cookie —— 它比面板更早发现"查不动了"。
+        """
+        alert = getattr(self, "_expiry_alert", None)
+        if alert is None:
+            return
+        import bili_expiry_alert
+        import cfgutil
+        cfg = cfgutil.load_cfg() or {}
+        cookie = str(cfg.get("bili_cookie") or "")
+        if "SESSDATA=" not in cookie:
+            return          # 压根没登录，不提醒（那是另一件事）
+        # 真实过期时间以 SESSDATA 里解出来的为准：配置里那个可能是 30 天
+        # 估算，那样"剩 2~5 天"这个区间永远进不去，提醒就永远不触发。
+        import bili_login as _bl0
+        exp, _est = _bl0.effective_expires(
+            cookie, float(cfg.get("bili_cookie_expires") or 0))
+        days, expired = bili_expiry_alert.days_left_of(exp)
+        res = alert.evaluate(days, expired)
+        lv = res.get("level")
+
+        # 写给面板（概况页顶部横幅会读它）
+        try:
+            import heartbeat
+            heartbeat.touch(bili_expiry={
+                "level": lv,
+                "text": res.get("text") or "",
+                "days_left": days,
+                "expired": bool(expired),
+                "at": time.time(),
+            })
+        except Exception:
+            pass
+
+        if not res.get("need_qq"):
+            return
+
+        gid = str(cfg.get("sandbox_group") or "").strip()
+        if not gid:
+            # 沙盒群没配：不推，但也不能当作"已通知"——
+            # 配好之后应当立刻收到这条提醒。所以这里不 mark_sent。
+            _log.warning("B 站登录态%s，但没配沙盒群，无法推送提醒"
+                         % ("已过期" if expired else f"只剩 {days} 天"))
+            return
+
+        import bili_login as _bl
+        info = _bl.expired_info(exp) if exp else {}
+        text = bili_expiry_alert.build_message(
+            days if days is not None else 0, expired,
+            info.get("expires_str") or "")
+        try:
+            await self.qq.send_text(gid, text)
+            alert.mark_sent(lv)
+            _log.warning("已向沙盒群推送 B 站登录态到期提醒")
+        except Exception as e:
+            _log.warning(f"登录态到期提醒发送失败：{e}")
+
     async def _bili_verify(self, cookie: str = "") -> dict:
         """向 B站 求证这段 cookie 到底算不算登录。
 
@@ -1866,6 +1933,11 @@ class NotifyBot(botpy.Client):
                     self._sync_bili_auth()
                 except Exception:
                     pass
+                # B 站登录态快到期 / 已过期时提醒（见 _check_bili_expiry）
+                try:
+                    await self._check_bili_expiry()
+                except Exception as e:
+                    _log.debug(f"登录态到期检查跳过：{e}")
             except asyncio.CancelledError:
                 # ⚠️ CancelledError 有两种来源，必须分开：
                 #   ① 真要停止（close() 里 cancel，会先置 _stopping）→ 照常抛出

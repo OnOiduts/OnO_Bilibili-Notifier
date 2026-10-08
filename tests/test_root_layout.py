@@ -5,6 +5,7 @@
 分不清哪些能删、哪些一删就出事。v1.96 起根目录只留 5 个脚本，
 其它按用途归进 src/（源码与随包文件）、docs/（文档）、deploy/（容器）。
 """
+import io
 import os
 import sys
 
@@ -38,6 +39,9 @@ def main():
     #       - .gitattributes —— 换行符规则，只认根目录这份
     #         （.bat 被 Git 转成 LF 会在 Windows 上闪退/乱码，必须钉死 CRLF）
     #      所以显式放行，不算"多余"。除这五类之外仍然一个都不许有。
+    # ⚠️ 新增脚本忘了加进这份名单，布局检查立刻报"根目录有多余文件"——
+    #    这是好事：本项目的规矩就是根目录不许随便堆东西，
+    #    每加一个脚本都得是**有意**加的，并在这里登记。
     allowed_scripts = {"启动机器人.bat", "启动机器人.sh", "安装依赖.bat",
                        "备份全部数据.bat", "恢复全部数据.bat"}
     allowed_extra = {"LICENSE", "README.md", ".gitignore", ".env.example",
@@ -49,7 +53,18 @@ def main():
     ck("README.md 在根目录（GitHub 才渲染）", "README.md" in files)
     ck(".gitignore 在根目录（Git 才认）", ".gitignore" in files)
     ck(".env.example 在根目录（凭据模板）", ".env.example" in files)
-    ck("5 个启动/安装脚本都在", allowed_scripts.issubset(set(files)))
+
+    # 本机域名（BilibiliNotifier.OnO / 改 hosts）已整条移除：
+    # 改 hosts 要管理员权限、易被杀软拦，收益只是省记一串数字，不划算。
+    # ⚠️ 反向验证：把 hostalias.py 加回来或让 start.py 再 import 它，
+    #    下面两条立刻变红。
+    ck("本机域名模块已移除（src/hostalias.py 不存在）",
+       not os.path.exists(os.path.join(ROOT, "src", "hostalias.py")))
+    _start = os.path.join(ROOT, "src", "start.py")
+    _txt = io.open(_start, encoding="utf-8").read() if os.path.exists(_start) else ""
+    ck("启动流程不再引用 hostalias",
+       "hostalias" not in _txt and "BilibiliNotifier" not in _txt)
+    ck("7 个启动/安装脚本都在", allowed_scripts.issubset(set(files)))
 
     # 2. 子目录各就各位
     ck("有 src/", "src" in dirs)
