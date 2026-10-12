@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>B站消息订阅工具 · 控制台</title>
-<link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+<link rel="stylesheet" href="/static/style.css?v={{ asset_stamp }}">
 <!-- ⚠️ 主题脚本必须紧跟 CSS、放在 <head> 里，且必须是 ES5（var / function）。
      以前这一页是硬编码 data-theme="dark"，真正的切换逻辑在 app.js 里
      —— 而 app.js 是外部脚本，加载执行时浏览器早就按深色把整页画完了。
@@ -31,7 +31,7 @@
 <!-- 标签页小图标：不随包带图，地址由后端 /api/brand/ico 给出（远程读取，
      可用环境变量 ONOBN_ICO_URL 换，设 off 则接口返回 404、浏览器静默不显示）。
      ⚠️ 带版本号参数：换图后不用等浏览器自己想起去刷新那个顽固的 favicon 缓存。 -->
-<link rel="icon" href="/api/brand/ico?v={{ app_version }}">
+<link rel="icon" href="/api/brand/ico?v={{ asset_stamp }}">
 <!-- 标签页小图标：不随包带图，地址由后端 /api/brand/ico 给出（远程读取，
      可用环境变量 ONOBN_ICO_URL 换，设 off 则接口返回 404、浏览器静默不显示）。
      ⚠️ 带版本号参数：换图后不用等浏览器自己想起去刷新那个顽固的 favicon 缓存。 -->
@@ -2416,6 +2416,10 @@
                    没有任何 JS 去同步 .on 样式：点下去 checkbox 变了、
                    界面却纹丝不动 → 看着就是「失灵、没反馈」。
                    现在改成 data-act 按钮，样式和动作一起走。 -->
+              <!-- ⚠️ data-tip 由 app.js 的 kindTip() 在启动时统一填，
+                   不在 HTML 里写死 —— 文案只留一份，改一处两边都跟着变。
+                   以前这四项没有任何说明，「置顶评论」尤其容易被误理解成
+                   "视频评论区被顶上去的那条"，于是勾错、然后抱怨不提醒。 -->
               <button class="chip-tgl on" id="defLive" data-act="toggle-defkind" data-kind="live">🔴 直播</button>
               <button class="chip-tgl on" id="defVideo" data-act="toggle-defkind" data-kind="video">📺 投稿</button>
               <button class="chip-tgl on" id="defDyn" data-act="toggle-defkind" data-kind="dynamic">📝 动态</button>
@@ -2915,6 +2919,19 @@
             <div class="ds">把 DEBUG 级细节也写进 bot.log。排查问题时开，平时关（日志会长得很快）</div></div>
             <label class="sw-btn"><input type="checkbox" id="cDebugLog" style="display:none"></label>
           </div>
+          <!-- 启动后首轮静默：
+               启动同步有 25s 总时限，订阅多了会有 UP 主被留到轮询再对齐，
+               而它们的基线是停机前的旧值 → 第一轮当成新内容补推一遍
+               （日志明明写着"已记为基线（静默）"，结果还是推了一条）。
+               开着的话，启动后第一轮只把这些基线强制刷新、不推送。 -->
+          <div class="sw"><div><div class="nm">启动后首轮静默</div>
+            <div class="ds">开机后第一轮只对齐基线、不推送，专治"重启一次就补推历史内容"。宽限轮数在下面调，0 = 关闭</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cGraceOn" style="display:none"></label>
+          </div>
+          <div class="row"><label>静默轮数</label>
+            <input id="cGraceRounds" type="number" min="0" max="5" step="1" value="1">
+            <div class="hint">开机后前几轮不推送（每轮约 8~12 秒）。填 0 = 关掉这个功能，恢复成"对齐完就照常推"</div>
+          </div>
           <div class="btns">
             <button class="btn pri" data-act="save-cfg">💾 保存</button>
             <button class="btn" data-act="dump-debug">🩺 输出调试日志</button>
@@ -3063,7 +3080,7 @@
 <div id="tipLayer" role="tooltip" aria-hidden="true"></div>
 <script nonce="{{ csp_nonce }}">window.__BE_VER = "{{ app_version }}";</script>
 <!-- 音效要早于 app.js：app.js 里的 toast / 折叠都可能马上用到它 -->
-<script src="/static/sound.js?v={{ app_version }}"></script>
-<script src="/static/app.js?v={{ app_version }}"></script>
+<script src="/static/sound.js?v={{ asset_stamp }}"></script>
+<script src="/static/app.js?v={{ asset_stamp }}"></script>
 </body>
 </html>

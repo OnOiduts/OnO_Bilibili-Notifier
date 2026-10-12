@@ -609,7 +609,11 @@ const CFG_FIELDS = ['cAppid', 'cSecret', 'cPoll', 'cSlow',
                     'cTimeout', 'cDedupe',
                     // ⚠️ 这几个以前**没登记**，后果是：改了不进 FORM_DIRTY，
                     //    loadState() 一刷就用后台值把输入框覆盖回去（用户正在填也会被冲掉）。
-                    'cMinReqInt', 'cPollMax', 'cLogTrans', 'cDebugLog'];
+                    'cMinReqInt', 'cPollMax', 'cLogTrans', 'cDebugLog',
+                    // ⚠️ cGraceOn / cGraceRounds 以前没登记：改完不进 FORM_DIRTY，
+                    //    loadState() 每 15 秒一刷就用后台值把框覆盖回去，
+                    //    看着就是"改了不保存、刷新又变回原样"。
+                    'cGraceOn', 'cGraceRounds'];
 
 /* 文案预设：整套一次套用。default = 留空（用 notify 内置默认文案）。 */
 const TPL_PRESETS = {
@@ -1154,7 +1158,8 @@ function renderMigPick() {
       var on = !!(s.kinds && s.kinds[k] && s.kinds[k].on);
       return '<button class="chip-tgl' + (on ? ' on' : '') +
         '" data-act="mig-chip" data-uid="' + esc(s.uid) +
-        '" data-kind="' + k + '">' + esc(migKindName(k)) + '</button>';
+        '" data-kind="' + k + '" data-tip="' + escAttr(kindTip(k)) +
+        '">' + esc(migKindName(k)) + '</button>';
     }).join('');
     // 默认选中：源群里这位 UP 至少开着一类提醒，才预先选上
     return '<div class="mig-card' + (any ? ' on' : '') + '"' +
@@ -1536,6 +1541,101 @@ function groupsSig() {
   } catch (e) { return String(Date.now()); }
 }
 
+/* ── 四类提醒开关的悬停说明 ──
+
+   ⚠️ 这四项以前**没有任何说明**，尤其「置顶评论」极易被误理解成
+      "视频评论区里被顶上去的那条评论" —— 它检测的根本不是那个。
+      理解错了就会勾错、然后抱怨"为什么不提醒"或"为什么推这个"。
+
+   命名也刻意不叫 Tips 之类含糊名字：kindTip 只服务订阅类型开关。 */
+var KIND_TIP = {
+  live:
+    '🔴 直播\n' +
+    'UP 主开播时提醒；下播是否提醒由上面的「下播提醒」单独控制。\n' +
+    'UP 没在播时查不到直播间号是正常的，开播时会自动反查。',
+
+  video:
+    '📺 投稿\n' +
+    'UP 主发布新视频时提醒。\n' +
+    '合集里的新视频也算投稿，但每轮先跑合集检测并记进基线，' +
+    '所以同一条视频不会推两次。',
+
+  dynamic:
+    '📝 动态\n' +
+    'UP 主发新动态（图文 / 视频 / 转发 / 置顶动态本身变化）时提醒。\n' +
+    '⚠️ 它只看「动态本身有没有更新」，' +
+    '看不到动态底下评论的变化（那种要用置顶评论）。',
+
+  /* ⚠️ 这段是整个项目里最容易误解的一项，写清楚比写得短重要。 */
+  top_comment:
+    '💬 置顶评论\n' +
+    '\n' +
+    '它检测的是：UP 主【置顶动态】下面，' +
+    '【UP 主自己置顶的那条评论】。\n' +
+    '\n' +
+    '❌ 不是「所有视频的置顶评论」\n' +
+    '❌ 也不是视频评论区里被点赞顶上去的那条\n' +
+    '❌ 普通动态检测同样覆盖不到它\n' +
+    '\n' +
+    '为什么单列这一项：像「星瞳_Official」这类 UP 主，会长期把一条动态' +
+    '置顶，并在那条动态下面用评论分享「瞳瞳空间」这类固定内容 —— ' +
+    '内容更新了，但动态本身没变，所以「动态」检测抓不到。\n' +
+    '好在位置是固定的（永远在置顶动态下面），' +
+    '所以可以专门盯着这个位置来追踪。\n' +
+    '\n' +
+    '多数 UP 主用不上，噪音相对大，所以默认不勾。'
+};
+
+function kindTip(k) { return KIND_TIP[k] || ''; }
+
+/* ⏳ cookie 时效那格的悬停说明。
+
+   为什么必须写：这里的天数**不等于**你实际还能用多久。
+   用户看到"还剩 179 天"很容易当保险，而 B站 可以在到期前任何一刻
+   让它失效（别处重新登录、长期没真人操作、被风控判定异常）。
+   再加上本程序是拿 cookie 直接调接口，不像浏览器那样会自动续期，
+   所以只会走完这条原始期限，没有宽限。
+
+   与其让人事后才发现"怎么一直没消息"，不如把这条写在数字旁边。 */
+function cookieTip(d) {
+  const L = [];
+  if (d && d.expired) {
+    L.push('⚠️ cookie 已过期');
+    L.push('');
+    L.push('登录态已失效，订阅的投稿 / 动态现在查不动了，');
+    L.push('请到「🔑 B 站登录」重新登录一次。');
+    return L.join('\n');
+  }
+  L.push(d && d.expires_estimated
+    ? '⏳ 这个天数是「估算」的'
+    : '⏳ 这个天数来自 cookie 自带的到期时间');
+  L.push('');
+  if (d && d.expires_estimated) {
+    L.push('没能从 SESSDATA 里解出真实到期时间，');
+    L.push('所以按登录时刻往后推 30 天估算，仅供参考。');
+    L.push('重新登录一次就能拿到真实值。');
+  } else {
+    L.push('它是从 SESSDATA 自身读出来的真实到期时刻，');
+    L.push('不是拍脑袋写的固定值。');
+  }
+  L.push('');
+  L.push('❗ 但「有效期到那天」不等于「能用那么久」：');
+  L.push('· 同一账号在别处重新登录，这份可能当场作废');
+  L.push('· 长时间没有真人操作行为，会话可能被清掉');
+  L.push('· 高频请求 / 异地多设备被判定异常，会被强制下线');
+  L.push('');
+  L.push('本程序是拿 cookie 直接调接口，不像浏览器那样');
+  L.push('每次访问会自动续期，所以走完这条期限就是到期。');
+  L.push('');
+  L.push('🔔 到期提醒（自动的，不用管）：');
+  L.push('· 还剩 2 ~ 5 天 → 面板顶部橙色提醒');
+  L.push('· 还剩不足 2 天 / 已失效 → 面板红色告警 + 推沙盒群');
+  L.push('');
+  L.push('同一行的「会员到期」是大会员到期日，');
+  L.push('跟 cookie 有效期是两回事，互不影响。');
+  return L.join('\n');
+}
+
 /* 「📊 当前数据」的详细内容：鼠标移到那个小标签上才浮出来。
    短直播间号单独列一行并说明取没取到 —— 它是直播提醒能不能
    正常反查房间号的关键，以前藏在 "原：x　短：y" 里根本看不出来。 */
@@ -1637,7 +1737,8 @@ function renderGroups(force) {
         const c = (s.kinds || {})[k.key] || {};
         return '<button class="chip-tgl ' + (c.on ? 'on' : '') +
           '" data-act="toggle-sub" data-gid="' + gid +
-          '" data-uid="' + esc(s.uid) + '" data-kind="' + esc(k.key) + '">' +
+          '" data-uid="' + esc(s.uid) + '" data-kind="' + esc(k.key) +
+          '" data-tip="' + escAttr(kindTip(k.key)) + '">' +
           esc(k.label) + '</button>';
       }).join('');
       return '<div class="li">' +
@@ -2083,6 +2184,17 @@ function fillCfg() {
   if ($('cDebugLog') && !FORM_DIRTY.cDebugLog) {
     $('cDebugLog').checked = !!c.log_debug;
   }
+  // 启动后首轮静默：默认 1 轮。0 = 用户关掉了这个功能。
+  if ($('cGraceRounds') && !FORM_DIRTY.cGraceRounds) {
+    const g = Number(c.startup_grace_rounds != null
+      ? c.startup_grace_rounds : 1);
+    $('cGraceRounds').value = isNaN(g) ? 1 : Math.max(0, Math.min(5, g));
+  }
+  if ($('cGraceOn') && !FORM_DIRTY.cGraceOn) {
+    const gv = Number($('cGraceRounds') ? $('cGraceRounds').value : 1);
+    $('cGraceOn').checked = gv > 0;
+  }
+  syncGraceOn();
   /* 检查间隔的范围按**后台真实上下限**渲染，不写死 8~120。
      改了「轮询上限」之后这里的数字会跟着变 —— 用户报的就是
      "数值应该是多少到多少，并且会变化"。 */
@@ -2165,7 +2277,9 @@ function initFormDirty() {
       if (['cSandbox', 'cSandbox2', 'cOffline', 'cImage', 'cPlainMsg',
            'cOnlyUpCmt', 'cLogTrans', 'cDebugLog',
            'cImgMode', 'cSandboxGroup', 'cSizeHint', 'cHintW',
-           'cHintH', 'cHintMaxH', 'cHintCell', 'cGridMode', 'cImgMax'].includes(id)) saveCfg(true);
+           'cHintH', 'cHintMaxH', 'cHintCell', 'cGridMode', 'cImgMax',
+           // 启动后首轮静默：开关 / 轮数改完立刻存，不用再点「保存」
+           'cGraceOn', 'cGraceRounds'].includes(id)) saveCfg(true);
       // 折叠卡片的摘要跟着变（「提醒开关」折着时也能看出开了几项）
       if (['cOffline', 'cPlainMsg', 'cOnlyUpCmt', 'cLogTrans'].includes(id)) {
         syncSwCardSum();
@@ -2210,7 +2324,12 @@ function initFormDirty() {
    导致整个「图片」区块看着像失灵。tests/test_sw_ids.py 会自动扫描
    HTML 里所有 sw-btn 开关来兜住这件事，防止以后再漏。 */
 const SW_IDS = ['cSandbox', 'cSandbox2', 'cImage', 'cOffline', 'cOnlyUpCmt',
-                'cPlainMsg', 'cLogTrans', 'cDebugLog', 'cSizeHint'];
+                'cPlainMsg', 'cLogTrans', 'cDebugLog', 'cSizeHint',
+                /* ⚠️ cGraceOn（启动后首轮静默）v2.3.4 新增却没登记：
+                   paintSwitches 不给 label 加 .on、initSwitches 不绑 change
+                   → 点了没动画、外观纹丝不动、也不会自动保存。
+                   tests/test_sw_ids.py 会扫 HTML 兜住这类漏登记。 */
+                'cGraceOn'];
 
 /* ⚠️「沙箱环境」一对开关（凭据页 cSandbox + 设置→高级 cSandbox2）事故复盘：
    initFormDirty / initSwitches 的 change 监听在 DOMContentLoaded 里注册，
@@ -2283,6 +2402,16 @@ async function saveCfg(silent) {
     // 中文翻译 / 输出调试日志（真实生效：/api/log 与 bot.py 日志级别）
     log_translate: !$('cLogTrans') || !!$('cLogTrans').checked,
     log_debug: !!($('cDebugLog') && $('cDebugLog').checked),
+
+    // 启动后首轮静默：开关关掉就是 0（syncGraceOn 已把框填成 0）
+    startup_grace_rounds: (function () {
+      /* 先对齐一次再读：两个监听器（自动保存 / 联动）的先后顺序不定，
+         不先 sync 就可能读到"开关已开、轮数还是 0"这种不一致的中间态。 */
+      try { syncGraceOn(); } catch (e) { /* 兜底，别让保存整个挂掉 */ }
+      const n = Number(($('cGraceRounds') && $('cGraceRounds').value) || 0);
+      const on = !$('cGraceOn') || $('cGraceOn').checked;
+      return on ? Math.max(0, Math.min(5, isNaN(n) ? 1 : n)) : 0;
+    })(),
 
     top_comment_only_up: !$('cOnlyUpCmt') || $('cOnlyUpCmt').checked,
 
@@ -2424,9 +2553,15 @@ async function loadBili() {
     const lv = Math.max(0, Math.min(6, parseInt(A.level, 10) || 0));
     const vipCls = (A.vip_type === 2) ? 'vip-badge annual' : 'vip-badge';
     const expCls = d.expired ? 'bad' : (d.soon ? 'soon' : '');
+    /* 估算值必须标出来。以前只有"已保存但未验证"那格会写（估算），
+       正常登录这格反而不写 —— 于是最该看到的场景恰恰看不到。
+       "还剩 179 天"是算出来的还是读出来的，不说就是误导。 */
+    const estTag = d.expires_estimated ? '（估算）' : '';
     const expTxt = d.expired ? 'cookie 已过期，请重新登录'
                              : ('cookie 有效期至 ' + (d.expires_str || '') +
-                                (d.days_left != null ? '（还剩 ' + d.days_left + ' 天）' : ''));
+                                (d.days_left != null
+                                  ? '（还剩 ' + d.days_left + ' 天' + estTag + '）'
+                                  : estTag));
     const due = A.vip_due
       ? ' · 会员到期 ' + new Date(Number(A.vip_due)).toLocaleDateString('zh-CN')
       : '';
@@ -2445,7 +2580,8 @@ async function loadBili() {
             '<span class="acc-uid">UID ' + esc(A.mid) + '</span>' +
             '<span>·</span><span>硬币 ' + esc(A.coins || 0) + '</span>' +
           '</div>' +
-          '<div class="acc-exp ' + expCls + '">⏳ ' + esc(expTxt) + due + '</div>' +
+          '<div class="acc-exp ' + expCls + '" data-exp="1" data-tip="' +
+            escAttr(cookieTip(d)) + '">⏳ ' + esc(expTxt) + due + '</div>' +
         '</div>' +
       '</div>';
   } else if (d.has_login) {
@@ -2463,7 +2599,8 @@ async function loadBili() {
           '<div class="acc-meta"><span>' +
             esc(A.msg || (bad ? 'B站 说这段 cookie 无效，接口会返回 -352/412'
                               : '没能向 B站 求证，登录状态未知')) + '</span></div>' +
-          '<div class="acc-exp ' + expCls + '">⏳ ' +
+          '<div class="acc-exp ' + expCls + '" data-exp="1" data-tip="' +
+            escAttr(cookieTip(d)) + '">⏳ ' +
             esc(d.expired ? '已过期' : (bad ? '请重新扫码或粘贴完整 Cookie'
                                             : (d.expires_text || ''))) + '</div>' +
         '</div>' +
@@ -5857,10 +5994,58 @@ function restoreTestOpt() {
   });
 }
 
+/* 「启动后首轮静默」的开关与轮数联动。
+   关掉 → 轮数框填 0 并禁用（不能关着却填 3，那样语义自相矛盾）；
+   打开 → 轮数框恢复可改，原来是 0 就补成 1。 */
+function syncGraceOn() {
+  const on = $('cGraceOn'), num = $('cGraceRounds');
+  if (!on || !num) return;
+  if (on.checked) {
+    num.disabled = false;
+    if (!Number(num.value)) num.value = 1;
+  } else {
+    num.value = 0;
+    num.disabled = true;
+  }
+  /* 程序给 .checked 赋值不会触发 change（也就不会重画），
+     所以这里必须手动刷一次外观，否则"改轮数 → 开关跟着开/关"
+     只改了值、滑块纹丝不动。 */
+  paintSwitches();
+}
+function initGraceOpt() {
+  if (initGraceOpt._done) return;
+  initGraceOpt._done = true;
+  const on = $('cGraceOn'), num = $('cGraceRounds');
+  if (on) on.addEventListener('change', syncGraceOn);
+  if (num) num.addEventListener('change', () => {
+    if (on) on.checked = Number(num.value) > 0;
+    syncGraceOn();
+  });
+}
+
+/* 「➕ 添加订阅」里那四个默认开关是写在 HTML 里的，没有 kindTip。
+   启动时按 data-kind 统一补上，文案跟订阅卡片里那套共用一份。
+   ⚠️ 幂等：群列表每 15 秒重画，别重复跑。 */
+function initKindTips() {
+  if (initKindTips._done) return;
+  initKindTips._done = true;
+  try {
+    document.querySelectorAll(
+      '[data-act="toggle-defkind"]').forEach(function (el) {
+      const k = el.getAttribute('data-kind');
+      const t = kindTip(k);
+      if (t) el.setAttribute('data-tip', t);
+    });
+  } catch (e) { /* 浮层加不上不影响勾选 */ }
+}
+
 /* ---------- 首屏：默认落在「概况」 ---------- */
 (function bootHome() {
   document.addEventListener('DOMContentLoaded', () => {
     initTips();
+    initKindTips();
+    initGraceOpt();
+    syncGraceOn();
     goto('home');
     // 轮询间隔输入框改了 → 心跳周期立刻跟着变
     const p = document.getElementById('cPoll');

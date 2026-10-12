@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>登录 · OnOB站通知订阅工具（OnOBN）</title>
-<link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+<link rel="stylesheet" href="/static/style.css?v={{ asset_stamp }}">
 <!-- ⚠️ 主题脚本必须紧跟 CSS、放在 <head> 里，且必须是 ES5（var / function）。
      以前它在 body 末尾：浏览器已经用硬编码的 data-theme="dark" 把整页画完了
      才轮到它改 —— 用户看到的是"锁死在夜间模式"，或者先深后浅闪一下。
@@ -25,7 +25,7 @@
 <!-- 标签页小图标：不随包带图，地址由后端 /api/brand/ico 给出（远程读取，
      可用环境变量 ONOBN_ICO_URL 换，设 off 则接口返回 404、浏览器静默不显示）。
      ⚠️ 带版本号参数：换图后不用等浏览器自己想起去刷新那个顽固的 favicon 缓存。 -->
-<link rel="icon" href="/api/brand/ico?v={{ app_version }}">
+<link rel="icon" href="/api/brand/ico?v={{ asset_stamp }}">
 <style>
   /* ⚠️ 这个页面是**独立模板**，拿不到 index.html 内联 <style> 里的任何东西。
      面板那些 .card / .wrap / .f / .hint 的视觉样式全在 index.html 里定义，

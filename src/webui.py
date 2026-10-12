@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import atexit
 import glob
+import hashlib
 import os
 import re
 import sys
@@ -365,6 +366,54 @@ def _theme_from_cookie() -> str:
     return v if v in ("light", "dark") else "dark"
 
 
+# ---------------- 静态资源缓存串 ----------------
+# ⚠️ 事故复盘（这个坑反复出现，必须写清楚）：
+#    以前所有静态资源都写成 `/static/app.js?v={{ app_version }}`，
+#    缓存串跟着**版本号**走。而修复期间版本号是不动的（小更新和一般修复
+#    按规则囤着不涨号），于是：
+#      · 改了 app.js / style.css，URL 一个字没变
+#      · 浏览器继续用磁盘里缓存的旧文件
+#      · 但 index.html 是服务端每次现渲染的，永远是新的
+#    → 表现就是"页面上看得到新控件，点了却没反应、也不保存"：
+#      HTML 是新的，JS 是旧的，新控件根本没有被绑上任何事件。
+#    用户报过的「登录页背景没变」「首轮静默开关点不动」都是这一个根因。
+#    修法：缓存串改成跟**文件内容**走，文件内容一变 URL 就变，缓存自动失效。
+_ASSET_STAMP_CACHE = {}
+
+
+def _asset_stamp():
+    """静态资源缓存串：取 app.js / style.css / sound.js 内容的哈希。
+
+    文件内容变了，串就变 —— 不用等版本号涨，也不用让用户按 Ctrl+F5。
+    按 (mtime, size) 缓存结果，不会每次请求都重读文件。
+    """
+    try:
+        parts = []
+        for name in ("app.js", "style.css", "sound.js"):
+            path = os.path.join(app.static_folder or "", name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                parts.append(name + ":missing")
+                continue
+            key = (int(st.st_mtime), st.st_size)
+            hit = _ASSET_STAMP_CACHE.get(name)
+            if hit and hit[0] == key:
+                parts.append(hit[1])
+                continue
+            try:
+                with open(path, "rb") as f:
+                    digest = hashlib.md5(f.read()).hexdigest()[:10]
+            except OSError:
+                digest = "err"
+            _ASSET_STAMP_CACHE[name] = (key, digest)
+            parts.append(digest)
+        return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()[:10]
+    except Exception:
+        # 兜底：算不出来也不能让页面打不开
+        return _version.current()
+
+
 def _login_ctx(error="", authed_now=None):
     """登录页模板变量，两条渲染路径（GET / POST 失败）共用，避免漏传。"""
     if authed_now is None:
@@ -375,6 +424,9 @@ def _login_ctx(error="", authed_now=None):
         # ⚠️ 必须传：登录页用它拼 style.css?v= 和 ico?v= 的缓存串。
         #    不传就渲染成空，换版本后浏览器继续用旧的 CSS，看着像"改了没生效"。
         "app_version": _version.current(),
+        # ⚠️ 静态资源缓存串跟**文件内容**走（不是版本号），
+        #    改了 JS/CSS 而版本号没涨时，浏览器也会拉到新文件。
+        "asset_stamp": _asset_stamp(),
         # 背景飘动用的**同目录同名字的 svg**；svg 取不到时前端会自动退回同名 png。
         "bg_logo_svg": svg_variant(_logo_remote_url()),
         "bg_ico_svg": svg_variant(_ico_remote_url()),
@@ -428,6 +480,7 @@ def index():
     #    加载执行才变回日间。服务端先按 cookie 定一次，
     #    前端 <head> 里的内联脚本再用 localStorage 校正。
     return render_template("index.html", app_version=_version.current(),
+                           asset_stamp=_asset_stamp(),
                            theme=_theme_from_cookie())
 
 
@@ -545,6 +598,11 @@ def api_state():
             "top_comment_only_up": bool(cfg.get("top_comment_only_up", True)),
             "log_translate": bool(cfg.get("log_translate", True)),
             "log_debug": bool(cfg.get("log_debug", False)),
+            # ⚠️「启动后首轮静默」轮数：v2.3.4 新增了保存（/api/config）却漏了
+            #    这里回读。后果正是上面那段注释说的假保存 —— 落盘是真落了，
+            #    但 /api/state 不带这个键 → 前端拿到 undefined → NaN → 兜回
+            #    默认值 1 → 开关"关了又弹回开"。凡是面板能改的，state 必须回。
+            "startup_grace_rounds": _grace_rounds_out(cfg),
             "request_timeout": cfg.get("request_timeout", 10),
             "dedupe_window": cfg.get("dedupe_window", 900),
 
@@ -1400,6 +1458,18 @@ def api_config():
     if "log_debug" in d:
         cfg["log_debug"] = bool(d.get("log_debug"))
 
+    # 「启动后首轮静默」宽限轮数。
+    # ⚠️ 这是个真开关（bot.py 每轮读 cfg，改完下一轮就生效，不用重启）：
+    #   启动同步有 25s 总时限，订阅多了会有 UP 被留到轮询再对齐，
+    #   而那些 UP 的基线是停机前的旧值 → 第一轮被当成新内容补推一遍。
+    #   宽限轮次把它们的基线强制刷新并拦掉推送。0 = 关闭（恢复老行为）。
+    if d.get("startup_grace_rounds") is not None:
+        try:
+            cfg["startup_grace_rounds"] = min(
+                5, max(0, int(d.get("startup_grace_rounds"))))
+        except (TypeError, ValueError):
+            pass
+
     # 请求超时 / 去重窗口：面板「设置→高级」里能改。
     # ⚠️ 这两个是真实配置项（config.example.yaml 里有），
     #    但以前面板上有输入框、后端白名单里没有 —— 改了不保存，
@@ -1617,6 +1687,19 @@ def _norm_grid_mode(v) -> str:
     """
     _v = str(v or "").strip().lower()
     return _v if _v in ("box", "ratio", "square", "contain") else "box"
+
+
+def _grace_rounds_out(cfg: dict) -> int:
+    """「启动后首轮静默」轮数，供 /api/state 回读。
+
+    ⚠️ 保存侧已经钳到 0~5，这里再钳一次是为了防脏值（手改 config.yaml、
+       旧版本残留）把前端算成 NaN —— NaN 一进前端就是 `isNaN → 兜默认值 1`，
+       表现为"关掉开关又自己弹回开"。
+    """
+    try:
+        return max(0, min(5, int(cfg.get("startup_grace_rounds", 1))))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _apply_render_cfg(cfg=None):

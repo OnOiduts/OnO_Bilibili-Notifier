@@ -545,6 +545,9 @@ class NotifyBot(botpy.Client):
         self._iv_from = None      # 本次「加快链」的起点间隔
         self._iv_last_log = 0.0   # 上次打间隔日志的时间戳（冷却用）
         self._silent = False   # 启动同步期间为 True → 只记基线不推送
+        # 启动同步真正对齐过的 UP 主。启动同步有总时限（默认 25s），
+        # 订阅多了会有 UP 被留到轮询再对齐 —— 记下来，宽限轮次只补这些。
+        self._startup_synced = set()
         # 记录各类提醒的推送时间，用于「直播/视频 vs 动态」去重
         self._recent_push = {}
         # 「主动消息无权限」的群先歇一会儿再试：{gid: 到期时间戳}
@@ -1450,6 +1453,12 @@ class NotifyBot(botpy.Client):
         g_live = _g("live", "live")
         g_video = _g("video", "video")
         g_dyn = _g("dynamic", "dyn")
+        # 置顶评论是独立开关（top_comment → dyn_top_cmt）。以前这里漏了它，
+        # 于是"刚给某个群开了置顶评论"时基线一直空着，_missing_baselines
+        # 每轮都算它缺失、又每轮什么都不做。虽然 _check_top_comment 内部有
+        # "首次静默对齐"兜底（不会真补推），但那条路径要先发两次请求，且
+        # 与"新订阅不补推历史"的语义不一致。这里补齐，逻辑才自洽。
+        g_top_cmt = _g("top_comment", "dyn_top_cmt")
 
         if room_id and g_live:
             try:
@@ -1480,10 +1489,36 @@ class NotifyBot(botpy.Client):
                             pubdate=getattr(d, "pubdate", 0) or 0)
             except BiliError as e:
                 _log.warning(f"[UID {uid}] 初始化动态基线失败：{e}")
-        if g_live or g_video or g_dyn:
+        if g_top_cmt:
+            try:
+                top = await self.bili.get_pinned_dynamic(uid)
+                if top and top.dyn_id:
+                    c = await self.bili.get_pinned_comment(
+                        top.dyn_id, uid, getattr(top, "rid", "") or "",
+                        comment_id=getattr(top, "comment_id_str", "") or "",
+                        comment_type=getattr(top, "comment_type", 0) or 0)
+                    # ⚠️ 必须和 _check_top_comment 用同一套"本人"判定。
+                    # 少了这一步，粉丝刷上去的置顶评论会被当成基线记下来
+                    # （检测时它是不认的），于是两边口径不一致：
+                    # 粉丝评论占住了基线，UP 主自己的评论反而成了"新内容"。
+                    if c and c.get("id"):
+                        if self.cfg.get("top_comment_only_up", True):
+                            mid = str((c or {}).get("mid") or "").strip()
+                            if mid and mid != str(uid):
+                                c = None
+                    if c and c.get("id"):
+                        for gid in g_top_cmt:
+                            self.store.set_baseline_of(
+                                gid, uid, "dyn_top_cmt", id=c["id"])
+            except BiliError as e:
+                _log.warning(f"[UID {uid}] 初始化置顶评论基线失败：{e}")
+            except Exception as e:
+                _log.warning(
+                    f"[UID {uid}] 初始化置顶评论基线异常：{redact(str(e))[:60]}")
+        if g_live or g_video or g_dyn or g_top_cmt:
             _log.info(f"[UID {uid}] 新订阅/新增类型：已静默对齐 "
-                      f"{len(set(g_live) | set(g_video) | set(g_dyn))} 个群"
-                      f"（不推送历史内容）")
+                      f"{len(set(g_live) | set(g_video) | set(g_dyn) | set(g_top_cmt))}"
+                      f" 个群（不推送历史内容）")
 
     # ============ 轮询 ============
     async def _fetch_group_name(self, gid: str):
@@ -1765,6 +1800,11 @@ class NotifyBot(botpy.Client):
             _log.debug(f"补查直播间号整体跳过：{e}")
 
         self.store.refresh()
+        # ⚠️ 懒初始化：有些调用方（测试、部分内部路径）是 __new__ 出来的，
+        #    不走 __init__，直接 .add() 会 AttributeError 并被下面的
+        #    except 吞掉 —— 表现为"启动同步一位都没对齐"，极难排查。
+        if not hasattr(self, "_startup_synced"):
+            self._startup_synced = set()
         uids = sorted(self.store.all_ups())
 
         # ⚠️ 启动同步以前是**完全串行**的：每个 UP 依次跑 直播/投稿/动态
@@ -1804,6 +1844,16 @@ class NotifyBot(botpy.Client):
                     await self._check_live(uid, name)
                     await self._check_video(uid, name)
                     await self._check_dynamic(uid, name)
+                    # ⚠️ 置顶评论**必须单独对齐**，不能指望 _check_dynamic 顺带
+                    #    做（它在 2882 行附近明确注释了"不在这里调"）。
+                    #    漏掉它的后果：停机期间 UP 主换了置顶评论，启动同步只
+                    #    对齐了 live/video/dynamic，置顶评论基线还是停机前的旧
+                    #    ID，第一轮轮询就 prev != cur → 当成新内容补推一遍 ——
+                    #    这正是"开机静默没完全静默"的来源。
+                    #    置顶评论是独立开关，没订阅的群不必白跑一次请求。
+                    if "top_comment" in kinds:
+                        await self._check_top_comment(uid, name)
+                    self._startup_synced.add(uid)
                     return 1
                 except Exception as e:
                     _log.debug(f"启动同步 [{uid}] 跳过：{e}")
@@ -1828,6 +1878,45 @@ class NotifyBot(botpy.Client):
             _log.info(f"启动同步：{skipped} 位 UP 主留到第一轮轮询再对齐"
                       f"（已用满 {budget:.0f}s 预算，不拖慢启动；轮询里会"
                       f"自动静默对齐，不会补推历史内容）")
+        return done
+
+    async def _grace_align(self) -> int:
+        """启动后宽限轮次：把**启动同步没覆盖到**的 UP 强制对齐基线。
+
+        为什么还需要这一步
+        ------------------
+        启动同步有总时限（默认 25s），订阅多了会有 UP 被留到轮询再对齐，
+        日志里会写"留到第一轮轮询再对齐"。
+
+        但轮询里的 `_init_baseline` 默认只补**缺失**的基线
+        （only_missing=True，这是对的：正常运行时不能把 A 群正等着推的
+        那条给吞掉）。而那些被跳过的 UP，基线是**停机前留下的旧值** ——
+        不是缺失，于是第一轮就 prev != cur → 当成新内容补推一遍。
+        这正是"开机静默没完全静默"的最后一块：启动同步日志明明写着
+        "已记为基线（静默）"，结果还是推了一条。
+
+        所以宽限轮次里改成强制刷新（only_missing=False）。
+        ⚠️ 只有在这里才安全：刚开机，没有任何群"正等着推"，
+        不存在"把别人该推的吞掉"的问题。
+
+        配置项 startup_grace_rounds：宽限几轮（默认 1，0 = 关闭）。
+        """
+        done = 0
+        try:
+            uids = sorted(self.store.all_ups())
+        except Exception:
+            return 0
+        synced = getattr(self, "_startup_synced", set()) or set()
+        for uid in uids:
+            if uid in synced:
+                continue
+            try:
+                name = self.store.get_up(uid).get("uname") or str(uid)
+                await self._init_baseline(uid, only_missing=False)
+                synced.add(uid)
+                done += 1
+            except Exception as e:
+                _log.debug(f"宽限对齐 [{uid}] 跳过：{e}")
         return done
 
     async def _startup_sync_seasons(self, deadline=None) -> int:
@@ -1927,6 +2016,27 @@ class NotifyBot(botpy.Client):
                 except Exception:
                     pass
                 self._round += 1
+                # ── 启动后宽限轮次：只对齐基线、不推送 ──
+                # 兜住"启动同步因时限没覆盖到的 UP"：那些 UP 的基线是停机
+                # 前的旧值，不强制刷新就会在第一轮被当成新内容补推。
+                # 配置 startup_grace_rounds（默认 1，0 = 关闭）。
+                try:
+                    _grace = max(0, min(5, int(
+                        self.cfg.get("startup_grace_rounds", 1) or 0)))
+                except (TypeError, ValueError):
+                    _grace = 1
+                if _grace and self._round <= _grace:
+                    self._silent = True
+                    try:
+                        n = await self._grace_align()
+                        if n:
+                            _log.info(
+                                f"启动宽限（第 {self._round}/{_grace} 轮）："
+                                f"{n} 位 UP 主的基线已强制对齐（不推送）")
+                    except Exception as e:
+                        _log.debug(f"宽限对齐跳过：{e}")
+                else:
+                    self._silent = False
                 await self._poll_once()
                 # 每轮把「B站 认不认这个登录态」写给面板（见 _sync_bili_auth）
                 try:
