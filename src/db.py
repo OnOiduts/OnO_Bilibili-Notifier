@@ -1267,6 +1267,36 @@ class Store:
         except Exception:
             return 0
 
+    def season_uname(self, uid: int, season_id: int = 0) -> str:
+        """这个 UP 主在**合集订阅**里记下的名字（订阅时存进 seasons.uname）。
+
+        ⚠️ 只订合集、没订 UP 主时，ups 表里根本没有这一条 ——
+        那时这是唯一能填上名字的地方（面板就是靠它显示中文名的，
+        见 webui 里那句"只订合集、没订 UP 主时只有它有"）。
+
+        给 season_id 就先认这一个合集（同一个 UP 主有多个合集时更准），
+        取不到再按 uid 找这个 UP 主任意一个合集上记的名字。
+        """
+        self.refresh()
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return ""
+        try:
+            rows = []
+            if season_id:
+                rows = self._conn().execute(
+                    "SELECT uname FROM seasons WHERE uid=? AND season_id=? "
+                    "AND uname<>'' LIMIT 1", (uid, int(season_id))).fetchall()
+                if rows:
+                    return str(rows[0]["uname"] or "")
+            rows = self._conn().execute(
+                "SELECT uname FROM seasons WHERE uid=? AND uname<>'' LIMIT 1",
+                (uid,)).fetchall()
+        except Exception:
+            return ""
+        return str(rows[0]["uname"] or "") if rows else ""
+
     def all_season_keys(self) -> list:
         """所有**开着**的合集订阅，去重后 [(gid, uid, season_id)]。
 

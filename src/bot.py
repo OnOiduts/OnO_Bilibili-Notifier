@@ -55,6 +55,72 @@ AUTH_HOLD_INTERVAL = 30
 #    可用 config.yaml 的 season_fresh_grace 覆盖。
 SEASON_FRESH_GRACE = 3600
 
+# 补查 UP 主名字失败后的冷却时间（秒），到点自动重试。
+#
+# ⚠️ 以前是「失败一次就永久进冷却集合」，而**启动那一波请求最容易撞上
+#    风控/超时**（开机自检 + 启动同步全挤在一起）。于是常见的后果是：
+#    刚启动那一下没查到 → 整个进程生命周期内所有合集推送的 {name}
+#    都退化成一串 uid 数字，重启才好、过一阵又犯 —— 正是"又不显示
+#    UP 主了"的反复发作。
+#
+#    给冷却加时效：失败只歇这么久，之后自动再试，不用重启。
+#    可用 config.yaml 的 season_name_miss_ttl 覆盖。
+SEASON_NAME_MISS_TTL = 600
+
+
+def season_name_fallback(uid) -> str:
+    """真名实在取不到时，{name} 显示成什么。
+
+    ⚠️ 绝不能是一串光秃秃的数字：用户看到「280242571更xx录播了！」
+    只会以为程序坏了，而且分不清这是 UP 主名还是别的什么号。
+    带上「UP主」三个字，至少一眼看得出它是什么、也能照着找回去。
+    """
+    return f"UP主{uid}"
+
+
+def resolve_season_up_name(store, uid: int, season_id: int = 0) -> str:
+    """合集推送时 UP 主叫什么 —— 三级兜底，绝不显示成一串 uid。
+
+    ⚠️ 以前只有一级：`store.get_up(uid).get("uname") or str(uid)`。
+    而**只订合集、没订 UP 主**时（很常见：只盯录播合集），ups 表里
+    根本没有这一条，于是推送正文里的 {name} 直接变成 uid 数字 ——
+    面板上明明显示着中文名，发出去的消息却是一串数字，用户看着像坏了。
+
+    顺序与面板（webui 里那套 sv["uname"] 兜底）保持一致：
+      ① 合集订阅上记的名字（只订合集时只有它有）
+      ② ups 缓存（订过这个 UP 主的会有）
+      ③ 都没有才退回 uid
+    同一个名字在面板和推送里不一致更让人困惑，所以两处用同一顺序。
+    """
+    try:
+        nm = str(store.season_uname(uid, season_id) or "")
+    except Exception:
+        nm = ""
+    if nm:
+        return nm
+    try:
+        nm = str((store.get_up(uid) or {}).get("uname") or "")
+    except Exception:
+        nm = ""
+    return nm or str(uid)
+
+
+def season_name_is_uid(name: str, uid: int) -> bool:
+    """这个"名字"是不是退化成了一串 uid 数字。
+
+    真名不可能全是数字，所以只要长得像 uid 就当没取到 —— 宁可再去问一次
+    B 站，也不要把一串数字当名字发出去。
+    """
+    s = str(name or "").strip()
+    if not s:
+        return True
+    try:
+        if int(s) == int(uid):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return s.isdigit()
+
 # 日志文件的行首格式（与下面 FileHandler 的 fmt 一致）：
 # 2026-09-25 12:00:00 [INFO] …
 # 用来判断「这行是不是 logging 已经写过一遍的」，避免再被 Tee 写第二次。
@@ -1288,6 +1354,37 @@ class NotifyBot(botpy.Client):
             return False
         return str(hit.get("val", "")) == bvid
 
+    def _silent_note(self, uid: int, gid: str, kind: str, key: str,
+                     name: str, msg: str):
+        """「正确地什么都没做」的日志 —— **同一条内容只打一次**。
+
+        ⚠️ 为什么必须记账：
+        这几处静默分支本身没问题（确实该什么都不推），但只要基线因为
+        某种原因没推进（落盘被系统拒绝、接口偶发没返回发布时间……），
+        下一轮就会**再次**判定成「新投稿 → 该静默」，于是同一句话每轮
+        刷一行。日志里连着二十行「已由投稿动态提醒过」就是这么来的 ——
+        看着像去重失灵，其实去重一直在正常工作，只是同一句话说了 20 遍。
+
+        所以按 (群, UP 主, 类型, 内容 ID) 记一笔：打过就不再打，顺带把
+        后面那几次去重查询也省掉。
+        """
+        try:
+            s = getattr(self, "_silent_noted", None)
+            if s is None:
+                s = self._silent_noted = set()
+            if len(s) > 2000:
+                s.clear()          # 只防无限增长，不影响正确性
+            k = (str(gid), int(uid), str(kind), str(key))
+            if k in s:
+                return
+            s.add(k)
+        except Exception:
+            pass
+        try:
+            _log.info(f"[{name}] 群 {str(gid)[:8]}… {msg}")
+        except Exception:
+            pass
+
     def _should_silence_video(self, uid: int, v) -> bool:
         """这条投稿要不要静默 —— 该 UP 的动态**先**被检测到并推过了。
 
@@ -2323,10 +2420,21 @@ class NotifyBot(botpy.Client):
             if "live" in kinds:
                 await _safe(self._check_live(uid, name), "live")
             if slow_round:
-                if "video" in kinds:
-                    await _safe(self._check_video(uid, name), "video")
+                # ⚠️ 顺序**不能反**：动态必须排在投稿之前。
+                #
+                # UP 主发新视频时 B 站先发一条「带视频卡的动态」（动态接口
+                # 快，几乎实时），个人主页的投稿列表要等索引才更新。
+                # 所以用户看到的优先级就是「动态为主、投稿为备」：
+                # 动态那条带 UP 主自己写的配文，投稿那条只有标题。
+                #
+                # 同一轮里两者都是新的时，让动态先推 —— 内容更全、也符合
+                # B 站的实际顺序；投稿随后由 _should_silence_video 静默。
+                # 反过来（投稿先跑）会把同一件事推成「📺 新视频投稿」，
+                # 配文就没了，动态那边反而被当成重复动态静默掉。
                 if "dynamic" in kinds:
                     await _safe(self._check_dynamic(uid, name), "dyn")
+                if "video" in kinds:
+                    await _safe(self._check_video(uid, name), "video")
                 # 置顶评论是独立开关，不能挂在 dynamic 下面
                 if "top_comment" in kinds:
                     await _safe(self._check_top_comment(uid, name), "top_cmt")
@@ -2398,6 +2506,102 @@ class NotifyBot(botpy.Client):
             except Exception as e:
                 _log.warning(f"合集 {sid} 检测失败：{redact(str(e))[:120]}")
 
+    async def _season_up_name(self, uid: int, season_id: int = 0,
+                              bvid: str = "") -> str:
+        """合集推送时 UP 主叫什么 —— 五级兜底，绝不显示成一串 uid。
+
+        前三级见 resolve_season_up_name，局限是：只订合集、且订阅时**没
+        记下名字**（旧数据，或当时 B 站没查到）时三级全空，{name} 就退化
+        成 uid 数字 —— 面板上明明是中文名，发出去的消息却是一串数字。
+
+        ⚠️ 面板里那套补救（backfill）**只在打开面板时跑**。机器人一直跑着
+        不面板就补不上，于是"又"出现了 —— 这正是它没法根治的原因。
+
+        第四级：实时问一次 B 站（card 接口），拿到就**回填** seasons.uname
+        和 ups 缓存，之后走前三级就能拿到，不必再查。
+        第五级：card 接口不给时，问视频详情接口要 owner.name —— 合集里
+        的视频必然都是这个 UP 主自己传的，所以它是可靠的兜底。
+
+        ⚠️⚠️ 冷却**必须有时效**（SEASON_NAME_MISS_TTL）。以前是"失败一次就
+        永久进集合"，而启动那一波请求最容易撞风控/超时，于是"刚启动没查到"
+        会让整个进程生命周期内的合集推送全变成数字串，重启才好、过阵又犯。
+        现在只歇一会儿就自动重试，不用重启。
+        """
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return str(uid)
+        nm = ""
+        try:
+            nm = resolve_season_up_name(self.store, uid, season_id)
+        except Exception:
+            nm = ""
+        if not season_name_is_uid(nm, uid):
+            return nm
+        # 进程内缓存 / 冷却都用 getattr 建：对象若不是走 __init__ 建出来的
+        # （测试桩等）就没有这些属性，直接取会 AttributeError 把整轮打断。
+        cached = getattr(self, "_season_name_cache", None)
+        if cached is None:
+            cached = {}
+            self._season_name_cache = cached
+        got = str(cached.get(uid) or "")
+        if got:
+            return got
+        miss = getattr(self, "_season_name_miss", None)
+        if miss is None:
+            miss = {}
+            self._season_name_miss = miss
+        now = time.time()
+        until = 0.0
+        try:
+            until = float(miss.get(uid) or 0)
+        except (TypeError, ValueError):
+            until = 0.0
+        if until and now < until:
+            return season_name_fallback(uid)
+
+        got = ""
+        try:
+            up = await self.bili.get_up(uid)
+            got = str(getattr(up, "uname", "") or "").strip()
+        except Exception as e:
+            _log.debug(f"补查合集 UP 主名字失败（uid {uid}）："
+                       f"{redact(str(e))[:80]}")
+            got = ""
+        # 第五级：card 接口没给，就用视频详情里的 owner.name。
+        # 只在上面没拿到时才问，正常情况下不多打一次请求。
+        if not got and bvid:
+            try:
+                owner = getattr(self.bili, "get_video_owner", None)
+                if owner is not None:
+                    mid, oname = await owner(bvid)
+                    if not mid or int(mid) == int(uid):
+                        got = str(oname or "").strip()
+            except Exception as e:
+                _log.debug(f"从视频详情补查 UP 主名字失败（{bvid}）："
+                           f"{redact(str(e))[:80]}")
+                got = ""
+        if got and not season_name_is_uid(got, uid):
+            # 回填：seasons（面板与推送都用得上）+ ups 缓存，下次不必再查
+            try:
+                self.store.set_season_uname(uid, got)
+            except Exception:
+                pass
+            try:
+                self.store.set_up_info(uid, got, 0)
+            except Exception:
+                pass
+            cached[uid] = got
+            _log.info(f"已补回合集 UP 主名字：{got}（uid {uid}）")
+            return got
+        ttl = float(self.cfg.get("season_name_miss_ttl",
+                                 SEASON_NAME_MISS_TTL) or 0)
+        miss[uid] = now + (ttl if ttl > 0 else SEASON_NAME_MISS_TTL)
+        _log.warning(f"合集 UP 主名字没取到（uid {uid}），推送里将显示为"
+                     f"「{season_name_fallback(uid)}」；"
+                     f"{int(ttl) if ttl > 0 else SEASON_NAME_MISS_TTL} 秒后自动重试")
+        return season_name_fallback(uid)
+
     async def _check_one_season(self, uid: int, season_id: int):
         max_pages = max(1, int(self.cfg.get("season_max_pages", 2)))
         # 拿不到就让它抛出去（上层会记日志），**不写基线** ——
@@ -2425,7 +2629,17 @@ class NotifyBot(botpy.Client):
                 except Exception:
                     pass
 
-        name = self.store.get_up(uid).get("uname") or str(uid)
+        # ⚠️ 名字要在**推之前**定下来，且把本合集最新那条视频的 bvid 给它：
+        #    card 接口不给名字时，还能从视频详情里的 owner.name 兜底，
+        #    不用多打一次请求（详情接口本来每轮都要打，用于小节结构）。
+        hint_bvid = ""
+        try:
+            _nv = max(info.videos,
+                      key=lambda v: int(getattr(v, "pubdate", 0) or 0))
+            hint_bvid = str(getattr(_nv, "bvid", "") or "")
+        except (ValueError, TypeError, AttributeError):
+            hint_bvid = ""
+        name = await self._season_up_name(uid, season_id, bvid=hint_bvid)
         # ⚠️ 小节感知（每个合集只做一次，不按群重复请求）
         await self._season_apply_sections(info, season_id)
         for gid in gids:
@@ -2819,8 +3033,9 @@ class NotifyBot(botpy.Client):
                 # 删稿/撤稿后"最新投稿"退回成更早的一条：
                 # ID 变了但不是新内容，只更新基线，不推送。
                 skip.add(gid)
-                _log.info(f"[{name}] 群 {gid[:8]}… 最新投稿回退为更早的 "
-                          f"{v.bvid}（疑似删稿），静默不推送")
+                self._silent_note(
+                    uid, gid, "video", v.bvid, name,
+                    f"最新投稿回退为更早的 {v.bvid}（疑似删稿），静默不推送")
             # 这个视频如果已经在某个合集里推过，就别再当"新投稿"推一遍。
             # 按群判断：没订阅那个合集的群照样要收到投稿提醒。
             try:
@@ -2837,14 +3052,18 @@ class NotifyBot(botpy.Client):
                     if self._content_pushed_by(uid, "video", v.bvid,
                                                ("dynamic",)):
                         skip.add(gid)
-                        _log.info(f"[{name}] 群 {gid[:8]}… 新投稿 {v.bvid} 已由"
-                                  f"投稿动态提醒过，静默不重复推送")
+                        self._silent_note(
+                            uid, gid, "video", v.bvid, name,
+                            f"新投稿 {v.bvid} 已由投稿动态提醒过，"
+                            f"静默不重复推送")
                     elif self._should_silence_video(uid, v):
                         # 动态里取不到 BV（新版投稿动态把地址藏在跳转链接
                         # 里）→ 按发布时间兜底，同样是刚推过的那条动态
                         skip.add(gid)
-                        _log.info(f"[{name}] 群 {gid[:8]}… 新投稿 {v.bvid} 与"
-                                  f"刚推过的动态是同一件事，静默不重复推送")
+                        self._silent_note(
+                            uid, gid, "video", v.bvid, name,
+                            f"新投稿 {v.bvid} 与刚推过的动态是同一件事，"
+                            f"静默不重复推送")
             except Exception:
                 pass
         changed = [g for g in gids if g not in skip]

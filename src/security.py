@@ -264,15 +264,26 @@ class LoginLimiter:
 
 # ────────────────────────── 输入校验 ──────────────────────────
 def validate_uid(raw) -> int:
-    """B 站 UID：3~12 位纯数字。"""
+    """B 站 UID：1~16 位纯数字。
+
+    ⚠️ 以前写死 3~12 位。B 站 UID 是**自增**的：早期注册的号位数很短
+    （最早的号只有 1~2 位），新号已经排到 10 位以上并且还会继续变长。
+    把上下限写死的结果就是——位数一旦超出，面板和命令添加订阅时直接抛
+    「UID 必须是 N 位数字」，前端只提示"格式不对"，看的人根本想不到是
+    位数超限，表现就是"这个 UP 主加不进去"。
+    现在按 1~16 位放行（SQLite 的 INTEGER 是 64 位，16 位数字存得下），
+    位数变了不用改代码。
+    末尾 (?!\\d) 是边界：超过 16 位的数字串**整个不匹配**，不会被悄悄
+    截成前 16 位当成一个合法 UID。
+    """
     s = str(raw or "").strip()
-    m = re.fullmatch(r"(\d{3,12})", s)
+    m = re.fullmatch(r"(\d{1,16})", s)
     if m:
         return int(m.group(1))
-    m = re.search(r"(?:space\.bilibili\.com/|mid=)(\d{3,12})", s)
+    m = re.search(r"(?:space\.bilibili\.com/|mid=)(\d{1,16})(?!\d)", s)
     if m:
         return int(m.group(1))
-    raise ValueError("UID 必须是 3~12 位数字")
+    raise ValueError("UID 必须是 1~16 位数字")
 
 
 def validate_gid(raw) -> str:

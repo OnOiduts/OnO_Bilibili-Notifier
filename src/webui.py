@@ -1491,9 +1491,10 @@ def api_config():
     #    前端 loadState() 一刷又用默认值覆盖输入框，表现就是"一直回弹"。
     #    只取数字、限长，防止塞进脏值。
     if "selfcheck_uid" in d:
-        _m = re.search(r"\d{3,}", str(d.get("selfcheck_uid") or ""))
+        _m = re.search(r"(\d{1,16})(?!\d)",
+                       str(d.get("selfcheck_uid") or ""))
         if _m:
-            cfg["selfcheck_uid"] = _m.group(0)[:20]
+            cfg["selfcheck_uid"] = _m.group(0)[:16]
 
     # 最小请求间隔 / 轮询上限：真实生效（bot.py 在读），
     # ⚠️ 但以前面板没有输入框、白名单也不收 —— 只能手改 yaml。现在补上。

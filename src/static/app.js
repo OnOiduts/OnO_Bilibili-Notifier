@@ -5461,7 +5461,11 @@ function showChkUid(v, name) {
   el.textContent = nm + ' | uid：' + v;
 }
 function parseUid(s) {
-  var m = String(s || '').match(/(\d{3,})/);
+  // ⚠️ 以前是 (\d{3,})：下限 3 位，1~2 位的老号抠不出来；上限没有，
+  //    超长串会被整段当成 UID 交给后端，后端再按位数拒绝 —— 面板上
+  //    只显示"没填 UID"，看的人不知道是位数问题。
+  //    现在跟后端同一口径：1~16 位，(?!\d) 保证超长就整个不匹配。
+  var m = String(s || '').match(/(\d{1,16})(?!\d)/);
   return m ? m[1] : '';
 }
 async function saveChkUid() {

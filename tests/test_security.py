@@ -82,7 +82,18 @@ def t_input():
     ck("合法 UID", S.validate_uid("672328094") == 672328094)
     ck("空间链接提取 UID",
        S.validate_uid("https://space.bilibili.com/672328094") == 672328094)
-    for bad in ("abc", "../../etc/passwd", "1", "123456789012345", ""):
+    # ⚠️ 以前这里把 "1" 和 "123456789012345"（15 位）当作非法 UID，
+    #    正是那条断言逼着代码把 UID 写死在 3~12 位。B 站 UID 是自增的，
+    #    位数会一直变长，写死上下限的结果就是新号加不进去。
+    #    现在 1~16 位都放行，超过 16 位才拒绝。
+    ck("1 位 UID 放行", S.validate_uid("1") == 1)
+    ck("15 位 UID 放行", S.validate_uid("123456789012345") == 123456789012345)
+    ck("16 位 UID 放行",
+       S.validate_uid("1234567890123456") == 1234567890123456)
+    ck("空间链接提取 16 位 UID",
+       S.validate_uid("https://space.bilibili.com/1234567890123456")
+       == 1234567890123456)
+    for bad in ("abc", "../../etc/passwd", "12345678901234567", ""):
         try:
             S.validate_uid(bad)
             ck(f"拒绝非法 UID {bad!r}", False)

@@ -30,7 +30,7 @@ _BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
 # 「开播提醒 + 开播动态」连着推两条（用户原话："这种动态就是直播中的
 # 直播推送"）。
 _ROOM_URL_RE = re.compile(
-    r"live\.bilibili\.com/(?:h5/|blanc/)?(\d{1,12})")
+    r"live\.bilibili\.com/(?:h5/|blanc/)?(\d{1,16})(?!\d)")
 
 
 def _room_from_src(value) -> int:
@@ -1201,6 +1201,31 @@ class BiliClient:
             "pic": ep.get("pic") or arc.get("pic") or "",
             "pubdate": pub,
         }
+
+    async def get_video_owner(self, bvid: str) -> tuple:
+        """视频详情里的 UP 主 (mid, 名字)。取不到返回 (0, "")。
+
+        ⚠️ 这是给「合集推送时 UP 主名字退化成一串 uid」兜底用的：
+        合集里的视频必然都是这个 UP 主自己传的，所以视频详情里的
+        owner.name 可以当 UP 主名字用。
+
+        只在 card 接口拿不到名字时才调，正常情况下不多打一次请求。
+        """
+        if not bvid:
+            return (0, "")
+        await self._throttle("view")
+        try:
+            data = await self._get(
+                VIEW_API, {"bvid": bvid},
+                referer=f"https://www.bilibili.com/video/{bvid}")
+        except BiliError:
+            return (0, "")
+        owner = ((data.get("data") or {}).get("owner") or {})
+        try:
+            mid = int(owner.get("mid") or 0)
+        except (TypeError, ValueError):
+            mid = 0
+        return (mid, str(owner.get("name") or "").strip())
 
     async def get_season_sections(self, bvid: str,
                                   season_id: int = 0) -> list:
