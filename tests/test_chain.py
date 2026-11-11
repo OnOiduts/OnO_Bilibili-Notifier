@@ -271,17 +271,22 @@ async def t_pinned_comment_detection():
 
 
 def t_at_all_feature_removed():
-    """@全体 功能必须彻底移除（v1.18.0）。
+    """@全体：v1.18.0 移除的是**旧标签**，2026-10-26 群聊开放了新标签。
 
-    移除原因：官方内嵌 @everyone 仅文字子频道可用；且 @全体 需要
-    群主/管理员身份，而机器人不在管理员候选池里。两条都堵死。
-    所以这里守住"不再残留任何 @全体 痕迹"。
+    旧结论「@everyone 仅文字子频道可用、群聊不支持」已过时：官方在
+    群聊开放了 <qqbot-at-everyone />（文本 + markdown 都支持），
+    条件是机器人为群管理员、每群每天 1 次。功能按新形态重新加入，
+    但只作用于开播提醒（见 bot._atall_want / atall.py）。
+    这里守住：旧写法不许复活、新标签不许溢出到别的提醒类型。
     """
     import notify as N
     ck("notify 不再有 at_all_text", not hasattr(N, "at_all_text"))
 
     bot = io.open(_os_path("bot.py"), encoding="utf-8").read()
-    ck("bot 不再引用 at_all", "at_all" not in bot)
+    ck("bot 用官方群聊标签而非旧 @everyone",
+       "atall.AT_ALL_TAG" in bot and "@everyone" not in bot)
+    ck("bot 的 @全体 只限开播提醒",
+       'if kind != "live":' in bot and "_atall_want" in bot)
     ck("bot 不再有 /全体 指令", '"全体"' not in bot and "'全体'" not in bot)
 
     db = io.open(_os_path("db.py"), encoding="utf-8").read()
@@ -302,7 +307,8 @@ def t_at_all_feature_removed():
     ck("前端无 data-act 全体", not re.search(r"['\"]全体['\"]", _js))
 
     html = io.open(_os_path("templates/index.html"), encoding="utf-8").read()
-    ck("面板无 @全体 说明", "@全体" not in html)
+    ck("面板 @全体 说明写明官方每日 1 次限制",
+       'id="cAtAllLive"' in html and "每天只能 @ 1 次" in html)
 
     ex = io.open(_os_path("config.example.yaml"), encoding="utf-8").read()
     ck("配置无 at_all_style", "at_all_style" not in ex)
@@ -566,10 +572,17 @@ def t_adaptive_poll_interval():
     b._adapt_interval()
     ck("刚撞完不加速", b.interval >= prev)
 
-    # —— 稳定很久（>5分钟）→ 回最快档 ——
+    # —— 稳定很久（>5分钟）→ 逐步加快，最终回到最快档 ——
+    # ⚠️ 以前这里断言"一轮就跳回 8s"。那正是 8s↔16s 自激振荡的成因：
+    #    8s 刚刚证明撑不住，一步跳回去必然再撞、再退避，周而复始
+    #    （控制台里这两条成对反复出现）。现在改为逐步下探，
+    #    **最终仍然必须能回到最快档** —— 否则一次偶发抖动就把间隔永久锁死。
     bili._risk_at = 0.0          # 清空 → since_risk 返回 1e9
     b._adapt_interval()
-    ck("稳定后回最快档", b.interval == 8)
+    ck("稳定后不一步跳回最快（防 8↔16 回摆）", b.interval != 8)
+    for _ in range(60):
+        b._adapt_interval()
+    ck("稳定足够久后回到最快档", b.interval == 8)
     ck("不再是退避中", not b.interval_info()["backing_off"])
 
     # —— 逐步加快（不是一步到位） ——
@@ -990,12 +1003,17 @@ async def t_top_comment_failure_is_visible():
     # 有置顶动态但没取到评论
     b.bili.dyn_top_id = "TOP1"
     b.bili.top_cmt_id = ""
+    # ⚠️ 上一轮给「没有可取的置顶评论」加了常态冷却（10 分钟内不重复查）。
+    #    不清掉的话这一轮直接 return，note 里还是上一条「没找到置顶动态」，
+    #    断言就变成"验了上一轮的残值"。这里逼它真跑一遍本轮。
+    b._top_cmt_empty_until = {}
     await b._poll_once()
     ck("无评论有提示", "置顶评论" in note())
 
     # /检测 必须包含置顶评论这一项
     b.bili.top_cmt_id = "C9"
     # 指令已移除（v1.21.0），检测改由面板触发，这里直接跑一轮验证
+    b._top_cmt_empty_until = {}
     await b._poll_once()
     ck("检测含置顶评论", "置顶评论" in note())
 
@@ -1324,7 +1342,12 @@ def t_no_command_code_left():
     # 这里要查的是「指令分发函数 _handle 还在不在」，
     # 所以按标识符边界匹配。
     ck("无 _handle 分发", not re.search(r"\b_handle\b", src))
-    ck("无 _cmd_ 指令方法", "_cmd_" not in src)
+    # ⚠️ 不能写成 `"_cmd_" not in src`：任何名字里带 cmd 的新方法
+    #    （_handle_test_cmd / _test_cmd_throttled）都会被这个子串命中，
+    #    明明是新增功能却被当成旧代码残留。要查的是「旧的 _cmd_xxx
+    #    指令方法还在不在」，所以按方法定义匹配。
+    ck("无 _cmd_ 指令方法",
+       not re.search(r"def\s+_cmd_\w*\s*\(", src))
     ck("无 HELP 文本", "HELP_MD" not in src and "HELP = " not in src)
     ck("无权限判定", "_is_allowed" not in src and "_check_perm" not in src)
     ck("无全量消息监听", "on_group_message_create" not in src)

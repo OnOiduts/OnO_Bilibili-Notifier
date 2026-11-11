@@ -86,7 +86,20 @@
 
 html, body { height: 100%; }
 
-
+/* ── 给滚动条预留位置 ──
+   页面高度随页签切换 / 日志加载 / 折叠展开变化，滚动条出现或消失会让
+   视口可用宽度少 9px（宽度见 index.html 里的 ::-webkit-scrollbar），
+   侧边栏、卡片、表格会整体横向跳一下。
+   stable = 不管有没有滚动条，都把这条轨道留出来，宽度恒定、不再跳。
+   ⚠️ 只加在真正会滚的容器上；.tabs 用 display:none 藏了滚动条，
+      本来就零宽度，给它预留反而平白留白。 */
+html { scrollbar-gutter: stable; }
+/* 老浏览器不认 scrollbar-gutter 时退回常驻竖向滚动条，同样不会跳 */
+@supports not (scrollbar-gutter: stable) {
+  html { overflow-y: scroll; }
+}
+/* 面板主体 / 日志列表：内容由少变多时滚动条出现会挤窄内部元素 */
+.sheet-body, .log-list { scrollbar-gutter: stable; }
 
 .bg-deco { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
 .bg-deco .blob {
@@ -336,6 +349,21 @@ html, body { height: 100%; }
 /* 未选中：整块压暗 + 去色，跟"选中"明显是两种状态 */
 .mig-card:not(.on) { opacity: .45; filter: grayscale(.75); }
 .mig-card:not(.on) .mig-kinds { opacity: .8; }
+
+/* 目标群已经订过的条目：划掉 + 更暗，一眼看出"这些不用搬"。
+   ⚠️ 不只是视觉提示 —— 点上去选不中（JS 会拦并提示），
+   cursor 也跟着改成 not-allowed，别让人以为是自己没点准。 */
+.mig-card.dup { border-style: dashed; cursor: not-allowed; }
+.mig-card.dup .t1 { text-decoration: line-through; text-decoration-thickness: 1px; }
+.mig-card.dup:not(.on) { opacity: .38; }
+.mig-card.dup .dup-tag {
+  display: inline-block; margin-left: 7px; padding: 0 6px;
+  font-size: 11px; font-weight: 600; line-height: 17px;
+  border-radius: 999px; vertical-align: middle;
+  color: var(--muted);
+  border: 1px solid color-mix(in srgb, var(--muted) 45%, transparent);
+  text-decoration: none;   /* 别跟着标题一起被划掉 */
+}
 .mig-kinds {
   display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
   margin-top: 2px;

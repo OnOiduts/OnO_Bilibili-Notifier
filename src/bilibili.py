@@ -406,6 +406,8 @@ class BiliClient:
         self._buvid3: str = ""
         self._wbi_key: Optional[tuple] = None   # (img_key, sub_key)
         self._wbi_key_ts: float = 0
+        # 置顶动态 id -> 上次成功命中的 (type, oid)。见 get_pinned_comment。
+        self._cmt_oid_hint: Dict[str, tuple] = {}
 
     # ---------- 基础设施 ----------
     def _headers(self, referer: str = "https://www.bilibili.com/") -> dict:
@@ -442,26 +444,34 @@ class BiliClient:
     # 但也要让自适应轮询放慢（继续猛打只会让对面更超时）。
     TRANSIENT_CODES = (-504, -500, -502, -503)
 
-    # HTTP 状态码：这些先重试再放弃（不含 403，那是明确的拒绝）
-    RETRY_STATUS = (404, 429, 500, 502, 503, 504)
+    # HTTP 状态码：这些先重试再放弃（不含 403，那是明确的拒绝）。
+    # ⚠️ 412 是 B 站 WAF 的临时拦截，和「cookie 不被认可」是两回事：
+    #    以前把它算进 AUTH_STATUS，一次抖动就把面板点成「未生效」。
+    #    现在归到重试 + 风控计数，不再碰认证标记。
+    RETRY_STATUS = (404, 412, 429, 500, 502, 503, 504)
 
     # 登录态 / 权限类：接口明确要求登录，或被 WAF 直接拦下。
     # -352 = 需要登录态；-403 = 访问权限不足（绝大多数也是没登录）。
     AUTH_CODES = (-352, -403)
-    # HTTP 层同理：412 是 B 站 WAF 的经典拦截码，403 是明确的拒绝。
-    AUTH_STATUS = (403, 412)
+    # HTTP 层只有 403 是明确的权限拒绝；412 见上面 RETRY_STATUS。
+    AUTH_STATUS = (403,)
+    # 连续这么多次认证类失败才认定「cookie 真挂了」。单次 -352/-403
+    # 在接口持续抖动时也会出现，立刻判失效会造成「刚扫码却显示未生效」。
+    AUTH_CONFIRM = 3
 
     def _note_auth(self, reason: str = ""):
-        """记一次"登录态失效/被拦"。
+        """记一次"登录态失效/被拦"，**连续确认**才置 auth_bad。
 
         ⚠️ 与 _note_risk 分开：风控放慢就有救，认证放慢没用（得重新登录）。
-        但两者都该让轮询别再加速 —— 否则会一路冲到最快档猛撞墙。
+        但单次 -352/-403 也可能只是风控抖动，不能一次就把面板点成
+        「cookie 不被认可」——那正是「刚扫码却显示未生效」的成因。
         """
         self._auth_hits += 1
         self._auth_at = time.monotonic()
-        self._auth_bad = True
         if reason:
             self._auth_reason = reason
+        if self._auth_hits >= self.AUTH_CONFIRM:
+            self._auth_bad = True
 
     def _clear_auth(self):
         """任一接口正常返回 → 登录态没问题了，解除"取不到"状态。
@@ -469,8 +479,9 @@ class BiliClient:
         不这样做的话，扫码登录成功后轮询还停在最慢档，用户会以为
         "登录了也没变快"。
         """
-        if getattr(self, "_auth_bad", False):
+        if getattr(self, "_auth_bad", False) or self._auth_hits:
             self._auth_bad = False
+            self._auth_hits = 0
             self._auth_at = 0.0
             self._auth_reason = ""
 
@@ -1417,6 +1428,23 @@ class BiliClient:
             pass
         return None
 
+    @staticmethod
+    def _is_no_comment(err: object) -> bool:
+        """评论接口返回「没有这个内容」时是否等价于『没有置顶评论』。
+
+        code=-404 / 啥都木有 是评论接口对「该评论区不存在或没有内容」
+        的正常回答。UP 主没置顶评论、或置顶动态是带图/转发类型导致
+        候选评论区全不命中时，都会走到这里。
+
+        ⚠️ 以前一律抛 BiliError，于是：
+          - 基线对齐把它记成「接口异常」→ 启动宽限永远有 1 位待对齐
+          - 检测每轮打一条 WARNING → 日志刷屏、面板翻译成「UP 主不存在」
+          - 每轮白白重试十几次请求 → 反过来加重 B 站风控
+        它跟 -352 / -412 / 超时完全不同，后者才是真异常，必须继续抛。
+        """
+        s = str(err or "")
+        return ("code=-404" in s or "啥都木有" in s)
+
     async def get_pinned_comment(self, dyn_id: str, uid: int = 0,
                                  rid: str = "", comment_id: str = "",
                                  comment_type: int = 0) -> Optional[dict]:
@@ -1459,10 +1487,28 @@ class BiliClient:
         if not cands:
             return None
 
+        # ⚠️ 必须**锁定上次成功命中的 (type, oid)**，不能每轮从头试。
+        #
+        # 一条动态可能同时存在多个能取到评论的评论区组合：
+        # 带图动态既有 (11, 相簿id) 也有 (17, 动态id)，两者返回的置顶
+        # 评论**不是同一条**。接口一抖动（用户日志里满屏 404 / 超时），
+        # 排在前面的候选就取不到、落到后面那个 —— 于是这一轮拿到评论 A、
+        # 下一轮拿到评论 B，再下一轮又回到 A。
+        #
+        # 表现就是「同一位 UP 主的置顶评论连着推三四次」，而且每次内容
+        # 还不一样，看着像 UP 主一直在换、其实是我们在两个评论区之间漂。
+        # 记住上次成功的组合并优先用它，id 就稳定了。
+        try:
+            hint = (self._cmt_oid_hint or {}).get(str(dyn_id))
+        except Exception:
+            hint = None
+        if hint and hint in cands:
+            cands = [hint] + [c for c in cands if c != hint]
+
         referer = (f"https://space.bilibili.com/{uid}/dynamic"
                    if uid else "https://www.bilibili.com/")
 
-        last_err = None
+        errs = []
         for ctype, oid in cands:
             for sort in (2, 1, 0):     # 2=热度 更容易出置顶
                 try:
@@ -1473,7 +1519,7 @@ class BiliClient:
                         referer=referer,
                     )
                 except BiliError as e:
-                    last_err = e
+                    errs.append(e)
                     continue
                 got = _pick_top_reply(data)
                 if got:
@@ -1490,11 +1536,22 @@ class BiliClient:
                     got["dyn_id"] = jump_id
                     got["oid"] = str(oid)      # 评论区 oid，仅供排查
                     got["ctype"] = int(ctype)
+                    # 记住这次命中的组合，下一轮优先复用（见上面的说明）
+                    try:
+                        self._cmt_oid_hint[str(dyn_id)] = (ctype, oid)
+                    except Exception:
+                        pass
                     return got
 
-        # 全都失败：抛出去让调用方能记录并展示原因
-        if last_err:
-            raise BiliError(str(last_err))
+        # 全都失败：区分「确实没有置顶评论」与「接口真出错」。
+        # 只有**每一个**候选都返回 -404/啥都木有 才算常态 —— 只要混进
+        # 一条 -352 / -412 / 超时，就仍按真异常抛出，不能把风控误判成
+        # 「没有评论」（那样会静默掉一次真实的失败）。
+        if errs:
+            hard = [e for e in errs if not self._is_no_comment(e)]
+            if hard:
+                raise BiliError(str(hard[-1]))
+            return None
         return None
 
 

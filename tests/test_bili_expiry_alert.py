@@ -21,22 +21,26 @@ def check(name, cond, extra=""):
 
 
 # ---------- 分级阈值 ----------
-check("剩 10 天不提醒", B.level_of(10) == B.LEVEL_OK)
-check("剩 6 天不提醒", B.level_of(6) == B.LEVEL_OK)
-check("剩 5 天 UI 提醒", B.level_of(5) == B.LEVEL_UI)
-check("剩 3 天 UI 提醒", B.level_of(3) == B.LEVEL_UI)
-check("剩 2 天 UI 提醒（不是群提醒）", B.level_of(2) == B.LEVEL_UI)
-check("剩 1 天推群", B.level_of(1) == B.LEVEL_QQ)
+# ⚠️ 有效期上限是 7 天（CAP_TTL_DAYS），所以"剩几天"直接对应"第几天"：
+#    剩 6/5/4/3 天 = 第 1~4 天（安静）；剩 2 天 = 第 5 天（UI）；
+#    剩 ≤1 天 = 第 6 天起（推群）。
+check("第 1 天（剩 6 天）不提醒", B.level_of(6) == B.LEVEL_OK)
+check("第 2 天（剩 5 天）不提醒", B.level_of(5) == B.LEVEL_OK)
+check("第 3 天（剩 4 天）不提醒", B.level_of(4) == B.LEVEL_OK)
+check("第 4 天（剩 3 天）不提醒", B.level_of(3) == B.LEVEL_OK)
+check("第 5 天（剩 2 天）UI 提醒", B.level_of(2) == B.LEVEL_UI)
+check("第 6 天（剩 1 天）推群", B.level_of(1) == B.LEVEL_QQ)
 check("剩 0 天推群", B.level_of(0) == B.LEVEL_QQ)
+check("剩 10 天不提醒（没封顶时的旧值）", B.level_of(10) == B.LEVEL_OK)
 check("已过期推群", B.level_of(99, expired=True) == B.LEVEL_QQ)
 check("未知天数不提醒", B.level_of(None) == B.LEVEL_OK)
 
 # ---------- 防重推 ----------
 a = B.ExpiryAlert()
-r1 = a.evaluate(3)
-check("首次 3 天 → UI 档", r1["level"] == B.LEVEL_UI)
+r1 = a.evaluate(2)
+check("首次剩 2 天 → UI 档", r1["level"] == B.LEVEL_UI)
 check("UI 档不推群", r1["need_qq"] is False)
-r2 = a.evaluate(3)
+r2 = a.evaluate(2)
 check("同档重复不再触发", r2["need_qq"] is False)
 
 a2 = B.ExpiryAlert()
@@ -81,7 +85,8 @@ check("毫秒级时间戳能读", abs(ms - (time.time() + 3 * 86400)) < 5, str(m
 check("会话 cookie（expires=-1）读不到",
       BBL._expires_from_cookies([{"name": "SESSDATA", "value": "x",
                                   "expires": -1}]) == 0.0)
-check("读到的剩余天数正确", B.days_left_of(sec)[0] == 2, str(B.days_left_of(sec)))
+# 3 天后到期 → 向上取整应是 3（向下取整会算成 2，把第 4 天误判成第 5 天）
+check("读到的剩余天数向上取整", B.days_left_of(sec)[0] == 3, str(B.days_left_of(sec)))
 
 # ---------- 接入：bot 每轮检查、webui 暴露、前端横幅 ----------
 BOT = open(os.path.join(S, "bot.py"), encoding="utf-8").read()

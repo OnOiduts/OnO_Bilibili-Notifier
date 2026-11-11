@@ -24,6 +24,8 @@ from bilibili import (BiliClient, parse_season_ref, BiliError,
 import base64
 import threading
 
+import atall
+import grouplabel
 import bili_login
 import harden
 import heartbeat
@@ -485,6 +487,19 @@ def index():
 
 
 # ---------------- API ----------------
+def _gname_of(gid: str) -> str:
+    """审计日志/回执里一律用群显示名，不裸露 openid。
+
+    ⚠️ 必须放在所有路由装饰器之前：以前插在 @app.route("/api/state") 下面，
+       Flask 把它注册成了 /api/state 的视图函数，调用时缺 gid 直接 500。
+    """
+    try:
+        return (grouplabel.labels_of(get_store()).get(str(gid))
+                or "未命名群")
+    except Exception:
+        return "未命名群"
+
+
 @app.route("/api/state")
 def api_state():
     cfg = load_cfg()
@@ -493,6 +508,7 @@ def api_state():
     # 这样"开了直播却没提示"时能直接在面板看到是不是接口失败了。
     notes = (heartbeat.read() or {}).get("notes") or {}
     groups = []
+    _labels = grouplabel.labels_of(st)
     for gid, g in st.data["groups"].items():
         if not isinstance(g, dict):
             continue
@@ -559,6 +575,7 @@ def api_state():
             sv["url"] = (f"https://space.bilibili.com/{sv['uid']}/lists/"
                          f"{sv['season_id']}?type=season")
         groups.append({"gid": gid, "name": g.get("name") or "",
+                       "label": _labels.get(str(gid)) or "未命名群",
                        "subs": subs, "seasons": seasons})
 
     # ⚠️ 订阅数由后端统一算好再给前端（去重口径见 Store.sub_stats）。
@@ -579,7 +596,7 @@ def api_state():
             "has_secret": bool(cfg.get("secret")),
             "is_sandbox": bool(cfg.get("is_sandbox", False)),
             "sandbox_group": str(cfg.get("sandbox_group") or ""),
-            "poll_interval": cfg.get("poll_interval", 30),
+            "poll_interval": cfg.get("poll_interval", 12),
             "slow_check_every": cfg.get("slow_check_every", 1),
             "notify_offline": bool(cfg.get("notify_offline", False)),
             "send_image": bool(cfg.get("send_image", True)),
@@ -598,6 +615,10 @@ def api_state():
             "top_comment_only_up": bool(cfg.get("top_comment_only_up", True)),
             "log_translate": bool(cfg.get("log_translate", True)),
             "log_debug": bool(cfg.get("log_debug", False)),
+            # 凡是面板能改的字段 state 必须回，否则 loadState() 会把输入框刷回默认值
+            "at_all_on_live": bool(cfg.get("at_all_on_live", True)),
+            # 面板能改的字段 state 必须回，否则 loadState() 把开关刷回默认值
+            "at_all_merge": bool(cfg.get("at_all_merge", True)),
             # ⚠️「启动后首轮静默」轮数：v2.3.4 新增了保存（/api/config）却漏了
             #    这里回读。后果正是上面那段注释说的假保存 —— 落盘是真落了，
             #    但 /api/state 不带这个键 → 前端拿到 undefined → NaN → 兜回
@@ -626,6 +647,11 @@ def api_state():
             # 机器人不在跑时读不到，前端当作"不提醒"，不显示横幅。
             "bili_expiry": ((heartbeat.read() or {}).get("bili_expiry")
                             or {"level": "ok"}),
+            # 机器人写的「登录态实际失效」：连续 N 次被 B站 拦回。
+            # 与 bili_expiry 是两回事——被风控踢下线时剩余天数可能还有
+            # 179 天，到期提醒永远触发不了，只能靠这个。
+            "bili_auth_bad": ((heartbeat.read() or {}).get("bili_auth_bad")
+                              or {"bad": False}),
         },
         "templates": {**DEFAULT_TEMPLATES, **(cfg.get("templates") or {})},
         # 自定义值单独给，前端才能区分「用户改过」和「用的默认」
@@ -778,6 +804,30 @@ async def _probe_season(uid: int, season_id: int) -> dict:
             "cover": getattr(info, "cover", "") or ""}
 
 
+def _season_owner(uid: int, hint: str = "") -> str:
+    """合集作者的名字，取不到就退回空串。
+
+    只订合集、没订 UP 主时，ups 缓存里不会有这一条，
+    界面上就会显示成一串 uid —— 所以订阅时先把名字记下来。
+    三级：调用方给的（通常是查 UP 主那一步带过来的）
+          → 本地缓存 → 现查一次。全都失败也不阻塞订阅。
+    """
+    owner = str(hint or "").strip()[:64]
+    if owner:
+        return owner
+    try:
+        owner = str((get_store().get_up(uid) or {}).get("uname") or "")
+    except Exception:
+        owner = ""
+    if owner:
+        return owner
+    try:
+        owner = str(run_async(_fetch_up(uid)).get("uname") or "")
+    except Exception:
+        owner = ""
+    return owner
+
+
 async def _fetch_up(uid: int) -> dict:
     c = bili_client()
     try:
@@ -819,7 +869,7 @@ def api_sub_add():
         default_on = k in DEFAULT_KINDS
         st.set_sub(gid, uid, k, bool(d.get("kinds", {}).get(k, default_on)),
                    uname)
-    AUDIT.log("添加订阅", client_ip(), f"{gid} uid={uid} {uname}", "info")
+    AUDIT.log("添加订阅", client_ip(), f"{_gname_of(gid)} uid={uid} {uname}", "info")
     return jsonify({"ok": True, "msg": f"已添加 {uname}"})
 
 
@@ -835,6 +885,61 @@ def api_sub_set():
     st = get_store()
     st.set_sub(gid, uid, kind, bool(d.get("on")))
     return jsonify({"ok": True})
+
+
+@app.route("/api/season/lookup", methods=["POST"])
+def api_season_lookup():
+    """先看一眼合集是什么，再决定要不要订。
+
+    用户以前只能「填 uid + 填 ID → 直接订阅」，于是出现
+    **uid 填 A、合集链接填 B** 也能成功 —— 库里记着 A 的名字、
+    却装着 B 的合集，界面上看着就是「写着 A 的名字有着 B 的合集」。
+    根因是作者 uid 有两处来源（手填的框 + 链接里解析出来的），
+    而旧代码取的是手填的那个。
+
+    现在只认一处：**链接里解析出来的作者优先**；纯数字 ID 没有作者，
+    才退回调用方给的 uid（一般是上面刚查过的那位 UP 主）。
+    查完把「合集标题 + 作者名 + 视频数」回给前端确认，
+    确认过了才会写库 —— 不再是"填完就进库"。
+    """
+    d = request.json or {}
+    ref = str(d.get("ref") or "").strip()
+    if not ref:
+        return jsonify({"ok": False, "msg": "先填合集链接或合集 ID"})
+    p_uid, p_sid = parse_season_ref(ref)
+    if not p_sid:
+        return jsonify({"ok": False, "msg":
+                        "没认出合集 ID。要 ...?type=season 那种合集链接，"
+                        "「视频列表」订阅不了"})
+    uid_raw = str(d.get("uid") or "").strip()
+    try:
+        hint_uid = validate_uid(uid_raw) if uid_raw else 0
+    except ValueError:
+        hint_uid = 0
+    uid = int(p_uid or hint_uid or 0)
+    if not uid:
+        return jsonify({"ok": False, "msg":
+                        "只填合集 ID 认不出它属于谁 —— 请粘贴完整合集链接"
+                        "（space.bilibili.com/UID/lists/合集ID?type=season）"})
+    try:
+        probed = run_async(_probe_season(uid, p_sid))
+    except Exception as e:
+        return jsonify({"ok": False, "msg":
+                        f"查不到这个合集（{redact(str(e))[:120]}）。"
+                        f"确认一下：链接要是 ...?type=season 的合集，"
+                        f"不是「视频列表」"})
+    return jsonify({
+        "ok": True,
+        "uid": uid,
+        "season_id": p_sid,
+        "title": str(probed.get("title") or ""),
+        "total": int(probed.get("total") or 0),
+        "cover": str(probed.get("cover") or ""),
+        "uname": _season_owner(uid, str(d.get("uname") or "")),
+        # 手填的 uid 和链接里的对不上时告诉前端一声，别默默改掉
+        "owner_fixed": bool(p_uid and hint_uid and p_uid != hint_uid),
+        "from_link": bool(p_uid),
+    })
 
 
 @app.route("/api/season/add", methods=["POST"])
@@ -854,15 +959,20 @@ def api_season_add():
     uid_raw = str(d.get("uid") or "").strip()
     ref = str(d.get("ref") or "").strip()     # 链接或 season_id
     try:
-        uid = validate_uid(uid_raw) if uid_raw else 0
+        hint_uid = validate_uid(uid_raw) if uid_raw else 0
     except ValueError as e:
         return jsonify({"ok": False, "msg": str(e)})
 
     p_uid, p_sid = parse_season_ref(ref)
-    uid = int(uid or p_uid or 0)
+    # ⚠️ 作者以**链接里解析出来的为准**，手填的只当补充。
+    # 以前写成 uid or p_uid（手填优先），于是 uid 填 A、链接是 B 的合集
+    # 也能成功入库 —— 记着 A 的名字却装着 B 的合集，界面上看着就是
+    # 「写着 A 的名字有着 B 的合集」，而用户对不上号很难排查。
+    uid = int(p_uid or hint_uid or 0)
     season_id = int(p_sid or 0)
     if not uid:
-        return jsonify({"ok": False, "msg": "还需要填 UP 主的 UID"})
+        return jsonify({"ok": False, "msg":
+                        "认不出这个合集属于谁 —— 请粘贴完整合集链接"})
     if not season_id:
         return jsonify({"ok": False, "msg": "没认出合集 ID，请粘贴合集链接或填数字"})
 
@@ -879,17 +989,7 @@ def api_season_add():
     st = get_store()
     # 订阅时就把 UP 主名字记下来：只订合集、没订 UP 主的情况下，
     # ups 缓存里不会有这一条，界面上就会显示成 uid。
-    _owner = str(d.get("uname") or "").strip()[:64]
-    if not _owner:
-        try:
-            _owner = str((st.get_up(uid) or {}).get("uname") or "")
-        except Exception:
-            _owner = ""
-    if not _owner:
-        try:
-            _owner = str(run_async(_fetch_up(uid)).get("uname") or "")
-        except Exception:
-            _owner = ""
+    _owner = _season_owner(uid, str(d.get("uname") or ""))
     try:
         st.add_season(gid, uid, season_id,
                       str(d.get("title") or probed.get("title") or ""),
@@ -898,7 +998,7 @@ def api_season_add():
     except Exception as e:
         return jsonify({"ok": False, "msg": f"添加失败：{redact(str(e))}"})
     try:
-        AUDIT.log("订阅合集", client_ip(), f"{gid[:8]} {season_id}", "info")
+        AUDIT.log("订阅合集", client_ip(), f"{_gname_of(gid)} {season_id}", "info")
     except Exception:
         pass
     return jsonify({"ok": True, "msg": f"已订阅合集 {season_id}（静默记录基线，不补推历史）"})
@@ -1141,7 +1241,7 @@ def api_sub_remove():
         return jsonify({"ok": False, "msg": str(e)})
     st = get_store()
     st.remove_up(gid, uid)
-    AUDIT.log("删除订阅", client_ip(), f"{gid} uid={uid}", "info")
+    AUDIT.log("删除订阅", client_ip(), f"{_gname_of(gid)} uid={uid}", "info")
     return jsonify({"ok": True})
 
 
@@ -1248,6 +1348,20 @@ def _backfill_season_names(st, limit: int = 8) -> int:
 
 
 @app.route("/api/group/refresh-names", methods=["POST"])
+def _mark_test_at_used(gid: str) -> None:
+    """测试推送真的把带标签的消息发出去了 → 同步占掉当天额度。
+
+    ⚠️ 平台侧「每群每天 1 次」是全局的：测试烧掉之后，正式开播若还
+       以为有额度就会再撞一次墙、日志多一条「@全体未生效」。两份进程
+       共用同一个 at_all_quota.json（每次读写都重新 load、原子替换，
+       写的是同一个当天日期，覆盖也无害）。
+    """
+    try:
+        atall.AtAllQuota().mark_used(gid)
+    except Exception:
+        pass
+
+
 def api_group_refresh_names():
     """向官方批量查询群名并保存。
 
@@ -1324,6 +1438,14 @@ def api_group_refresh_names():
         return _updated, _denied, _failed, _removed, _detail
 
     updated, denied, failed, removed, detail = run_async(_run())
+    # ⚠️ 回执里给前端一个可读的群显示名，前端不再拼 8 位 openid。
+    try:
+        _dl = grouplabel.labels_of(st)
+    except Exception:
+        _dl = {}
+    for _it in detail:
+        if isinstance(_it, dict) and _it.get("gid"):
+            _it["label"] = _dl.get(str(_it["gid"])) or "未命名群"
 
     # 顺带把「合集显示成 uid」的旧数据补上 UP 主名字。
     # 以前订阅合集时没记名字，ups 缓存里也没有，界面就显示数字。
@@ -1358,7 +1480,7 @@ def api_group_add():
         return jsonify({"ok": False, "msg": str(e)})
     st = get_store()
     st.ensure_group(gid, str(d.get("name") or "").strip()[:40])
-    AUDIT.log("登记新群", client_ip(), gid[:20], "info")
+    AUDIT.log("登记新群", client_ip(), _gname_of(gid), "info")
     return jsonify({"ok": True})
 
 
@@ -1376,7 +1498,7 @@ def api_group_remove():
         gone = st.remove_group(gid) or {}
     except Exception as e:
         return jsonify({"ok": False, "msg": f"移除失败：{redact(str(e))}"})
-    AUDIT.log("移除群", client_ip(), gid[:20], "warn")
+    AUDIT.log("移除群", client_ip(), _gname_of(gid), "warn")
     return jsonify({"ok": True, "msg": f"已移除（订阅 {gone.get('subs', 0)} 条、"
                                        f"文案 {gone.get('tpl', 0)} 条）"})
 
@@ -1449,6 +1571,13 @@ def api_config():
     for key in ("is_sandbox", "notify_offline", "send_image"):
         cfg[key] = bool(d.get(key, cfg.get(key, False)))
 
+    # 开播提醒 @全体成员（官方群聊能力：每群每天 1 次、需群管理员）。
+    # 只对 kind == "live" 生效，见 bot._atall_want。
+    if "at_all_on_live" in d:
+        cfg["at_all_on_live"] = bool(d.get("at_all_on_live"))
+    if "at_all_merge" in d:
+        cfg["at_all_merge"] = bool(d.get("at_all_merge"))
+
     # 中文翻译 / 输出调试日志：
     # ⚠️ 面板上以前**没有入口**（"缺少日志翻译功能"），现在补成真实配置项。
     #   log_translate → /api/log 决定要不要把英文术语翻成中文
@@ -1496,11 +1625,21 @@ def api_config():
         if _m:
             cfg["selfcheck_uid"] = _m.group(0)[:16]
 
-    # 最小请求间隔 / 轮询上限：真实生效（bot.py 在读），
+    # 最小请求间隔 / 轮询上限 / 最快档：真实生效（bot.py 在读），
     # ⚠️ 但以前面板没有输入框、白名单也不收 —— 只能手改 yaml。现在补上。
     try:
         cfg["min_request_interval"] = min(30.0, max(0.0, float(d.get(
             "min_request_interval", cfg.get("min_request_interval", 2.0)))))
+    except (TypeError, ValueError):
+        pass
+    # ⚠️「最快档」必须**先于** poll_interval_max / poll_interval 处理：
+    #    下面两处都拿 _pmin 当地板，写完这里才能保证 min ≤ base ≤ max，
+    #    不会留下「最快档 20、基线还是 12」这种语义反了的配置。
+    #    下界 3 与 bot.py 的 max(3, ...) 对齐，上界与轮询上限同取 3600。
+    try:
+        _raw_min = int(d.get("poll_interval_min",
+                             cfg.get("poll_interval_min", 8)))
+        cfg["poll_interval_min"] = min(3600, max(3, _raw_min))
     except (TypeError, ValueError):
         pass
     try:
@@ -1833,18 +1972,53 @@ def api_test():
     except Exception:
         n_img = 0
     keyboard = build_keyboard(buttons)
+    # ⚠️「测试」以前完全不走 @全体 逻辑（直接 send_markdown），所以点测试
+    #   按钮永远看不到 @，用户会以为功能是坏的。现在给一个显式开关。
+    #   和正式推送一样：默认把 @ 合并进同一张卡片；关掉「合并进卡片」时
+    #   才退回「单独一条纯文本」。测试真的带标签发出去后，会同步占掉
+    #   机器人侧的当天额度（见 _mark_test_at_used），避免正式开播白撞一次。
+    at_all = (d.get("at_all") is True and kind == "live")
+    merge_at = bool(at_all and cfg.get("at_all_merge", True))
+    at_note = ""
     qq = QQClient(cfg["appid"], cfg["secret"], sandbox=bool(cfg.get("is_sandbox")))
     try:
+        if at_all and not merge_at:
+            probe = (atall.AT_ALL_TAG + "\n"
+                     "【🧪 测试】开播提醒 @全体成员生效检查")
+            try:
+                run_async(qq.send_text(gid, probe))
+                _mark_test_at_used(gid)
+                at_note = ("；已另发一条带 @全体 的纯文本（平台侧该群今天唯一 "
+                           "1 次额度已用于本次测试，正式开播再尝试会被拒并"
+                           "自动降级，不会丢卡片）")
+            except Exception as e_at:
+                at_note = ("；@全体未生效（" + redact(str(e_at))[:80]
+                           + "）——多半是机器人不是该群管理员，或今天额度已用")
         # ⚠️ 图片随卡片一起走（内嵌），这里只发这一条 markdown。
         #    不要再加 send_image 单独发图 —— 那样卡片会被 strip_images
         #    剥成没图的样子，群里多出一条孤零零的图。
-        run_async(qq.send_markdown(gid, md, keyboard=keyboard))
+        md_body = (atall.AT_ALL_TAG + "\n" + md) if merge_at else md
+        try:
+            run_async(qq.send_markdown(gid, md_body, keyboard=keyboard))
+            if merge_at:
+                _mark_test_at_used(gid)
+                at_note = ("；@全体已合并进这张卡片（平台侧该群今天唯一 1 次"
+                           "额度已用于本次测试）。若群里显示的是普通文字而非"
+                           "高亮 @，关掉设置里「@全体 合并进卡片」即可回到"
+                           "已验证生效的双消息模式")
+        except Exception as e_md:
+            if not merge_at:
+                raise
+            # 带标签那条被拒：去掉标签重发同一张卡片，测试不白跑
+            at_note = ("；@全体未生效（" + redact(str(e_md))[:80]
+                       + "），已去掉 @全体重发同一张卡片")
+            run_async(qq.send_markdown(gid, md, keyboard=keyboard))
     except Exception as e:
         return jsonify({"ok": False, "msg": f"发送失败：{redact(str(e))}"})
     finally:
         run_async(qq.close())
     AUDIT.log("测试推送", client_ip(),
-              f"{gid} {PUSH_KIND_LABEL.get(kind, kind)}", "info")
+              f"{_gname_of(gid)} {PUSH_KIND_LABEL.get(kind, kind)}", "info")
     # ⚠️ 图片行也写进运行日志：面板上的「上次发送详情」有可能被忽略，
     #    而"后台看不到"是用户的原话。写进日志后，运行日志页同样查得到，
     #    且会走日志翻译（群代码→群名等）。
@@ -1856,7 +2030,7 @@ def api_test():
             "msg": (f"已发送，但没取到真实数据（{real_err}），"
                     f"发的是占位内容——占位内容本身没有封面和配图。"
                     f"需要看真实图的话，确认测试 UID 和 B站 cookie 有效"
-                    f"（自检页能取到东西即可）。"),
+                    f"（自检页能取到东西即可）。" + at_note),
             "src": "demo", "real": False, "imgs": n_img,
             "img_lines": _ilines})
     src = "real" if (use_real and real_ok) else "demo"
@@ -1871,7 +2045,7 @@ def api_test():
         # 或者封面被安全白名单挡了 —— 说清楚，别让用户以为功能坏了。
         hint += "，但这条内容本身没带封面/配图"
     return jsonify({"ok": True,
-                    "msg": f"测试消息已发送{hint}，去看群里有没有",
+                    "msg": f"测试消息已发送{hint}，去看群里有没有" + at_note,
                     "src": src, "real": bool(use_real and real_ok),
                     "imgs": n_img, "img_lines": _ilines})
 
@@ -2187,7 +2361,7 @@ def api_media_test_upload():
                 pass
         finally:
             run_async(qq.close())
-        AUDIT.log("测试上传", client_ip(), f"{gid} 图片 {len(data)}B", "info")
+        AUDIT.log("测试上传", client_ip(), f"{_gname_of(gid)} 图片 {len(data)}B", "info")
         return jsonify({"ok": True,
                         "msg": "已向沙盒群发送一张测试图，去看群里有没有",
                         "file_info": fi[:40] + ("…" if len(fi) > 40 else ""),
@@ -2271,14 +2445,14 @@ def api_runstate():
     stt = heartbeat.status()
     poll = hb.get("poll") if isinstance(hb.get("poll"), dict) else {}
     # 实际间隔优先用机器人每轮上报的值，拿不到才回配置里的基线值
-    cur = poll.get("current") or cfg.get("poll_interval", 30)
-    base = poll.get("base") or cfg.get("poll_interval", 30)
+    cur = poll.get("current") or cfg.get("poll_interval", 12)
+    base = poll.get("base") or cfg.get("poll_interval", 12)
     mn = poll.get("min") or cfg.get("poll_interval_min", 8)
     mx = poll.get("max") or cfg.get("poll_interval_max", 120)
     try:
         cur, base, mn, mx = int(cur), int(base), int(mn), int(mx)
     except Exception:
-        cur, base, mn, mx = 30, 30, 8, 120
+        cur, base, mn, mx = 12, 12, 8, 120
     started = 0.0
     try:
         started = float(hb.get("started_at") or 0)
@@ -2515,6 +2689,11 @@ _blogin = {"running": False, "done": False, "ok": False, "stage": "",
            "msg": "", "epoch": 0, "started_at": 0.0, "cancel": False,
            "timeout": 180}
 
+# 续期任务状态（跟浏览器登录同一套模式：后台线程 + 前端轮询）。
+_brefresh = {"running": False, "done": False, "ok": False, "stage": "",
+             "msg": "", "epoch": 0, "started_at": 0.0, "timeout": 180,
+             "via": "", "changed": False}
+
 
 def _epoch_ok(state: dict, mine: int) -> bool:
     """旧线程用：自己的世代号还是最新的吗。"""
@@ -2568,7 +2747,7 @@ def _run_browser_login(epoch: int):
 
     # 浏览器给的过期时间只作备选：SESSDATA 里那个才是 B 站自己写的准信儿
     exp, _est = bili_login.effective_expires(
-        cs, float(res.get("expires") or 0))
+        cs, float(res.get("expires") or 0), time.time())
     cfg = load_cfg()
     cfg["bili_cookie"] = cs
     cfg["bili_cookie_ts"] = time.time()
@@ -2728,7 +2907,8 @@ def api_bili_cookie():
     # 旧版留下的 30 天估算，那样面板会一直显示"还剩 29 天"却永远不动。
     # 解到的真值回写一份，之后离线也能用。
     exp, estimated = bili_login.effective_expires(
-        cookie, float(cfg.get("bili_cookie_expires") or 0))
+        cookie, float(cfg.get("bili_cookie_expires") or 0),
+        float(cfg.get("bili_cookie_ts") or 0))
     if exp > 0 and abs(exp - float(cfg.get("bili_cookie_expires") or 0)) > 60:
         try:
             cfg["bili_cookie_expires"] = exp
@@ -2782,22 +2962,235 @@ def api_bili_cookie():
     })
 
 
+def _run_refresh(epoch: int, ip: str = ""):
+    """后台跑续期。
+
+    ⚠️ 为什么必须放后台：第二条路要开 playwright 启浏览器、等页面加载，
+       动辄几十秒甚至一两分钟（首次还要下浏览器内核）。以前这段是塞在
+       HTTP 请求里同步跑的，前端 30 秒一到就 abort —— 于是用户只看到
+       「请求超时——面板这会儿没响应，等几秒再试」，而后台其实还在跑，
+       最后换没换到也不知道。现在改成后台任务 + 前端轮询进度。
+    """
+    def stage(t):
+        if _epoch_ok(_brefresh, epoch):
+            _brefresh["stage"] = str(t or "")
+
+    def finish(**kw):
+        if _epoch_ok(_brefresh, epoch):
+            _brefresh.update(running=False, done=True, **kw)
+
+    try:
+        cfg = load_cfg()
+        cookie = str(cfg.get("bili_cookie") or "")
+        if not cookie:
+            finish(ok=False, msg="还没有 cookie，请用「🌐 浏览器登录」登录一次")
+            return
+        stage("正在用接口续期…")
+        res = run_async(bili_login.renew_cookie(cookie, on_stage=stage)) or {}
+        if not res.get("ok"):
+            finish(ok=False, msg=res.get("msg") or "续期失败")
+            return
+        new_cs = str(res.get("cookie") or "")
+        if not new_cs:
+            finish(ok=False, msg="没拿到新 cookie")
+            return
+        # ⚠️ 换来的一律先向 B站 求证：它说不认，就保留原来那串不动。
+        #    直接覆盖的后果是"好 cookie 被换成残的"——面板照样显示已登录，
+        #    接口却一直 -352，那种最难排查。
+        stage("正在向 B 站确认新 cookie…")
+        try:
+            acc = run_async(bili_login.account_info(new_cs)) or {}
+        except Exception:
+            acc = {}
+        st, why = _bili_login_state(new_cs, acc)
+        if st == "invalid":
+            finish(ok=False,
+                   msg=f"换到了新 cookie，但 B 站说它无效（{why}），原来的没动。"
+                       "请用「🌐 浏览器登录」重新登录一次。")
+            return
+        cfg = load_cfg()
+        old_ts = float(cfg.get("bili_cookie_ts") or 0)
+        old_exp = float(cfg.get("bili_cookie_expires") or 0)
+        changed = bool(res.get("changed"))
+        cfg["bili_cookie"] = new_cs
+        est = False
+        if changed:
+            # 只有真的换到新 SESSDATA，才从这一刻重新起算 7 天。
+            cfg["bili_cookie_ts"] = time.time()
+            _exp, est = bili_login.effective_expires(
+                new_cs, float(res.get("expires") or 0), time.time())
+            cfg["bili_cookie_expires"] = _exp
+        else:
+            # ⚠️ 没换到时**保留原登录时刻**，宁可早提醒。
+            #    原来这里无条件写 now()，等于把本地提醒计时偷偷往后推 7 天：
+            #    B 站明天就把旧会话踢了，面板还显示「还剩 7 天」，
+            #    第 5/6 天那两条提醒反而来晚了。
+            if old_exp > 0:
+                cfg["bili_cookie_expires"] = bili_login.apply_cap(old_exp, old_ts)
+        save_cfg(cfg)
+        try:
+            AUDIT.log("B站cookie续期", ip or "",
+                      "换到新cookie=%s" % changed, "info")
+        except Exception:
+            pass
+        via = res.get("via") or ""
+        if changed:
+            msg = ("已用浏览器换到新 cookie，有效期重新计算" if via == "browser"
+                   else "已续期，有效期重新计算")
+        else:
+            msg = ("登录态确认有效，但这会儿 B 站没给新的（还没到它换的时机）；"
+                   "有效期仍按原登录时刻计算，到期提醒不会延后")
+        if est:
+            msg += "（读不到明确到期时间，按 7 天估算）"
+        finish(ok=True, msg=msg, via=via, changed=changed)
+    except Exception as e:
+        finish(ok=False, msg=f"续期出错：{type(e).__name__}: {e}")
+
+
+def _start_refresh(ip: str = "", reason: str = "manual") -> dict:
+    """拉起一次续期（后台线程 + 看门狗）。手动点按钮和自动触发共用这一套。
+
+    ⚠️ 抽成函数而不是只在路由里写：到期提醒触发时要自动跑一次，
+       它不走 HTTP —— 那样得处理端口文件、CSRF 头、面板口令三条会坏的路。
+       面板进程自己就能读到同一份 config.yaml，直接调这里最稳。
+    """
+    if _brefresh.get("running"):
+        return {"ok": True, "already": True,
+                "msg": "已经在续期中，请看下面的进度"}
+    epoch = int(_brefresh.get("epoch") or 0) + 1
+    _brefresh.update(running=True, done=False, ok=False, stage="准备中…",
+                     msg="", epoch=epoch, started_at=time.time(),
+                     via="", changed=False)
+    threading.Thread(target=_run_refresh, args=(epoch, ip),
+                     daemon=True).start()
+
+    def watchdog(ep):
+        total = int(_brefresh.get("timeout") or 180) + 90
+        for _ in range(total):
+            time.sleep(1)
+            if _brefresh.get("epoch") != ep or not _brefresh.get("running"):
+                return
+        if _brefresh.get("epoch") == ep and _brefresh.get("running"):
+            _brefresh.update(done=True, ok=False, running=False,
+                             msg="续期超时（浏览器可能没启动起来）。"
+                                 "可用「🌐 浏览器登录」重新登录一次。")
+    threading.Thread(target=watchdog, args=(epoch,), daemon=True).start()
+    try:
+        AUDIT.log("B站cookie续期开始", ip or "-",
+                  "触发方式=%s" % reason, "info")
+    except Exception:
+        pass
+    return {"ok": True, "started": True, "msg": "已开始续期"}
+
+
 @app.route("/api/bili/refresh", methods=["POST"])
 def api_bili_refresh():
-    """续期：拿旧 cookie 换新的，有效期重新计算。"""
-    cfg = load_cfg()
+    """启动续期（后台跑，立即返回）。
+
+    两条路：先走 passport 接口（快），换不动就开浏览器让 B 站自己换
+    （真实浏览器环境里成功率高得多）。所以点一下就该真换到新 cookie，
+    而不是弹个「续期失败：请求错误」就完了。
+    """
+    # ⚠️ ip 要在主线程取：Flask 的 request 是线程局部的，后台线程里
+    #    调 client_ip() 会拿不到请求上下文。
+    ip = ""
+    try:
+        ip = client_ip()
+    except Exception:
+        pass
+    return jsonify(_start_refresh(ip, "manual"))
+
+
+# ── 到期提醒触发时自动续期一次 ──────────────────────────────────────
+# 面板与机器人是 start.py 拉起的两个独立子进程。放在面板这边的原因：
+# 续期后台任务本来就跑在这个进程里，config.yaml 也是同一份，
+# 不需要跨进程通信，也不受面板口令/CSRF 头影响。
+_AUTO_RENEW_INTERVAL = 60.0
+_auto_renew = {"alert": None, "gate": None, "last": ""}
+
+
+def _auto_renew_tick(cfg: dict, now: float = None) -> dict:
+    """算一次到期等级，决定要不要自动跑一次续期。纯逻辑，便于真值测试。
+
+    返回 {"fired","level","days_left","expired","reason"}
+    """
+    import bili_expiry_alert as EA
+    now = time.time() if now is None else now
+    gate = _auto_renew.get("gate")
+    alert = _auto_renew.get("alert")
+    if gate is None or alert is None:
+        return {"fired": False, "level": EA.LEVEL_OK, "reason": "未初始化"}
     cookie = str(cfg.get("bili_cookie") or "")
-    if not cookie:
-        return jsonify({"ok": False, "msg": "还没有 cookie"})
-    res = run_async(bili_login.refresh_cookie(cookie))
-    if not res.get("ok"):
-        return jsonify(res)
-    cfg["bili_cookie"] = res["cookie"]
-    cfg["bili_cookie_ts"] = time.time()
-    cfg["bili_cookie_expires"] = res.get("expires", 0)
-    save_cfg(cfg)
-    AUDIT.log("B站cookie续期", client_ip(), "", "info")
-    return jsonify({"ok": True, "msg": "已续期，有效期重新计算"})
+    if "SESSDATA=" not in cookie:
+        gate.reset()
+        return {"fired": False, "level": EA.LEVEL_OK, "reason": "未登录"}
+    exp, _est = bili_login.effective_expires(
+        cookie, float(cfg.get("bili_cookie_expires") or 0),
+        float(cfg.get("bili_cookie_ts") or 0))
+    days, expired = EA.days_left_of(exp, now=now)
+    lv = alert.evaluate(days, expired).get("level")
+    fired = gate.evaluate(lv, now=now)
+    return {"fired": fired, "level": lv, "days_left": days,
+            "expired": bool(expired),
+            "reason": "到期提醒触发" if fired else ""}
+
+
+def _start_auto_renew_thread():
+    """拉起自动续期线程。单独成函数，测试才能真检查它挂没挂上。"""
+    t = threading.Thread(target=_auto_renew_loop, daemon=True)
+    t.start()
+    return t
+
+
+def _auto_renew_loop():
+    """面板常驻线程：提醒一旦触发，自动在后台跑一次续期。"""
+    import bili_expiry_alert as EA
+    _auto_renew["alert"] = EA.ExpiryAlert()
+    _auto_renew["gate"] = EA.AutoRefreshGate()
+    while True:
+        try:
+            r = _auto_renew_tick(load_cfg())
+            if r.get("fired"):
+                out = _start_refresh("", "auto:expiry-reminder")
+                gate = _auto_renew["gate"]
+                if out.get("ok"):
+                    gate.mark_done()
+                    _auto_renew["last"] = (
+                        "到期提醒触发，已自动开始续期（%s）"
+                        % ("已有任务在跑" if out.get("already") else "后台执行中"))
+                else:
+                    gate.mark_failed()
+                    _auto_renew["last"] = "自动续期未能启动，10 分钟后再试"
+                try:
+                    AUDIT.log("B站cookie自动续期", "-",
+                              _auto_renew["last"], "info")
+                except Exception:
+                    pass
+        except Exception as e:
+            _auto_renew["last"] = "自动续期检查异常：%s: %s" % (type(e).__name__, e)
+        time.sleep(_AUTO_RENEW_INTERVAL)
+
+
+@app.route("/api/bili/refresh/status")
+def api_bili_refresh_status():
+    """续期进度。前端每 2 秒查一次。"""
+    _st = float(_brefresh.get("started_at") or time.time())
+    waited = int(time.time() - _st)
+    timeout = int(_brefresh.get("timeout") or 180)
+    return jsonify({
+        "ok": True,
+        "running": bool(_brefresh.get("running")),
+        "done": bool(_brefresh.get("done")),
+        "success": bool(_brefresh.get("ok")),
+        "stage": _brefresh.get("stage", ""),
+        "msg": _brefresh.get("msg", ""),
+        "via": _brefresh.get("via", ""),
+        "changed": bool(_brefresh.get("changed")),
+        "waited": waited,
+        "timeout": timeout,
+        "remaining": max(0, timeout - waited),
+        "auto": _auto_renew.get("last", ""),
+    })
 
 
 @app.route("/api/bili/cookie", methods=["POST"])
@@ -2836,7 +3229,7 @@ def api_bili_cookie_save():
     # 过期时间先从 SESSDATA 里解真值（大多数情况下解得到），
     # 解不到才退回 30 天估算 —— 以前这里一律写 30 天，于是面板永远
     # 显示"还剩 29 天"，到期提醒也就永远进不了 2~5 天那个区间。
-    _exp, _est = bili_login.effective_expires(cs, 0.0)
+    _exp, _est = bili_login.effective_expires(cs, 0.0, time.time())
     cfg["bili_cookie_expires"] = _exp
     save_cfg(cfg)
     AUDIT.log("手动填写B站cookie", client_ip(), "", "info")
@@ -2952,19 +3345,16 @@ def api_templates():
 
 
 def _group_name_map():
-    """gid 前缀 → 面板里保存的群名。
+    """gid 前缀 → 群显示名（含「未命名群 N」）。
 
-    日志写的是 `→ 群 6FBBD9B5…`（只取前 8 位，方便排版），
-    对用户就是一串认不出来的十六进制。这里换成自己登记的群名。
+    机器人现在直接把群名写进日志，这里主要兼容**旧日志文件**里
+    残存的 `→ 群 6FBBD9B5…` 8 位前缀，一样换成可读名字。
     """
     out = {}
     try:
-        st = get_store()
-        for gid, info in (st.data.get("groups") or {}).items():
-            info = info if isinstance(info, dict) else {}
-            name = (info.get("name") or "").strip()
-            if gid and name:
-                out[str(gid)[:8]] = name
+        for gid, lab in grouplabel.labels_of(get_store()).items():
+            if gid:
+                out[str(gid)[:8]] = lab
     except Exception:
         pass
     return out
@@ -3354,6 +3744,8 @@ def _bl_list(st, uid, kind, field):
         out.append({
             "gid": gid,
             "name": g.get("name") or "",
+            "label": grouplabel.group_label(
+                gid, g.get("name"), (st.data.get("groups") or {}).keys()),
             "value": "" if val is None else str(val),
         })
     return out
@@ -4299,6 +4691,9 @@ def main():
     if str(cfg.get("web_password") or ""):
         print("访问需要口令（登录失败会被限流锁定）")
     AUDIT.log("面板启动", "-", f"host={host} port={args.port}", "info")
+    # 到期提醒触发时自动续期一次。放这里而不是模块导入时：
+    # 测试/工具 import webui 时不应该悄悄起一个常驻线程。
+    _start_auto_renew_thread()
     app.run(host=host, port=args.port, debug=False)
 
 

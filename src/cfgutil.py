@@ -6,8 +6,6 @@ import subprocess
 import sys
 import re
 
-import yaml
-
 import paths
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +26,9 @@ def load_cfg() -> dict:
     cfg = {}
     if os.path.exists(path):
         try:
+            # 惰性导入：缺 PyYAML 时 start.py 仍能加载，
+            # ensure_deps() 才有机会把依赖自动装上。
+            import yaml
             with open(path, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
         except Exception:

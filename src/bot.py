@@ -20,6 +20,8 @@ import botpy
 import yaml
 from botpy import logging
 
+import atall
+import grouplabel
 import heartbeat
 import version as _version
 from cfgutil import safe_print, safe_stdio
@@ -32,17 +34,37 @@ from db import DYN_SEEN_KEEP, KIND_LABEL, Store
 import db as db          # 数据路径统一入口（data_path_from_cfg）
 import paths
 
+# 「最近推过的置顶评论」保留几条。接口抖动会让评论区在两个之间漂，
+# 记住最近这几条就能挡住来回重复推；真换了新评论时不在这个列表里。
+TOP_CMT_SEEN_KEEP = 5
+
 # Windows 中文控制台是 GBK，直接 print emoji 会 UnicodeEncodeError 崩溃。
 # safe_stdio 把输出流放宽，safe_print 在控制台上把 emoji 换成 ASCII 标记。
 safe_stdio()
 
 _log = logging.get_logger()
 
+# 基线对齐暂缓的时长（秒）。见 _init_baseline 的说明：
+# UP 主确实没有这类内容时（没直播间/没投稿/没置顶评论），不能每轮都
+# 白发一遍请求、还打一行"已静默对齐"的假日志。
+BL_PENDING_TTL = 600.0      # 确实没内容：10 分钟后再试
+BL_PENDING_TTL_ERR = 120.0  # 接口异常：2 分钟后重试
+# 检测侧「没有置顶动态/没有可取的置顶评论」的常态冷却（秒）。
+# 与基线侧 BL_PENDING_TTL 保持一致：别每 8 秒就重发十几个评论请求。
+TOP_CMT_EMPTY_TTL = 600.0
+
 # 登录态失效期间把轮询固定住的档位（秒）。
 # ⚠️ 认证类失败（-352/-403/HTTP 412）不是"我们太猛"，放慢到上限没意义，
 #    但也不能照常加速 —— 否则会在持续失败时一路冲到最快档猛撞墙。
 #    这里取一个温和的中间档：比基线略慢，又不至于恢复后要爬很久。
 AUTH_HOLD_INTERVAL = 30
+
+# 撞过风控之后，要平安多久（秒）才允许忘掉"哪一档撑不住"、重新往下试探。
+#
+# ⚠️ 没有这个"遗忘"机制会走向另一个极端：一次偶然抖动就把间隔永久锁死在
+#    退避档，再也快不回去，明明稳了也一直慢。给一个明显长于回稳时间
+#    （300s）的窗口，让"真的稳了"和"只是刚好这 5 分钟没撞"区分开。
+CALM_FORGET_AFTER = 900
 
 # 合集"新视频"判定容差（秒）。见 _season_sync_group 里的升级保护：
 # 发布时间只要不早于"上次检测"超过这个量，就算新内容。
@@ -308,6 +330,8 @@ HOT_CFG_KEYS = (
     "image_size_hint", "image_size_hint_w", "image_size_hint_h",
     "image_probe_size",
     "image_size_hint_avatar", "image_size_hint_max_h",
+    # 开播提醒 @全体：只在 _push 里现取，不牵扯任何状态机，热更新安全
+    "at_all_on_live", "at_all_merge",
 )
 
 _CFG_MTIME = [0.0]
@@ -336,6 +360,31 @@ def sync_cfg_from_disk(bot):
         if k in disk and disk.get(k) != getattr(bot, "cfg", {}).get(k):
             bot.cfg[k] = disk[k]
             changed.append(k)
+
+    # ⚠️「最快档」单独热更新：它只被 _adapt_interval 当目标下限读取，
+    #    不像 base/max 牵扯退避起点，改它不会打断状态机，可以即时生效。
+    #    面板改完不必重启 —— 重启在这项目里是有代价的（开机要重新静默对齐）。
+    #    放在 HOT_CFG_KEYS 之外单独处理，就是守住"轮询节奏不放进通用热更新"
+    #    那条约束，同时把这一个键做完整。
+    try:
+        _new_min = max(3, min(3600, int(
+            disk.get("poll_interval_min",
+                     getattr(bot, "min_interval", 8)) or 8)))
+    except (TypeError, ValueError):
+        _new_min = getattr(bot, "min_interval", 8)
+    if _new_min != getattr(bot, "min_interval", 8):
+        bot.min_interval = _new_min
+        if isinstance(getattr(bot, "cfg", None), dict):
+            bot.cfg["poll_interval_min"] = _new_min
+        # 维持 min ≤ base ≤ max、且当前间隔不快于下限，否则会出现
+        # 「最快档 12s、实际却按 8s 跑」这种自相矛盾的状态。
+        if getattr(bot, "base_interval", 0) < _new_min:
+            bot.base_interval = _new_min
+        if getattr(bot, "max_interval", 0) < _new_min:
+            bot.max_interval = _new_min
+        if getattr(bot, "interval", 0) < _new_min:
+            bot.interval = _new_min
+        changed.append("poll_interval_min")
     if changed:
         _log.info("配置已热更新：%s", "、".join(changed))
         if any(k.startswith("image_size_hint") for k in changed):
@@ -653,6 +702,10 @@ class NotifyBot(botpy.Client):
         #    就归 0，等下播再去取已经没有了。重启后第一次检测若发现正在
         #    直播，会用接口给的 live_time 补记（见 _check_live）。
         self._live_since = {}
+        # 基线对齐的暂缓表：{(uid, bl_kind): (到期时间戳, 原因)}。
+        # 见 _init_baseline —— UP 主确实没有这类内容时，不能每轮都发一遍
+        # 请求、还打一行"已静默对齐"的假日志。
+        self._bl_pending = {}
 
     def _live_since_map(self) -> dict:
         """开播时刻表（uid -> Unix 秒），懒初始化后返回。
@@ -680,6 +733,10 @@ class NotifyBot(botpy.Client):
         # 看不出根因是"没登录"。这里一次性说清楚。
         try:
             acc = await self._bili_verify()
+            # 记下来：下面启动同步的汇总行要靠它判断"到底有没有真对齐"。
+            # 不然 cookie 已经 -101 了，一个基线都没写进去，却照样宣布
+            # "N 位 UP 主已记录为基线" —— 用户以为静默生效了，其实全是空的。
+            self._boot_bili_state = str(acc.get("state") or "")
             if acc.get("state") == "logged":
                 _log.info("B 站登录态：已登录（%s，UID %s）",
                           acc.get("uname") or "", acc.get("mid") or "")
@@ -705,8 +762,18 @@ class NotifyBot(botpy.Client):
         # 之后才开始按周期检测。
         try:
             n = await self._startup_sync()
-            _log.info(f"启动同步完成：{n} 位 UP 主的当前状态已记录为基线"
-                      f"（静默，不推送）")
+            # ⚠️ 以前这行无条件报"已记录为基线"。cookie 失效时（code=-101）
+            #    B站 一个都没返回，_sync_one 却照样算成功 —— 于是日志写着
+            #    "9 位 UP 主已记录为基线"，实际基线全是空的。
+            #    现在按登录态分两种说法，说谎比不说更坑。
+            if getattr(self, "_boot_bili_state", "") == "invalid":
+                _log.warning(
+                    f"启动同步：{n} 位 UP 主的基线**未能**记录"
+                    f"（B 站登录态失效，接口一个都没返回）。"
+                    f"重新登录后会静默对齐，不会补推历史内容")
+            else:
+                _log.info(f"启动同步完成：{n} 位 UP 主的当前状态已记录为基线"
+                          f"（静默，不推送）")
         except Exception as e:
             _log.warning(f"启动同步失败（不影响后续轮询）：{e}")
 
@@ -799,6 +866,33 @@ class NotifyBot(botpy.Client):
     # 新群第一次 @ 机器人时的回复。只回这一次，之后这个群完全静默。
     GREETING_NEW_GROUP = "感谢使用OnOiduts产品"
 
+    # 「@机器人 测试」的关键词。命中后回一条自检结果（见 _handle_test_cmd）。
+    # ⚠️ 只认整句命中，不做包含匹配：有人在群里聊"这个功能要测试一下"
+    # 也会被 @ 到机器人，包含匹配会误触发。
+    TEST_CMD_WORDS = ("测试", "test", "TEST", "ping", "自检", "连通性")
+
+    # 自检回复。
+    #
+    # ⚠️ 顺序**不能反**（见 _handle_test_cmd）：QQ 的被动回复同一个
+    # msg_id 只能用一次。要是先拿它回一句"首次交互成功"，后面想把
+    # "主动消息没权限"也发回群里时机会已经用掉，发送被拒又被
+    # `except: pass` 吞掉 —— 群里就只剩那句"成功"，看着像没问题，
+    # 实际推送一条都发不出去。而这恰恰是这个功能存在的理由。
+    #
+    # 所以：**先主动发（探活），再用唯一一次被动机会回真正的结论**。
+    TEST_REPLY_ACTIVE_OK_PASSIVE = (
+        "✅ 首次交互成功：机器人已收到这条 @，本群已激活登记。")
+    TEST_REPLY_PUSH_OK = (
+        "✅ 交互正常：收到这条 @，且主动消息也正常 —— "
+        "订阅的更新提醒能推到本群。")
+    TEST_REPLY_PUSH_BLOCKED = (
+        "⚠️ 收到这条 @ 了，但主动消息没权限（官方 40034105），"
+        "本群暂时收不到订阅推送。请检查："
+        "① 群设置 → 机器人 → 打开「允许机器人主动发言」；"
+        "② 机器人是不是被禁言；③ 本群在不在沙箱群名单里。"
+        "处理好后在本群 @ 我再发一次「测试」就能验。")
+    TEST_REPLY_PUSH_FAIL = "⚠️ 主动消息发送失败：{why}"
+
     # ============ 群事件 ============
     async def on_group_add_robot(self, event):
         """被拉进群：**只静默登记，一句话都不说**。
@@ -811,7 +905,7 @@ class NotifyBot(botpy.Client):
         if not gid:
             return
         self.store.ensure_group(gid)
-        _log.info(f"机器人被加入群聊：{gid}（静默，不发言）")
+        _log.info(f"机器人被加入群聊：{self._gname(gid)}（静默，不发言）")
         # 刚进群往往还没拿到主动发言权限，直接推会撞 40034105。
         # 与其等第一次推送失败才发现，不如进群就提醒一句。
         _log.info(
@@ -904,6 +998,19 @@ class NotifyBot(botpy.Client):
         except Exception:
             pass
 
+    def _clear_no_perm(self, gid: str) -> None:
+        """解除该群的「主动消息无权限」冷却。
+
+        为什么要这个：用户按提示开了开关之后，本来要等冷却走完（默认
+        600s）订阅推送才会恢复。用「@机器人 测试」验证通过时主动解除，
+        不用干等，也不用重启机器人。
+        """
+        if not gid:
+            return
+        d = getattr(self, "_noperm_until", None)
+        if isinstance(d, dict) and gid in d:
+            d.pop(gid, None)
+
     def _noperm_active(self, gid: str) -> bool:
         """该群是否还在「主动消息无权限」的冷却里；冷却到点会自动解除。
 
@@ -942,7 +1049,7 @@ class NotifyBot(botpy.Client):
         try:
             n = self.store.remove_group(gid)
         except Exception as e:
-            _log.warning(f"清理群 {gid[:8]}… 失败：{e}")
+            _log.warning(f"清理群 {self._gname(gid)} 失败：{e}")
             return False
         for attr in ("_up_tpl_cache", "_greeted_groups"):
             box = getattr(self, attr, None)
@@ -955,7 +1062,7 @@ class NotifyBot(botpy.Client):
             for k in [k for k in role if isinstance(k, str)
                       and k.startswith(gid + "|")]:
                 role.pop(k, None)
-        who = f"{name}（{gid[:8]}…）" if name else f"{gid[:8]}…"
+        who = f"{name}（{self._gname(gid)}）" if name else self._gname(gid)
         tag = f"，{why}" if why else ""
         _log.info(
             f"已清理群 {who}{tag}：订阅 {n.get('subs', 0)} 条、"
@@ -983,11 +1090,11 @@ class NotifyBot(botpy.Client):
 
     async def on_group_msg_reject(self, event):
         _log.warning(
-            "群 {getattr(event, 'group_openid', None)} 关闭了主动消息，提醒将发不出去"
+            f"群 {self._gname(getattr(event, 'group_openid', '') or '')} 关闭了主动消息，提醒将发不出去"
         )
 
     async def on_group_msg_receive(self, event):
-        _log.info("群 {getattr(event, 'group_openid', None)} 已开启主动消息")
+        _log.info(f"群 {self._gname(getattr(event, 'group_openid', '') or '')} 已开启主动消息")
 
     async def on_group_at_message_create(self, message):
         """收到 @ 消息：登记群；**只有第一次见到这个群才回一句话**。
@@ -996,6 +1103,10 @@ class NotifyBot(botpy.Client):
           - 机器人被拉进群时**不发言**（避免打扰，见 on_group_add_robot）
           - 群里第一次 @ 机器人 → 回复一次感谢语，之后这个群再 @ 一律不理
           - 已经登记过的群 → 完全不交互，只有订阅的推送会发
+
+        例外：**「@机器人 测试」任何时候都回**，且回的是自检结果
+        （见 _handle_test_cmd）。老群也要能测 —— 排查"明明给了权限却
+        发不出消息"时，靠的就是在群里再 @ 一次看主动消息通不通。
 
         ⚠️ 感谢语走**被动回复**（带 msg_id）。被动回复是回复用户消息的
         行为，不需要"允许主动消息"权限 —— 群设置里只开了那个开关也能回。
@@ -1014,6 +1125,14 @@ class NotifyBot(botpy.Client):
             except Exception:
                 pass
 
+            # 自检指令优先：老群也要能测，所以放在"已登记就静默"之前。
+            if is_test_cmd(getattr(message, "content", "")):
+                if self._test_cmd_throttled(gid):
+                    return
+                _log.info(f"收到自检指令：群 {self._gname(gid)}")
+                await self._handle_test_cmd(gid, getattr(message, "id", None))
+                return
+
             # 平台偶尔会重复推送同一条事件。登记后 gid 已存在于库里，
             # 第二次进来 is_new 就是 False 了 —— 但并发时可能两条都读到
             # 同一个旧快照，所以再用内存记一道，避免回两次感谢语。
@@ -1026,10 +1145,10 @@ class NotifyBot(botpy.Client):
             greeted.add(gid)
 
             if not is_new:
-                _log.debug(f"群 {gid} 已登记过，不回复")
+                _log.debug(f"群 {self._gname(gid)} 已登记过，不回复")
                 return
 
-            _log.info(f"新群首次 @：登记并回复感谢语 group_openid={gid}")
+            _log.info(f"新群首次 @：登记并回复感谢语（群 {self._gname(gid)}）")
             try:
                 await self.qq.send_text(gid, self.GREETING_NEW_GROUP,
                                         msg_id=getattr(message, "id", None))
@@ -1042,6 +1161,81 @@ class NotifyBot(botpy.Client):
                     _log.warning(f"感谢语发送失败（不影响使用）：{e2}")
         except Exception as e:
             _log.debug(f"登记群失败：{e}")
+
+    # 「@机器人 测试」的节流秒数：连着 @ 好几下也只回一次，别刷屏。
+    TEST_CMD_CD = 10
+
+    def _test_cmd_throttled(self, gid: str) -> bool:
+        """该群是不是刚测过（冷却内）。返回 True 表示这次要跳过。
+
+        ⚠️ 这里不能用 _greeted_groups 那套"一次加入永不移除"的记法：
+        那个是为了防平台重复推送同一条事件，而自检必须能反复用 ——
+        不然排查"权限开了为什么还发不出"时第二次就没法验了。
+        """
+        d = getattr(self, "_test_cmd_at", None)
+        if not isinstance(d, dict):
+            d = {}
+            try:
+                self._test_cmd_at = d
+            except Exception:
+                return False
+        now = time.time()
+        try:
+            last = float(d.get(gid, 0) or 0)
+        except Exception:
+            last = 0.0
+        if now - last < self.TEST_CMD_CD:
+            return True
+        d[gid] = now
+        return False
+
+    async def _handle_test_cmd(self, gid: str, msg_id=None) -> None:
+        """「@机器人 测试」：回一句能说明**当前能不能收到推送**的话。
+
+        两步的权限要求不同：
+
+          1. 主动发送（不带 msg_id）—— 订阅推送走的就是这条路，
+             需要群里的主动发言权限，没开就会撞官方 40034105。
+          2. 被动回复（带 msg_id）—— 不需要"允许主动消息"权限，
+             只要能收到这条 @ 就回得出去。
+
+        ⚠️ 顺序必须是「先主动、后被动」，不能反。
+        QQ 的被动回复**同一个 msg_id 只能用一次**：先拿它回一句
+        "首次交互成功"的话，后面想把"主动消息没权限"也发回群里时
+        机会已经用掉，发送被拒又被 `except: pass` 吞掉 ——
+        群里就只剩那句"成功"，看着像没问题，实际推送一条都发不出去。
+
+        所以：先真的主动发一条探活，再用唯一一次被动机会把**真正的
+        结论**说出来。这样群里只会出现一条，且必然是结论。
+        """
+        # 第 1 步：主动探活。成功就到此为止，不再多说一句。
+        try:
+            await self.qq.send_text(gid, self.TEST_REPLY_PUSH_OK)
+        except Exception as e:
+            if is_no_perm_error(e):
+                self._mark_no_perm(gid)
+                _log.warning(no_perm_hint(gid, self._gname(gid)))
+                text = self.TEST_REPLY_PUSH_BLOCKED
+            else:
+                _log.warning(f"自检主动发送失败：{e}")
+                text = self.TEST_REPLY_PUSH_FAIL.format(why=str(e)[:80])
+            # 第 2 步：主动这条路不通，用唯一一次被动机会回结论。
+            #    被动不需要主动发言权限，所以它几乎必然能发到群里。
+            try:
+                await self.qq.send_text(gid, text, msg_id=msg_id)
+            except Exception as e2:
+                # 连被动都失败（极端情况）：退而求其次用主动再试一次，
+                # 失败也至少在日志里留一句，不再静默吞掉。
+                _log.warning(f"自检结论被动回复失败，改用主动：{e2}")
+                try:
+                    await self.qq.send_text(gid, text)
+                except Exception as e3:
+                    _log.warning(f"自检结论发送失败：{e3}")
+            return
+
+        # 主动发送成功 → 之前记的"无权限"已经不成立了，立刻解除
+        self._clear_no_perm(gid)
+        _log.info(f"自检通过：群 {self._gname(gid)} 主动消息正常，订阅推送能到本群")
 
     def _tpls_for(self, gid: str, season_key: tuple = None,
                   uid: int = None) -> dict:
@@ -1515,6 +1709,74 @@ class NotifyBot(botpy.Client):
                     out.append((gid, bl_kind))
         return out
 
+    def _bl_pending_map(self) -> dict:
+        """基线对齐暂缓表，懒初始化后返回（同 _live_since_map 的道理）。"""
+        m = getattr(self, "_bl_pending", None)
+        if m is None:
+            m = {}
+            self._bl_pending = m
+        return m
+
+    def _grace_pending_map(self) -> set:
+        """还没真正对齐成功的 UP 主集合。
+
+        和 `_startup_synced` 的区别：后者记的是「跑过一遍同步」，
+        前者记的是「基线确实写进去了」。开机时 B 站接口一抖，
+        `_init_baseline` 会把失败记进暂缓表然后**正常返回**，
+        旧逻辑照样把这个 UID 算成已对齐 —— 宽限轮一过就解除静默，
+        拿停机前的旧基线去比对，于是把重启期间的内容全补推一遍。
+        """
+        s = getattr(self, "_grace_pending", None)
+        if s is None:
+            s = set()
+            self._grace_pending = s
+        return s
+
+    def _up_tag(self, uid: int) -> str:
+        """日志里怎么称呼这个 UP 主：有名字用名字，没有才退回 UID。
+
+        以前一律打 [UID 320070259]，看日志的人还得自己拿这串数字去搜是
+        谁。这里改成优先用已存的名字，跟别处日志（[星瞳_Official] 群 …
+        已推送）的观感一致。
+
+        ⚠️ 只从本地缓存取，不为此发请求 —— 名字本就是订阅时存下来的，
+        为了日志好看再打一次接口纯属白发（还会加重风控）。订阅后确实
+        可能还没拉到名字，那时退回 UID，至少还能照着查。
+        """
+        try:
+            nm = (self.store.get_up(uid).get("uname") or "").strip()
+        except Exception:
+            nm = ""
+        return nm or f"UID {uid}"
+
+    async def _resolve_room_id(self, uid: int, up: dict) -> tuple:
+        """拿到直播间号 **(长号, 短号)**；本地没存就反查一次并写回。
+
+        ⚠️ 直播间号是 UP 主**开通过直播就一直存在**的，跟当前播没播无关 ——
+        未开播时照样反查得到（长短号都是）。所以本地存着 0 只说明
+        "以前那次没取到"（早期版本只信 card 接口的 `live_room`，UP 没在播
+        时那个字段是 null），**不能据此判定"该 UP 主没有直播间"**。
+
+        反查接口异常时**向上抛**：接口异常和"确实没有直播间"的恢复速度
+        不一样（前者可能只是暂时风控，2 分钟后就该重试），混为一谈会让
+        真有直播间的 UP 主被晾 10 分钟。怎么归类交给调用方决定。
+        """
+        rid = int(up.get("room_id") or 0)
+        if rid:
+            return (rid, int(up.get("short_room_id") or 0))
+        room, short_room = await self.bili.get_room_id_by_mid(uid)
+        room = int(room or 0)
+        short_room = int(short_room or 0)
+        if room:
+            # 顺手写回：补上了以后 _check_live 也不用每轮再反查一次
+            try:
+                self.store.set_up_info(
+                    uid, (up.get("uname") or ""), room,
+                    (up.get("face") or ""), short_room)
+            except Exception:
+                pass
+        return (room, short_room)
+
     async def _init_baseline(self, uid: int, only_missing: bool = True):
         """订阅/新增类型时立刻记一次当前状态，避免把历史内容当新内容推送。
 
@@ -1522,16 +1784,46 @@ class NotifyBot(botpy.Client):
         不加这个保护会出严重问题：给 B 群做初始化时，会把 A 群的基线
         也一并改成当前最新 —— A 群本来正等着推的那条就被吞掉了。
         不同群的进度必须互不影响。
+
+        ⚠️⚠️ 对齐不上时要**暂缓**，不能直接返回。
+        有的 UP 主压根没有这类内容（没开过播、没投过稿、置顶动态下没有
+        本人评论），此时"取不到"是常态。以前照样打一行"已静默对齐 N 个群"
+        —— 可实际上一个基线都没写进去，于是下一轮又判定缺失、又打一行：
+        日志被同一句话刷满，还每轮白发一遍请求（7 个 UP × 每 8 秒一轮，
+        等于一直在撞 B 站，反过来加重风控）。
+        所以取不到时记进暂缓表，冷却期内不再重复请求、也不再刷日志。
+        安全边界：检测本身有"首次静默对齐"兜底（基线缺失时不推送，
+        见 _check_video / _check_top_comment），暂缓不会造成补推历史。
         """
+        def _empty_receipt():
+            return {"written": set(), "stalled": {}}
+
         kinds = self.store.enabled_kinds_of_up(uid)
         if not kinds:
-            return
+            return _empty_receipt()
         missing = self._missing_baselines(uid, kinds)
-        if only_missing and not missing:
-            return
-        need = {bk for _, bk in missing} if only_missing else None
+        pend = self._bl_pending_map()
+        now = time.time()
+        if only_missing:
+            if not missing:
+                return _empty_receipt()
+            # 冷却中的先跳过：既不发请求，也不打日志。
+            alive = [it for it in missing
+                     if float(pend.get((uid, it[1]), (0.0, ""))[0]) <= now]
+            if not alive:
+                return _empty_receipt()
+            missing = alive
+            need = {bk for _, bk in missing}
+        else:
+            # 强制刷新（开机宽限轮）：冷却里的一律放行并清掉记录
+            for k in [k for k in pend if k[0] == uid]:
+                pend.pop(k, None)
+            need = None
         up = self.store.get_up(uid)
         room_id = up.get("room_id") or 0
+
+        # 日志里用名字称呼，不再是一串 UID（见 _up_tag 的说明）
+        up_tag = self._up_tag(uid)
 
         def _g(kind, bl_kind):
             """订阅了该类型的群，且（必要时）确实缺基线。"""
@@ -1557,15 +1849,42 @@ class NotifyBot(botpy.Client):
         # 与"新订阅不补推历史"的语义不一致。这里补齐，逻辑才自洽。
         g_top_cmt = _g("top_comment", "dyn_top_cmt")
 
-        if room_id and g_live:
-            try:
-                live = await self.bili.get_live(room_id)
-                for gid in g_live:
-                    self.store.set_baseline_of(
-                        gid, uid, "live", status=live.live_status,
-                        title=live.title)
-            except BiliError as e:
-                _log.warning(f"[UID {uid}] 初始化直播基线失败：{e}")
+        done = set()      # 真写进基线的 (gid, bl_kind)
+        stalled = {}      # bl_kind -> 原因（取不到 / 无直播间 / 接口异常）
+
+        if g_live:
+            if not room_id:
+                # ⚠️ 本地存着 0 ≠ 该 UP 主没有直播间。直播间号跟播没播无关
+                # （见 _resolve_room_id 的说明），未开播也反查得到。以前这里
+                # 直接判定"没有直播间"并暂缓 10 分钟，于是有直播间的 UP 主
+                # 被误晾着，日志还写着一句错的结论。
+                # _check_live 里早就有这个兜底，基线对齐这条路径漏了。
+                try:
+                    room_id, _short = await self._resolve_room_id(uid, up)
+                except Exception as e:
+                    # 反查失败多半是暂时风控，用短冷却（2 分钟）重试，
+                    # 别按"确实没有直播间"晾 10 分钟。
+                    stalled["live"] = f"接口异常：{e}"
+                    _log.warning(
+                        f"[{up_tag}] 反查直播间号失败：{redact(str(e))[:60]}")
+            if not room_id:
+                # 上面已因接口异常记过原因的话，不要覆盖成"没有直播间"
+                stalled.setdefault("live", "该 UP 主没有直播间")
+            else:
+                try:
+                    live = await self.bili.get_live(room_id)
+                    for gid in g_live:
+                        self.store.set_baseline_of(
+                            gid, uid, "live", status=live.live_status,
+                            title=live.title)
+                        done.add((gid, "live"))
+                except BiliError as e:
+                    stalled["live"] = f"接口异常：{e}"
+                    _log.warning(f"[{up_tag}] 初始化直播基线失败：{e}")
+                except Exception as e:
+                    stalled["live"] = f"接口异常：{e}"
+                    _log.warning(
+                        f"[{up_tag}] 初始化直播基线异常：{redact(str(e))[:60]}")
         if g_video:
             try:
                 v = await self.bili.get_latest_video(uid)
@@ -1574,8 +1893,16 @@ class NotifyBot(botpy.Client):
                         self.store.set_baseline_of(
                             gid, uid, "video", bvid=v.bvid,
                             pubdate=getattr(v, "pubdate", 0) or 0)
+                        done.add((gid, "video"))
+                else:
+                    stalled["video"] = "该 UP 主还没有投稿"
             except BiliError as e:
-                _log.warning(f"[UID {uid}] 初始化投稿基线失败：{e}")
+                stalled["video"] = f"接口异常：{e}"
+                _log.warning(f"[{up_tag}] 初始化投稿基线失败：{e}")
+            except Exception as e:
+                stalled["video"] = f"接口异常：{e}"
+                _log.warning(
+                    f"[{up_tag}] 初始化投稿基线异常：{redact(str(e))[:60]}")
         if g_dyn:
             try:
                 d = await self.bili.get_latest_dynamic(uid)
@@ -1584,8 +1911,16 @@ class NotifyBot(botpy.Client):
                         self.store.set_baseline_of(
                             gid, uid, "dyn", id=d.dyn_id,
                             pubdate=getattr(d, "pubdate", 0) or 0)
+                        done.add((gid, "dyn"))
+                else:
+                    stalled["dyn"] = "该 UP 主还没有动态"
             except BiliError as e:
-                _log.warning(f"[UID {uid}] 初始化动态基线失败：{e}")
+                stalled["dyn"] = f"接口异常：{e}"
+                _log.warning(f"[{up_tag}] 初始化动态基线失败：{e}")
+            except Exception as e:
+                stalled["dyn"] = f"接口异常：{e}"
+                _log.warning(
+                    f"[{up_tag}] 初始化动态基线异常：{redact(str(e))[:60]}")
         if g_top_cmt:
             try:
                 top = await self.bili.get_pinned_dynamic(uid)
@@ -1607,15 +1942,63 @@ class NotifyBot(botpy.Client):
                         for gid in g_top_cmt:
                             self.store.set_baseline_of(
                                 gid, uid, "dyn_top_cmt", id=c["id"])
+                            done.add((gid, "dyn_top_cmt"))
+                    else:
+                        # 评论接口所有候选都回 -404/啥都木有 →
+                        # 这条动态没有可取的置顶评论，是**常态**，不是接口异常。
+                        # 以前把它当异常抛出来，宽限轮就永远差这 1 位、
+                        # 每轮都打「已达上限」告警。
+                        stalled["dyn_top_cmt"] = (
+                            "该置顶动态没有可取的置顶评论（常态）")
+                else:
+                    stalled["dyn_top_cmt"] = "该 UP 主没有置顶动态"
             except BiliError as e:
-                _log.warning(f"[UID {uid}] 初始化置顶评论基线失败：{e}")
+                # 底层已把全候选 -404 转成 None；这里再兜一层，避免
+                # 旧版本 / 其它调用路径仍把「啥都木有」抛上来时，
+                # 又被记成接口异常、把启动宽限永远拖住。
+                _is_no = getattr(self.bili, "_is_no_comment", None)
+                if _is_no is not None and _is_no(e):
+                    stalled["dyn_top_cmt"] = (
+                        "该置顶动态没有可取的置顶评论（常态）")
+                else:
+                    stalled["dyn_top_cmt"] = f"接口异常：{e}"
+                    _log.warning(f"[{up_tag}] 初始化置顶评论基线失败：{e}")
             except Exception as e:
+                stalled["dyn_top_cmt"] = f"接口异常：{e}"
                 _log.warning(
-                    f"[UID {uid}] 初始化置顶评论基线异常：{redact(str(e))[:60]}")
-        if g_live or g_video or g_dyn or g_top_cmt:
-            _log.info(f"[UID {uid}] 新订阅/新增类型：已静默对齐 "
-                      f"{len(set(g_live) | set(g_video) | set(g_dyn) | set(g_top_cmt))}"
+                    f"[{up_tag}] 初始化置顶评论基线异常：{redact(str(e))[:60]}")
+        # ⚠️ 只有**真写进去了**才算对齐成功。
+        # 以前按"打算对齐几个群"报数，于是取不到数据时照样宣布
+        # "已静默对齐 1 个群" —— 基线其实还是空的，下一轮再来一遍。
+        if done:
+            _log.info(f"[{up_tag}] 新订阅/新增类型：已静默对齐 "
+                      f"{len({g for g, _ in done})}"
                       f" 个群（不推送历史内容）")
+            if stalled:
+                # ⚠️ 以前只打上面那句，读日志的人会以为"全部对齐了"。
+                #    实际上 done 可能只是 live 一类，video/dyn 还在下面暂缓。
+                #    补一句，把"部分成功"说清楚。
+                _log.info(f"[{up_tag}] 本轮另有 {len(stalled)} 类基线未写入"
+                          f"（{','.join(sorted(stalled))}），见下方暂缓说明；"
+                          f"未写入的部分不算已对齐")
+        # 对齐不上的：记进暂缓表，冷却期内不再重复请求、也不再刷日志。
+        for bk, why in stalled.items():
+            is_err = str(why).startswith("接口异常")
+            # 「取到了但不符合条件」比「压根没有」恢复得快 ——
+            # UP 主随时可能把自己的评论置顶上去，所以用短冷却。
+            is_soft = "没有 UP 主自己的" in str(why)
+            ttl = BL_PENDING_TTL_ERR if (is_err or is_soft) else BL_PENDING_TTL
+            # 「没有可取的置顶评论」是稳定状态，别按 2 分钟一轮反复问 B 站
+            if "没有可取的置顶评论" in str(why):
+                ttl = BL_PENDING_TTL
+            pend[(uid, bk)] = (now + ttl, why)
+            _log.info(f"[{up_tag}] 基线对齐暂缓（{bk}）：{why}；"
+                      f"{int(ttl)}s 后再试（不影响正常检测，"
+                      f"首次检测到时会自动静默对齐）")
+
+        # 真实写入回执：调用方（尤其是启动宽限轮）必须按这个判定成功，
+        # 不能因为"函数没抛异常"就算对齐了。
+        return {"written": set(done), "stalled": dict(stalled)}
 
     # ============ 轮询 ============
     async def _fetch_group_name(self, gid: str):
@@ -1625,6 +2008,16 @@ class NotifyBot(botpy.Client):
         但它是「白名单接口」——未开通会返回 11253。
         拿不到就静默跳过，群名留空由用户手动备注，不刷错误日志。
         """
+        # ⚠️ 已经有名字（官方查到的、或用户自己备注的）就别再问官方。
+        #    以前每轮都查一次，控制台里同一条「已获取群名：XXX」连着刷
+        #    好几遍，而这些请求全是白发的 —— 名字早就存下来了。
+        #    代价：群名在 QQ 那边改了不会自动同步，需要时到面板改备注。
+        try:
+            known = (self.store.get_group(gid).get("name") or "").strip()
+        except Exception:
+            known = ""
+        if known:
+            return known
         try:
             info = await self.qq.get_group_info(gid)
         except Exception as e:
@@ -1643,7 +2036,7 @@ class NotifyBot(botpy.Client):
         name = (info.get("name") or "").strip()
         if name:
             self.store.set_group_name(gid, name)
-            _log.info(f"已获取群名：{name}（{gid[:12]}…）")
+            _log.info(f"已获取群名：{name}")
         return name
 
     async def _reload_cookie(self):
@@ -1664,13 +2057,121 @@ class NotifyBot(botpy.Client):
             #    否则面板显示已登录、接口却一直 -352/412，两边说法完全相反。
             acc = await self._bili_verify(new)
             if acc.get("ok"):
+                # ⚠️ 新 cookie 已经向 B 站求证通过：把旧 cookie 时期
+                #    攒下的「认证被拦」计数/标记一并清掉，否则面板
+                #    还会显示「未生效」，轮询也停在退避档。
+                try:
+                    self.bili._clear_auth()
+                    heartbeat.touch(bili_login={"ok": True, "at": time.time()})
+                    heartbeat.touch(bili_auth_bad={"bad": False, "count": 0,
+                                                   "text": "", "reason": "",
+                                                   "at": time.time()})
+                except Exception:
+                    pass
                 _log.info("B 站登录态校验通过：%s（UID %s）",
                           acc.get("uname") or "", acc.get("mid") or "")
+                # ⚠️ 换了 cookie（尤其是从 -101/-352 恢复）之后，之前
+                #    写不进的基线必须重新静默对齐。只校验不重对齐，
+                #    下一轮就会拿停机前的旧基线比对，把重启期间的内容
+                #    全补推一遍。
+                try:
+                    self._on_bili_auth_recovered()
+                except Exception as e:
+                    _log.debug(f"重新对齐准备失败：{e}")
             elif acc.get("state") == "invalid":
                 _log.warning("B 站 cookie 已保存，但 B站 说它无效（%s）。"
                              "接口仍会返回 -352/412，请重新扫码或粘贴完整 Cookie",
                              acc.get("msg") or "未知")
             # state=unknown（连不上 / 查询失败）不吓唬人，下一轮还会再验
+
+    def _on_bili_auth_recovered(self):
+        """登录态恢复后重新进入启动静默，强制刷新基线。
+
+        cookie 失效期间开机：B 站一个接口都不返回，基线仍是停机前的旧值。
+        扫码 / 粘贴新 cookie 后接口一通，下一轮就 prev(旧) != cur(新)，
+        把重启期间的内容全补推一遍 —— 反复反馈的「静默结束后疯狂推送」
+        正是这条路径。所以这里把全部 UP 主重新标成待对齐，
+        并把宽限轮数归零，让静默重新走一遍、且按真实写入回执结束。
+        """
+        try:
+            uids = set(self.store.all_ups())
+        except Exception:
+            uids = set()
+        synced = getattr(self, "_startup_synced", None)
+        if isinstance(synced, set):
+            synced.difference_update(uids)
+        pending = self._grace_pending_map()
+        pending.update(uids)
+        self._grace_extra_rounds = 0
+        # 重新走一遍静默：轮数从 1 开始计数，上限告警也要重新有资格打一次。
+        # 少了这三行，日志会变成「第 10/1 轮」，并且放行后每轮刷同一条告警。
+        self._grace_round_no = 0
+        self._grace_warned = False
+        self._grace_finished = False
+        self._silent = True
+        _log.info("登录态已恢复：重新进入启动静默，强制对齐 %d 位 UP 主的基线"
+                  "（不补推停机期间的历史内容）", len(uids))
+
+    def _auth_alert(self):
+        """连续失败计数器（惰性创建，阈值从配置读）。
+
+        放在这里而不是 __init__：配置要等启动后才读得到，
+        而且 __init__ 里读失败会把整个机器人带崩。
+        """
+        a = getattr(self, "_auth_alert_obj", None)
+        if a is not None:
+            return a
+        import bili_auth_alert
+        streak = bili_auth_alert.DEFAULT_STREAK
+        try:
+            import cfgutil
+            cfg = cfgutil.load_cfg() or {}
+            streak = int(cfg.get(bili_auth_alert.STREAK_KEY) or streak)
+        except Exception:
+            pass
+        a = bili_auth_alert.AuthAlert(streak=streak)
+        self._auth_alert_obj = a
+        return a
+
+    async def _check_bili_auth_alert(self):
+        """登录态"实际失效"提醒：往沙盒群推一条。
+
+        ⚠️ 为什么与"到期提醒"分开：
+            到期提醒看的是 cookie 上写的到期时间；这里看的是 B站 当轮
+            的实际回答。被风控踢下线时剩余天数可能还有 179 天，
+            到期提醒永远触发不了，只能靠这里。
+        """
+        if not getattr(self, "_auth_alert_need", False):
+            return
+        alert = getattr(self, "_auth_alert_obj", None)
+        if alert is None:
+            return
+        import bili_auth_alert
+        import cfgutil
+        cfg = cfgutil.load_cfg() or {}
+        gid = str(cfg.get("sandbox_group") or "").strip()
+        if not gid:
+            # 沙盒群没配：不推，但也不能当作"已通知"——
+            # 配好之后应当立刻收到这条提醒，所以这里不 mark_sent。
+            # 因为不算已通知，下一轮还会再进来，所以这句要节流，
+            # 否则每 8 秒刷一条，把真正的推送记录埋掉。
+            now = time.time()
+            if now - (getattr(self, "_auth_nogroup_at", 0.0) or 0.0) < 600:
+                return
+            self._auth_nogroup_at = now
+            _log.warning("B 站登录态已失效（连续 %d 次被拦），"
+                         "但没配沙盒群，无法推送提醒。"
+                         "配好后下一轮会补推。", alert.count)
+            return
+        text = bili_auth_alert.build_message(
+            getattr(self, "_auth_last_reason", "") or "", alert.count)
+        try:
+            await self.qq.send_text(gid, text)
+            alert.mark_sent()
+            self._auth_alert_need = False
+            _log.warning("已向沙盒群推送 B 站登录态失效提醒")
+        except Exception as e:
+            _log.warning(f"登录态失效提醒发送失败：{e}")
 
     async def _check_bili_expiry(self):
         """登录态快到期 / 已过期时提醒：面板告警 + 往沙盒群推一条。
@@ -1692,7 +2193,8 @@ class NotifyBot(botpy.Client):
         # 估算，那样"剩 2~5 天"这个区间永远进不去，提醒就永远不触发。
         import bili_login as _bl0
         exp, _est = _bl0.effective_expires(
-            cookie, float(cfg.get("bili_cookie_expires") or 0))
+            cookie, float(cfg.get("bili_cookie_expires") or 0),
+            float(cfg.get("bili_cookie_ts") or 0))
         days, expired = bili_expiry_alert.days_left_of(exp)
         res = alert.evaluate(days, expired)
         lv = res.get("level")
@@ -1773,8 +2275,19 @@ class NotifyBot(botpy.Client):
         msg = f"[{name}] {kind}获取失败：{err}"
         if bad:
             _log.debug(msg)
-        else:
-            _log.warning(msg)
+            return
+        # 同一个失败原因在 10 分钟内只警告一次。B 站接口持续抖动时，
+        # 否则就是同一行 WARNING 每轮刷屏，把真正的推送记录埋掉。
+        seen = getattr(self, "_log_fail_seen", None)
+        if seen is None:
+            seen = self._log_fail_seen = {}
+        key = (kind, str(err)[:80])
+        now = time.time()
+        if now < float(seen.get(key, 0)):
+            _log.debug(msg + "（同一提示 10 分钟内不重复）")
+            return
+        seen[key] = now + 600.0
+        _log.warning(msg + "（同一提示 10 分钟内不重复）")
 
     def _sync_bili_auth(self):
         """把「B站 认不认」写进心跳，并把刷屏告警汇总成一条。
@@ -1797,17 +2310,50 @@ class NotifyBot(botpy.Client):
             heartbeat.touch(bili_login=info)
         except Exception:
             pass
+
+        # ── 连续失败计数：达到阈值才认定"cookie 真的挂了" ──
+        # 与上面的「剩余天数提醒」是两回事：这里管的是 B站 已经不认，
+        # 而 cookie 上写的到期时间可能还剩 179 天，到期提醒永远触发不了。
+        try:
+            alert = self._auth_alert()
+            res = alert.feed(bad)
+        except Exception:
+            return
+        try:
+            heartbeat.touch(bili_auth_bad={
+                "bad": bool(res.get("bad")),
+                "count": int(res.get("count") or 0),
+                "text": res.get("text") or "",
+                "reason": info.get("reason") or "",
+                "at": time.time(),
+            })
+        except Exception:
+            pass
+
         if not bad:
             self._auth_warn_at = 0.0
+            self._auth_alert_need = False
+            if res.get("recovered"):
+                _log.warning("B 站登录态已恢复，投稿/动态检测回到正常")
             return
-        now = time.time()
-        if now - (self._auth_warn_at or 0.0) < 600:
-            return                       # 10 分钟内只报一次，别刷屏
-        self._auth_warn_at = now
-        _log.warning("B 站登录态没生效，投稿/动态接口都被拦（%s）。"
-                     "面板显示「已登录」只代表本地存了 cookie，不代表 B站 认 —— "
-                     "去「⚙️ 凭据 → B站登录」重新扫码，或重新粘贴完整 Cookie。",
-                     info.get("reason") or "被风控/已过期")
+
+        if bad:
+            self._auth_last_reason = info.get("reason") or ""
+
+        # 达到阈值：标记待推，由 _check_bili_auth_alert 在异步上下文里发
+        self._auth_alert_need = bool(res.get("need_alert"))
+        if not res.get("reached"):
+            # 还没到阈值（可能只是抖动），或已经提醒过了。
+            # 提醒过之后不再每 10 分钟喊一遍 —— 那样会把真正的推送记录埋掉。
+            _log.debug("B 站登录态本轮被拦（连续 %d/%d 次%s）",
+                       alert.count, alert.streak,
+                       "，已提醒过" if alert.fired else "，未达阈值")
+            return
+        _log.warning("B 站登录态连续 %d 次被拦（%s），判定为已失效："
+                     "投稿/动态查不动了。面板显示「已登录」只代表本地存了 "
+                     "cookie，不代表 B站 认 —— 去「⚙️ 凭据 → B站登录」"
+                     "重新扫码，或重新粘贴完整 Cookie。",
+                     alert.count, info.get("reason") or "被风控/已过期")
 
     def _note(self, uid: int, kind: str, text: str):
         """记录某个 UP 某类检测的最近结果（成功值 / 失败原因）。
@@ -1937,6 +2483,15 @@ class NotifyBot(botpy.Client):
                     kinds = self.store.enabled_kinds_of_up(uid)
                     if not kinds:
                         return 0
+                    # ⚠️ 登录态不被认可时（code=-101/-352），三类检测全会失败、
+                    #    一个基线也写不进去，但异常被下面的 except 吞掉后这里
+                    #    照样 return 1 —— 汇总行于是宣布"N 位已记录为基线"，
+                    #    实际全是空的。这里直接短路，让数字说实话。
+                    try:
+                        if self.bili.auth_bad():
+                            return 0
+                    except Exception:
+                        pass
                     # 走正常检测流程，但因为基线为空/已对齐，不会产生推送
                     await self._check_live(uid, name)
                     await self._check_video(uid, name)
@@ -1977,6 +2532,37 @@ class NotifyBot(botpy.Client):
                       f"自动静默对齐，不会补推历史内容）")
         return done
 
+    @staticmethod
+    def _grace_keep_silent(round_no: int, grace: int, pending: set,
+                           extra: int, max_extra: int) -> bool:
+        """这一轮是否继续保持启动静默（纯判定，便于真值测试）。
+
+        正常开机按配置静默 grace 轮；若还有 UP 主没真对齐，
+        就额外静默到 max_extra 轮，而不是一轮跑完就放行。
+        """
+        if grace and round_no <= grace:
+            return True
+        return bool(pending) and extra < max_extra
+
+    def _grace_release(self, pending: set, max_extra: int) -> bool:
+        """解除启动静默；返回本次是否打了「已达上限」告警。
+
+        ⚠️ pending 在放行后仍可能一直非空（某位 UP 常态没有置顶评论、
+        或接口持续抖），旧写法在 else 里每轮都打同一条 WARNING，
+        日志里就是几十行一模一样的告警。一个静默周期只打一次。
+        登录态恢复（_on_bili_auth_recovered）会重置资格。
+        """
+        self._silent = False
+        self._grace_finished = True
+        if not pending or getattr(self, "_grace_warned", False):
+            return False
+        self._grace_warned = True
+        _log.warning(
+            f"启动宽限已达上限（{max_extra} 轮），仍有 "
+            f"{len(pending)} 位 UP 主基线未对齐；解除静默后"
+            f"可能补推停机期间的内容。请检查 B 站登录态或稍后重启")
+        return True
+
     async def _grace_align(self) -> int:
         """启动后宽限轮次：把**启动同步没覆盖到**的 UP 强制对齐基线。
 
@@ -2003,17 +2589,38 @@ class NotifyBot(botpy.Client):
             uids = sorted(self.store.all_ups())
         except Exception:
             return 0
-        synced = getattr(self, "_startup_synced", set()) or set()
+        synced = getattr(self, "_startup_synced", None)
+        if not isinstance(synced, set):
+            synced = set()
+            self._startup_synced = synced
+        pending = self._grace_pending_map()
         for uid in uids:
-            if uid in synced:
+            # 已经**真**对齐过、且没被重新标记为待对齐的，不必再跑一遍。
+            if uid in synced and uid not in pending:
                 continue
             try:
-                name = self.store.get_up(uid).get("uname") or str(uid)
-                await self._init_baseline(uid, only_missing=False)
-                synced.add(uid)
-                done += 1
+                receipt = await self._init_baseline(uid, only_missing=False)
             except Exception as e:
+                pending.add(uid)
                 _log.debug(f"宽限对齐 [{uid}] 跳过：{e}")
+                continue
+            if not isinstance(receipt, dict):
+                receipt = {"written": set(), "stalled": {}}
+            stalled = receipt.get("stalled") or {}
+            # ⚠️ 以前「函数没抛异常」就算对齐成功。但接口失败时
+            #    _init_baseline 只是把原因记进暂缓表然后正常返回，
+            #    于是 9 位全失败也照样宣布"已强制对齐"，宽限一轮就放行。
+            #    只有接口异常算真失败；「没有置顶动态」「还没投稿」是常态，
+            #    本来就没有基线可写，不能把宽限永远拖住。
+            failed = any(str(w).startswith("接口异常")
+                         for w in stalled.values())
+            if failed:
+                pending.add(uid)
+                _log.debug(f"宽限对齐 [{uid}] 未成功：{len(stalled)} 类接口异常")
+            else:
+                synced.add(uid)
+                pending.discard(uid)
+                done += 1
         return done
 
     async def _startup_sync_seasons(self, deadline=None) -> int:
@@ -2113,6 +2720,10 @@ class NotifyBot(botpy.Client):
                 except Exception:
                     pass
                 self._round += 1
+                # 宽限轮数用**相对计数**。登录态恢复后会重新进入静默，
+                # 若沿用开机累计的 _round，日志会打出「第 10/1 轮」这种
+                # 分子比分母还大的怪数字（分母是配置的宽限轮数）。
+                self._grace_round_no = getattr(self, "_grace_round_no", 0) + 1
                 # ── 启动后宽限轮次：只对齐基线、不推送 ──
                 # 兜住"启动同步因时限没覆盖到的 UP"：那些 UP 的基线是停机
                 # 前的旧值，不强制刷新就会在第一轮被当成新内容补推。
@@ -2122,18 +2733,42 @@ class NotifyBot(botpy.Client):
                         self.cfg.get("startup_grace_rounds", 1) or 0)))
                 except (TypeError, ValueError):
                     _grace = 1
-                if _grace and self._round <= _grace:
+                pending = self._grace_pending_map()
+                try:
+                    max_extra = max(1, min(10, int(
+                        self.cfg.get("startup_grace_max_rounds", 5) or 5)))
+                except (TypeError, ValueError):
+                    max_extra = 5
+                extra = getattr(self, "_grace_extra_rounds", 0)
+                _total = _grace + max_extra
+                # 还有 UP 主没真对齐就继续保持静默重试。以前宽限是
+                # 「第 1 轮无条件放行」，接口一抖就解除静默 → 拿停机前
+                # 的旧基线比对 → 把重启期间的内容全补推一遍。
+                # 不无限静默：到 max_extra 轮就放行，但明确告警。
+                # ⚠️ 放行之后别再每轮重复打同一条「已达上限」——
+                # pending 不清空是常态，旧写法每 8 秒刷一条 WARNING。
+                finished = getattr(self, "_grace_finished", False)
+                keep_silent = (not finished) and self._grace_keep_silent(
+                    self._grace_round_no, _grace, pending, extra, max_extra)
+                if keep_silent:
                     self._silent = True
                     try:
                         n = await self._grace_align()
                         if n:
                             _log.info(
-                                f"启动宽限（第 {self._round}/{_grace} 轮）："
+                                f"启动宽限（第 {self._grace_round_no}/{_total} 轮）："
                                 f"{n} 位 UP 主的基线已强制对齐（不推送）")
+                        elif pending:
+                            _log.warning(
+                                f"启动宽限（第 {self._grace_round_no}/{_total} 轮）："
+                                f"本轮 0 位对齐成功，仍有 {len(pending)} 位待对齐，"
+                                f"继续保持静默（不会补推历史内容）")
                     except Exception as e:
                         _log.debug(f"宽限对齐跳过：{e}")
+                    if pending:
+                        self._grace_extra_rounds = extra + 1
                 else:
-                    self._silent = False
+                    self._grace_release(pending, max_extra)
                 await self._poll_once()
                 # 每轮把「B站 认不认这个登录态」写给面板（见 _sync_bili_auth）
                 try:
@@ -2145,6 +2780,11 @@ class NotifyBot(botpy.Client):
                     await self._check_bili_expiry()
                 except Exception as e:
                     _log.debug(f"登录态到期检查跳过：{e}")
+                # B 站登录态"实际失效"提醒（连续 N 次被拦，见 _check_bili_auth_alert）
+                try:
+                    await self._check_bili_auth_alert()
+                except Exception as e:
+                    _log.debug(f"登录态失效提醒跳过：{e}")
             except asyncio.CancelledError:
                 # ⚠️ CancelledError 有两种来源，必须分开：
                 #   ① 真要停止（close() 里 cancel，会先置 _stopping）→ 照常抛出
@@ -2262,6 +2902,12 @@ class NotifyBot(botpy.Client):
                                                         self.interval * 2))
             if self.interval != old:
                 self._iv_from = None   # 退避是新一轮的起点
+                # ⚠️ 记住"是在哪一档撞的"：退避**之后**这一档才是已知撑得住的。
+                #    以前只记"这次撞了"，不记档位 —— 于是下面"平安 5 分钟"
+                #    一到就无条件一步跳回 min_interval，而那恰恰是刚证明
+                #    撑不住的档：8→16→8→16 无限回摆，控制台满屏这两条，
+                #    实际平均间隔却一直贴在最快档猛撞（B 站那边只会越撞越狠）。
+                self._slow_floor = self.interval
                 # ⚠️ 说清楚是"被拦了"还是"对面超时了"：以前一律写
                 #    "撞到 B 站风控"，但 -504 是对面没扛住、不是我们太猛，
                 #    提示不准会让人白调配置。
@@ -2284,8 +2930,33 @@ class NotifyBot(botpy.Client):
             return
 
         self._calm_rounds = calm + 1
-        if since > 300 and self.interval > self.min_interval:
-            # 超过 5 分钟没风控 → 直接回最快
+
+        # ⚠️ 退避时记下的"撑得住的档"。有它就不许越过 —— 见上面
+        #    _slow_floor 的注释：越过就是 8↔16 回摆的根因。
+        floor = getattr(self, "_slow_floor", 0) or 0
+
+        # 平安很久 → 忘掉那次教训，重新往下试探（否则一次偶发抖动会把
+        # 间隔永久锁死在退避档，明明稳了也快不回去）。
+        if floor and since > CALM_FORGET_AFTER:
+            floor = 0
+            self._slow_floor = 0
+
+        if floor:
+            # 有地板：平安 5 分钟可以回到地板档（这一档已知撑得住），
+            # 但**不能比它更快**。
+            target = max(self.min_interval, floor)
+            if self.interval > target:
+                old = self.interval
+                self.interval = target
+                self._iv_settled(old)
+            return
+
+        # ⚠️ 无地板时分两种：
+        #   · 从没撞过风控 → 一步回到最快（本来就撑得住，没必要爬）
+        #   · 撞过、只是教训已遗忘 → **逐步试探**，不再一步到底。
+        #     一步到底会让"刚遗忘就冲回 8s → 又撞 → 又退避"变成 900s
+        #     一轮的慢速回摆；逐步下探则会在中途某一档先撞到并停住。
+        if hits == 0 and since > 300 and self.interval > self.min_interval:
             old = self.interval
             self.interval = self.min_interval
             self._iv_settled(old)
@@ -2354,9 +3025,18 @@ class NotifyBot(botpy.Client):
         if now - (getattr(self, "_iv_last_log", 0.0) or 0.0) < 60:
             return
         self._iv_last_log = now
-        _log.info(
-            f"风控风险已解除，检查频率已回到最快：{f}s → {self.interval}s"
-            f"（最快档）")
+        if self.interval <= self.min_interval:
+            _log.info(
+                f"风控风险已解除，检查频率已回到最快：{f}s → {self.interval}s"
+                f"（最快档）")
+        else:
+            # ⚠️ 只回到"已知撑得住"的档，不是最快档。以前一律说"回到最快"，
+            #    于是 16s→8s（真回最快）和 32s→16s（只回到地板）在日志页
+            #    显示成同一句 —— 看的人以为一直在最快档跑，实际并没有。
+            _log.info(
+                f"风控风险已解除，检查频率放宽到 {self.interval}s"
+                f"（{self.min_interval}s 试过撑不住，先不往下探；"
+                f"平安 {CALM_FORGET_AFTER // 60} 分钟后会再试）")
 
     def interval_info(self) -> dict:
         """给面板 / 状态指令看的轮询状态。"""
@@ -2647,7 +3327,7 @@ class NotifyBot(botpy.Client):
                 await self._season_sync_group(
                     gid, uid, season_id, name, info)
             except Exception as e:
-                _log.warning(f"群 {gid[:8]}… 合集 {season_id} 处理失败："
+                _log.warning(f"群 {self._gname(gid)} 合集 {season_id} 处理失败："
                              f"{redact(str(e))[:120]}")
 
     async def _season_apply_sections(self, info, season_id: int):
@@ -2815,7 +3495,7 @@ class NotifyBot(botpy.Client):
         if getattr(self, "_silent", False):
             return
         if self._noperm_active(gid):
-            _log.debug(f"群 {gid[:8]}… 主动消息无权限，冷却中，本轮跳过合集")
+            _log.debug(f"群 {self._gname(gid)} 主动消息无权限，冷却中，本轮跳过合集")
             return
         try:
             tpls = self._tpls_for(gid, season_key=(uid, season_id))
@@ -2836,7 +3516,7 @@ class NotifyBot(botpy.Client):
                     # 同上：无权限时退纯文本也是同一个错，别白试一次
                     if is_no_perm_error(e_md):
                         self._mark_no_perm(gid)
-                        _log.warning(no_perm_hint(gid))
+                        _log.warning(no_perm_hint(gid, self._gname(gid)))
                         return
                     _log.warning(f"合集 Markdown 推送失败，改用纯文本："
                                  f"{redact(str(e_md))[:80]}")
@@ -2858,10 +3538,10 @@ class NotifyBot(botpy.Client):
                 pass
             heartbeat.touch(last_push_at=time.time(),
                             last_push=f"合集 · {push.title}")
-            _log.info(f"已推送【合集】{push.title} → 群 {gid[:8]}…")
+            _log.info(f"已推送【合集】{push.title} → 群 {self._gname(gid)}")
         except Exception as e:
             heartbeat.bump("errors")
-            _log.warning(f"合集推送到群 {gid[:8]}… 失败：{redact(str(e))[:120]}")
+            _log.warning(f"合集推送到群 {self._gname(gid)} 失败：{redact(str(e))[:120]}")
 
     async def _check_live(self, uid: int, name: str):
         up = self.store.get_up(uid)
@@ -2921,7 +3601,7 @@ class NotifyBot(botpy.Client):
                                        title=live.title)
             if prev is None:
                 skip.add(gid)          # 首次：静默对齐，不推送
-                _log.debug(f"[{name}] 群 {gid[:8]}… 直播基线已建立"
+                _log.debug(f"[{name}] 群 {self._gname(gid)} 直播基线已建立"
                            f"（静默，不推送）")
                 continue
             if prev != 1 and live.live_status == 1:
@@ -2933,7 +3613,7 @@ class NotifyBot(botpy.Client):
                                                         str(room_id),
                                                         ("dynamic",))):
                         skip.add(gid)
-                        _log.info(f"[{name}] 群 {gid[:8]}… 开播已由开播动态"
+                        _log.info(f"[{name}] 群 {self._gname(gid)} 开播已由开播动态"
                                   f"提醒过，静默不重复推送")
                         continue
                 except Exception:
@@ -3024,7 +3704,7 @@ class NotifyBot(botpy.Client):
                                      getattr(v, "pubdate", 0) or 0))
             if not prev:
                 skip.add(gid)          # 首次：静默对齐，不推送
-                _log.debug(f"[{name}] 群 {gid[:8]}… 投稿基线已建立"
+                _log.debug(f"[{name}] 群 {self._gname(gid)} 投稿基线已建立"
                            f"（静默，不推送）")
             elif prev == v.bvid:
                 skip.add(gid)          # 无变化
@@ -3173,7 +3853,7 @@ class NotifyBot(botpy.Client):
                                          getattr(top, "pubdate", 0) or 0))
                 if not prev:
                     skip_top.add(gid)      # 首次：静默对齐，不推送
-                    _log.debug(f"[{name}] 群 {gid[:8]}… 置顶动态基线已建立"
+                    _log.debug(f"[{name}] 群 {self._gname(gid)} 置顶动态基线已建立"
                                f"（静默，不推送）")
                 elif prev == top.dyn_id:
                     skip_top.add(gid)
@@ -3185,7 +3865,7 @@ class NotifyBot(botpy.Client):
                     # 分支，日志写成"回退为更早的"，把真实原因（早就提醒过）
                     # 盖掉，排查时会被误导。
                     skip_top.add(gid)
-                    _log.info(f"[{name}] 群 {gid[:8]}… 置顶动态 {top.dyn_id} "
+                    _log.info(f"[{name}] 群 {self._gname(gid)} 置顶动态 {top.dyn_id} "
                               f"已作为新动态提醒过，静默不推送")
                 elif self._should_silence_dynamic(uid, top):
                     skip_top.add(gid)
@@ -3198,7 +3878,7 @@ class NotifyBot(botpy.Client):
                     # 不该因为 ID 重新出现就再推一遍。
                     self._mark_dyn_notified(
                         gid, uid, top.dyn_id, getattr(top, "pubdate", 0) or 0)
-                    _log.info(f"[{name}] 群 {gid[:8]}… 置顶动态回退为更早的 "
+                    _log.info(f"[{name}] 群 {self._gname(gid)} 置顶动态回退为更早的 "
                               f"{top.dyn_id}，静默不推送（基线时间不回退）")
             todo = [g for g in g_top if g not in skip_top]
             if todo:
@@ -3239,7 +3919,7 @@ class NotifyBot(botpy.Client):
                 pubdate=self._wm_pub(prev_pub, getattr(d, "pubdate", 0) or 0))
             if not prev:
                 skip.add(gid)          # 首次：静默对齐，不推送
-                _log.debug(f"[{name}] 群 {gid[:8]}… 动态基线已建立"
+                _log.debug(f"[{name}] 群 {self._gname(gid)} 动态基线已建立"
                            f"（静默，不推送）")
             elif prev == d.dyn_id:
                 skip.add(gid)
@@ -3247,7 +3927,7 @@ class NotifyBot(botpy.Client):
                 # 这条之前是置顶、已经按「📌 置顶动态」提醒过；
                 # UP 取消置顶后它变成"最新非置顶"，不能再补推一遍。
                 skip.add(gid)
-                _log.info(f"[{name}] 群 {gid[:8]}… 动态 {d.dyn_id} "
+                _log.info(f"[{name}] 群 {self._gname(gid)} 动态 {d.dyn_id} "
                           f"已作为置顶动态提醒过，静默不推送")
             elif not self._is_newer_content(getattr(d, "pubdate", 0),
                                             prev_pub):
@@ -3259,7 +3939,7 @@ class NotifyBot(botpy.Client):
                 # 再按 ID 兜一道，双重保险。
                 self._mark_dyn_notified(
                     gid, uid, d.dyn_id, getattr(d, "pubdate", 0) or 0)
-                _log.info(f"[{name}] 群 {gid[:8]}… 最新动态回退为更早的 "
+                _log.info(f"[{name}] 群 {self._gname(gid)} 最新动态回退为更早的 "
                           f"{d.dyn_id}（疑似删动态），静默不推送"
                           f"（基线时间不回退）")
             elif self._should_silence_dynamic(uid, d):
@@ -3286,6 +3966,21 @@ class NotifyBot(botpy.Client):
         1. 自给自足：自己取置顶动态（调用方也可传入避免重复请求）
         2. 每一步都记 note + 日志，面板和 /检测 都能看到失败原因
         """
+        # ⚠️ 「没有置顶动态 / 没有可取的置顶评论」是稳定状态。
+        # 以前每轮都重新发十几个请求去确认一遍同一件事，日志里就是
+        # 同一条 WARNING 每 8 秒刷一次，还反过来加重 B 站风控。
+        # 记一次常态冷却，期间直接跳过；UP 主后来置顶了评论，冷却到期
+        # 会自然重新检查并照常推送。
+        empty_until = getattr(self, "_top_cmt_empty_until", None)
+        if empty_until is None:
+            empty_until = self._top_cmt_empty_until = {}
+        if time.time() < float(empty_until.get(uid, 0)):
+            return
+
+        def _mark_empty(reason: str):
+            empty_until[uid] = time.time() + TOP_CMT_EMPTY_TTL
+            self._note(uid, "top_cmt", reason)
+
         # 1) 拿到置顶动态（没传就自己取）
         if not dyn_id:
             try:
@@ -3298,7 +3993,7 @@ class NotifyBot(botpy.Client):
                 self._note(uid, "top_cmt", f"置顶动态异常：{redact(str(e))[:50]}")
                 return
             if not top or not top.dyn_id:
-                self._note(uid, "top_cmt", "没找到置顶动态")
+                _mark_empty("没找到置顶动态（常态，10 分钟内不重复查询）")
                 return
             dyn_id = top.dyn_id
             rid = getattr(top, "rid", "") or ""
@@ -3313,6 +4008,11 @@ class NotifyBot(botpy.Client):
                 comment_id=getattr(top_dyn, "comment_id_str", "") or "",
                 comment_type=getattr(top_dyn, "comment_type", 0) or 0)
         except BiliError as e:
+            # 即使底层版本较旧仍把 -404 抛上来，也按常态处理，
+            # 不让一条「啥都木有」变成 WARNING 刷屏 + 卡片误报。
+            if self.bili._is_no_comment(e):
+                _mark_empty("该置顶动态没有可取的置顶评论（常态）")
+                return
             self._note(uid, "top_cmt", f"评论获取失败：{e}")
             self._log_check_fail(name, "置顶评论", e)
             return
@@ -3321,9 +4021,9 @@ class NotifyBot(botpy.Client):
             _log.warning(f"[{name}] 置顶评论异常：{e}")
             return
 
+        empty_until.pop(uid, None)      # 真取到了，取消常态冷却
         if not c or not c.get("id"):
-            # 区分"接口没返回"和"确实没有置顶评论"，两者都让用户看到
-            self._note(uid, "top_cmt", f"未返回置顶评论（oid={rid or dyn_id}）")
+            _mark_empty("该置顶动态没有可取的置顶评论（常态）")
             return
 
         # 只认 UP 主本人的置顶评论：
@@ -3344,29 +4044,123 @@ class NotifyBot(botpy.Client):
         except Exception:
             gids = []
         skip = set()
+
+        # ⚠️ 只比基线还不够：基线只认"上一条"，一轮漂移就会漏。
+        #
+        # 置顶动态可能同时存在多个能取到评论的评论区（带图动态既有
+        # (11,相簿id) 也有 (17,动态id)），两边返回的置顶评论不是同一条。
+        # 接口一抖（404 / 超时），前面那个取不到就落到后面那个，于是
+        # A → B → A 来回漂 —— 每漂一次都被判成"新评论"再推一遍，
+        # 群里就是"同一位 UP 主的置顶评论连着来好几条"。
+        #
+        # 所以额外记住最近推过的几条：只要是它们就不重复推。真换了新
+        # 评论时 id 不在这个集合里，照常推送。
+        seen = getattr(self, "_top_cmt_seen", None)
+        if seen is None:
+            seen = self._top_cmt_seen = {}
+        recent = seen.setdefault(uid, [])
+        if cur in recent:
+            skip.update(gids)
+            _log.debug(f"[{name}] 置顶评论 {cur} 最近推过，本轮不重复推")
         for gid in gids:
             base = self.store.baseline_of(gid, uid, "dyn_top_cmt")
             prev = base.get("id")
             self.store.set_baseline_of(gid, uid, "dyn_top_cmt", id=cur)
             if not prev:
                 skip.add(gid)          # 首次：静默对齐，不推送
-                _log.debug(f"[{name}] 群 {gid[:8]}… 置顶评论基线已建立"
+                _log.debug(f"[{name}] 群 {self._gname(gid)} 置顶评论基线已建立"
                            f"（静默，不推送）")
             elif prev == cur:
                 skip.add(gid)
         if [g for g in gids if g not in skip]:
             self._note(uid, "top_cmt", f"更新：{c.get('content','')[:24]}")
             await self._push("top_comment", uid, name, c, exclude=skip)
+            # 推送成功才记进"最近推过"，失败的话下一轮还能补上
+            recent.append(cur)
+            del recent[:-TOP_CMT_SEEN_KEEP]
         else:
             self._note(uid, "top_cmt", c.get("content", "")[:24])
 
+    # ============ 群显示名 ============
+    def _gname(self, gid: str) -> str:
+        """群 openid 是内部键，不给人看：一律返回可读的群名。
+
+        没拿到群名时也不回退到 openid（一串十六进制没意义），
+        而是给按登记顺序稳定编号的「未命名群 N」。
+        """
+        try:
+            return grouplabel.group_label(
+                gid, self.store.get_group(gid).get("name"),
+                self.store.all_groups())
+        except Exception:
+            return "未命名群"
+
     # ============ 推送 ============
+    def _atall_quota(self):
+        """@全体 配额记录（懒加载，测试可替换成临时路径）。"""
+        q = getattr(self, "_atall_q", None)
+        if q is None:
+            q = self._atall_q = atall.AtAllQuota()
+        return q
+
+    def _atall_want(self, kind: str, gid: str) -> bool:
+        """这一条推送该不该带 @全体。
+
+        只对**开播提醒**（kind == "live"）生效：下播、投稿、动态、
+        「开播动态」（B 站自动发的那条）都不 @，否则一天要 @ 好几次，
+        而且官方每个群每天只允许 1 次。
+        """
+        if kind != "live":
+            return False
+        if not bool(self.cfg.get("at_all_on_live", True)):
+            self._atall_note_skip(gid, "设置里「开播提醒 @全体成员」是关的")
+            return False
+        try:
+            reason = self._atall_quota().explain(gid)
+        except Exception:
+            reason = ""
+        if reason:
+            self._atall_note_skip(gid, reason)
+            return False
+        return True
+
+    def _atall_note_skip(self, gid: str, reason: str) -> None:
+        """同一群、同一天、同一原因只报一次，别每轮开播都刷同一句。"""
+        try:
+            day = time.strftime("%Y-%m-%d", time.localtime())
+            key = (gid, day, reason)
+            noted = getattr(self, "_atall_skip_noted", None)
+            if noted is None:
+                noted = self._atall_skip_noted = set()
+            if key in noted:
+                return
+            noted.add(key)
+            _log.info(f"群 {self._gname(gid)} 本次开播未 @全体：{reason}")
+        except Exception:
+            pass
+
+    def _atall_used(self, gid: str) -> None:
+        try:
+            self._atall_quota().mark_used(gid)
+            _log.info(f"群 {self._gname(gid)} 开播提醒已 @全体成员（该群今日额度已用完）")
+        except Exception:
+            pass
+
+    def _atall_failed(self, gid: str) -> None:
+        try:
+            self._atall_quota().mark_failed(gid)
+        except Exception:
+            pass
+
     async def _push_plain(self, gid: str, md: str, plain: str,
-                          msg_id=None) -> bool:
+                          msg_id=None, at_all: bool = False) -> bool:
         """纯文本推送（Markdown 没申请权限时用）。
 
         直接把 markdown 原文当文本发会看到一堆星号和大于号，
         所以走 notify.to_plain 转成用 Unicode 符号排版的文本。
+
+        at_all=True 时在正文最前面加官方 @全体 标签；平台不接受时
+        **去掉标签重发一次**，保证开播提醒本身不会被 @ 拖累到发不出去。
         """
         try:
             from notify import to_plain
@@ -3375,14 +4169,32 @@ class NotifyBot(botpy.Client):
             text = plain
         if not text:
             return False
+        tagged = atall.AT_ALL_TAG + "\n" + text if at_all else text
         try:
-            await self.qq.send_text(gid, text, msg_id=msg_id)
+            await self.qq.send_text(gid, tagged, msg_id=msg_id)
+            if at_all:
+                self._atall_used(gid)
             return True
         except Exception as e:
+            if at_all:
+                # 多半是机器人不是群管理员 / 今日额度已用。不占配额，只冷却，
+                # 然后**无条件**去掉标签重发一次。以前这里加了
+                # `and not is_no_perm_error(e)`：平台拒标签时返回的错误码有
+                # 时会被判成「主动消息无权限」，于是整个开播提醒被跳过 ——
+                # @ 没生效还把正事丢了。宁可多一次请求，也别吞掉卡片。
+                self._atall_failed(gid)
+                _log.warning(
+                    f"群 {self._gname(gid)} @全体未生效（{redact(str(e))[:60]}），"
+                    "已去掉 @全体重发；该群 30 分钟内不再尝试")
+                try:
+                    await self.qq.send_text(gid, text, msg_id=msg_id)
+                    return True
+                except Exception as e2:
+                    e = e2
             # 无权限时给能照做的提示，别只留一句"推送失败"
             if is_no_perm_error(e):
                 self._mark_no_perm(gid)
-                _log.warning(no_perm_hint(gid))
+                _log.warning(no_perm_hint(gid, self._gname(gid)))
                 return False
             _log.warning(f"纯文本推送失败：{e}")
             # 如果是"机器人已不在该群"，顺手把这个群清掉
@@ -3430,7 +4242,7 @@ class NotifyBot(botpy.Client):
             # 该群刚被官方回过"主动消息无权限" → 冷却期内先不推。
             # 不然每一轮都要撞两次墙，日志里成对刷同一条警告。
             if self._noperm_active(gid):
-                _log.debug(f"群 {gid[:8]}… 主动消息无权限，冷却中，本轮跳过")
+                _log.debug(f"群 {self._gname(gid)} 主动消息无权限，冷却中，本轮跳过")
                 continue
             # ⚠️ 每个群用自己的文案模板渲染 —— 不同群可以有不同的说法
             try:
@@ -3444,6 +4256,8 @@ class NotifyBot(botpy.Client):
             # 纯文本降级文案：用该群的模板渲染后转纯文本排版
             plain_g = to_plain(md_g) or short_hint(kind, name)
             md_g_no_img = strip_images(md_g) if cover else md_g
+            # 仅「开播提醒」@全体，且按群、按自然日限一次
+            want_at = self._atall_want(kind, gid)
             # 记下这条推送用到过哪些图。
             # ⚠️ 内嵌模式图片不落盘，光数缓存文件永远是 0 —— 面板
             #    「媒体缓存」就是靠这份清单才能列出动态/视频/直播的封面。
@@ -3468,30 +4282,79 @@ class NotifyBot(botpy.Client):
                         md_g_no_img = md_g    # 退回到卡片里带图
                 style = str(self.cfg.get("message_style", "markdown")).lower()
                 if style == "text":
-                    # 没申请 Markdown 权限：直接走纯文本
-                    ok = await self._push_plain(gid, md_g_no_img, plain_g)
+                    # 没申请 Markdown 权限：直接走纯文本（本来就是一条）
+                    ok = await self._push_plain(gid, md_g_no_img, plain_g,
+                                                at_all=want_at)
                 else:
+                    keyboard = build_keyboard(buttons)
+                    # @全体 默认**合成一条**：官方 2026-10-26 变更记录明确
+                    # 「群聊场景文本消息、markdown 消息支持 <qqbot-at-everyone />」，
+                    # 标签放在 markdown.content 最前面，和卡片同一条发出。
+                    # ⚠️ 两种模式都已**真机验证生效**（用户实测：标签在
+                    #    markdown.content 里会被渲染成高亮 @）。早期注释把
+                    #    合成模式写成「没验证过的假设、会被解析器吞掉」，是错的。
+                    #    · 带标签那条被拒 → 去掉标签重发同一张卡片，绝不丢提醒
+                    #    · 平台改行为/收下却显示普通文字 → 关掉「合并进卡片」
+                    #      回到同样已验证生效的「单独一条纯文本」模式
+                    merge = bool(want_at and self.cfg.get("at_all_merge", True))
+                    if want_at and not merge:
+                        # 回退模式：单独一条纯文本（标签落在 content 字段），
+                        # 这是用户截图里已确认生效的路径。
+                        at_text = (atall.AT_ALL_TAG + "\n"
+                                   + f"【开播提醒】{name} 开播啦！")
+                        try:
+                            await self.qq.send_text(gid, at_text)
+                            self._atall_used(gid)
+                        except Exception as e_at:
+                            self._atall_failed(gid)
+                            _log.warning(
+                                f"群 {self._gname(gid)} @全体未生效"
+                                f"（{redact(str(e_at))[:60]}）；卡片照常推送，"
+                                "该群 30 分钟内不再尝试 @全体")
+                    md_body = (atall.AT_ALL_TAG + "\n" + md_g_no_img
+                               if merge else md_g_no_img)
                     try:
-                        await self.qq.send_markdown(gid, md_g_no_img,
-                                                    keyboard=build_keyboard(buttons))
+                        await self.qq.send_markdown(gid, md_body,
+                                                    keyboard=keyboard)
                         ok = True
+                        if merge:
+                            self._atall_used(gid)
+                            _log.info(
+                                f"群 {self._gname(gid)} @全体已合并进开播卡片；"
+                                "若群里显示的是普通文字而非高亮 @，关掉设置里"
+                                "「@全体 合并进卡片」即可回到已验证的双消息模式")
                     except Exception as e_md:
-                        # ⚠️ 「主动消息无权限」时**不要**退纯文本：
-                        # Markdown 和纯文本走的是同一个权限，
-                        # 退过去必然也是同一个错 —— 只会多一次请求、
-                        # 多一条一模一样的警告。直接说清楚并冷却。
-                        if is_no_perm_error(e_md):
-                            self._mark_no_perm(gid)
-                            _log.warning(no_perm_hint(gid))
-                            ok = False
-                            continue
-                        # 发不出去多半是没申请 Markdown 权限
-                        # （或没报备域名）→ 自动退回纯文本，
-                        # 否则用户会完全收不到提醒。
-                        _log.warning(
-                            f"Markdown 推送失败，自动改用纯文本："
-                            f"{redact(str(e_md))[:80]}")
-                        ok = await self._push_plain(gid, md_g_no_img, plain_g)
+                        ok = False
+                        if merge:
+                            # 带标签那条被拒：不占配额、只冷却，然后
+                            # **去掉标签重发同一张卡片**。
+                            self._atall_failed(gid)
+                            _log.warning(
+                                f"群 {self._gname(gid)} @全体未生效"
+                                f"（{redact(str(e_md))[:60]}），已去掉 @全体"
+                                "重发同一张卡片；该群 30 分钟内不再尝试")
+                            try:
+                                await self.qq.send_markdown(
+                                    gid, md_g_no_img, keyboard=keyboard)
+                                ok = True
+                            except Exception as e_md2:
+                                e_md = e_md2
+                        if not ok:
+                            # ⚠️ 「主动消息无权限」时**不要**退纯文本：
+                            # Markdown 和纯文本走的是同一个权限，
+                            # 退过去必然也是同一个错 —— 只会多一次请求、
+                            # 多一条一模一样的警告。直接说清楚并冷却。
+                            if is_no_perm_error(e_md):
+                                self._mark_no_perm(gid)
+                                _log.warning(no_perm_hint(gid, self._gname(gid)))
+                                continue
+                            # 发不出去多半是没申请 Markdown 权限
+                            # （或没报备域名）→ 自动退回纯文本，
+                            # 否则用户会完全收不到提醒。
+                            _log.warning(
+                                f"Markdown 推送失败，自动改用纯文本："
+                                f"{redact(str(e_md))[:80]}")
+                            ok = await self._push_plain(gid, md_g_no_img, plain_g)
                 if not ok:
                     continue
                 heartbeat.bump("pushes")
@@ -3509,7 +4372,7 @@ class NotifyBot(botpy.Client):
                     last_push_at=time.time(),
                     last_push=f"{KIND_LABEL.get(kind, kind)} · {name}",
                 )
-                _log.info(f"已推送【{KIND_LABEL.get(kind, kind)}】{name} → 群 {gid[:8]}…")
+                _log.info(f"已推送【{KIND_LABEL.get(kind, kind)}】{name} → 群 {self._gname(gid)}")
             except Exception as e:
                 heartbeat.bump("errors")
                 heartbeat.touch(last_error=redact(str(e))[:200])
@@ -3517,11 +4380,11 @@ class NotifyBot(botpy.Client):
                     # 群还在，只是开着沙箱往正式群发被官方拒了。
                     # 说清楚，否则用户会以为机器人被踢出去、白折腾。
                     _log.warning(
-                        f"推送到群 {gid[:8]}… 失败：沙箱环境不能访问此资源 —— "
+                        f"推送到群 {self._gname(gid)} 失败：沙箱环境不能访问此资源 —— "
                         "到面板「设置 → 通用 → 沙盒群」关掉「沙箱环境」"
                         "（已支持热切换，不用重启机器人）")
                 else:
-                    _log.warning(f"推送到群 {gid[:8]}… 失败：{redact(str(e))}")
+                    _log.warning(f"推送到群 {self._gname(gid)} 失败：{redact(str(e))}")
                 self._note_send_error(gid, e)
             await asyncio.sleep(0.6)      # 主动消息频控保护
 
@@ -3599,7 +4462,30 @@ def is_gone_group_error(text) -> bool:
 #    且 Markdown 和纯文本走的是同一个权限，
 #    所以命中后不要再退纯文本重试一次（必然也是同一个错）。
 NO_PERM_CODES = ("40034105",)
+
+# @ 消息里的提及写法（内嵌 <@!xxx> 和纯文本 @机器人），用于剥离出指令文本
+_AT_MENTION_RE = re.compile(r"<@[^>]*>|@\S+")
 NO_PERM_WORDS = ("主动消息失败", "主动消息", "无权限")
+
+
+def _strip_at_mentions(text) -> str:
+    """去掉 @ 消息里的提及部分，留下真正的指令文本。
+
+    平台给的 content 里 @ 有两种写法（内嵌 `<@!xxx>` 和纯文本 `@机器人`），
+    两种都要剥掉，否则 "@机器人 测试" 永远匹配不上"测试"。
+    """
+    return _AT_MENTION_RE.sub(" ", str(text or "")).strip()
+
+
+def is_test_cmd(text) -> bool:
+    """这条 @ 消息是不是「@机器人 测试」这类自检指令。
+
+    ⚠️ 整句匹配，不做包含：群里聊"这个功能要测试一下"也会被 @ 到，
+    包含匹配会让人聊着天就被机器人插话。
+    """
+    word = _strip_at_mentions(text).lower()
+    return bool(word) and word in {
+        str(w).lower() for w in getattr(NotifyBot, "TEST_CMD_WORDS", ())}
 
 
 def is_no_perm_error(text) -> bool:
@@ -3620,9 +4506,12 @@ def is_no_perm_error(text) -> bool:
     return "主动消息失败" in low
 
 
-def no_perm_hint(gid: str = "") -> str:
-    """无权限时给一句能照做的话，不只是一句"失败了"。"""
-    who = f"群 {gid[:8]}… " if gid else ""
+def no_perm_hint(gid: str = "", label: str = "") -> str:
+    """无权限时给一句能照做的话，不只是一句"失败了"。
+
+    label 由调用方传群显示名；拿不到就干脆不写群，绝不摆 openid。
+    """
+    who = f"群 {label} " if label else ""
     return (
         f"{who}主动消息无权限（官方 40034105），这条提醒发不出去 —— "
         "机器人需要在该群获得主动发言权限："

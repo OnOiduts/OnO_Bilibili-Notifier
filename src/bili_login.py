@@ -41,7 +41,17 @@ PASSPORT = "https://passport.bilibili.com"
 NAV = "https://api.bilibili.com/x/web-interface/nav"
 REFRESH = PASSPORT + "/x/passport-login/web/cookie/refresh"
 
-DEFAULT_TTL_DAYS = 30      # 拿不到明确过期时间时的保守估计
+DEFAULT_TTL_DAYS = 7       # 拿不到明确过期时间时的保守估计
+CAP_TTL_DAYS = 7           # cookie 自带值再长也只算这么多天
+
+# ⚠️ 为什么是 7 天、为什么要封顶（用户实测定的，不是拍脑袋）：
+#   cookie 自己声明的到期时间常常是 179 天，但**实际第 7 天就掉**了。
+#   只按自带值算的话，面板一直显示"还剩一百多天"，到期提醒的区间
+#   永远进不去，于是又是那种"静默失效、好几天后才发现"的老毛病。
+#   所以两处都按 7 天：
+#     - 读不到任何到期时间时 → 按 7 天估
+#     - 读到了（哪怕写着 179 天）→ 封顶到「登录那一刻 + 7 天」
+#   宁可早提醒一两天，也不要等它静默失效 —— 早提醒顶多多点一次登录。
 
 
 def _headers(referer: str = "https://www.bilibili.com/") -> dict:
@@ -119,21 +129,42 @@ def sessdata_expires(cookie: str) -> float:
     return 0.0
 
 
-def effective_expires(cookie: str, saved: float = 0.0) -> tuple:
+def apply_cap(expires: float, since: float = 0.0) -> float:
+    """把过期时间封顶到「登录那一刻 + CAP_TTL_DAYS」。
+
+    cookie 自带值可能写着 179 天，但实测第 7 天就掉 —— 不封顶的话
+    面板一直显示"还剩一百多天"，提醒永远进不了区间。
+    since 拿不到（老版本存的根本没记）时不封顶，等用户下次登录带上。
+    """
+    try:
+        s = float(since or 0)
+        e = float(expires or 0)
+    except Exception:
+        return expires
+    if s <= 0 or e <= 0:
+        return expires
+    return min(e, s + CAP_TTL_DAYS * 86400)
+
+
+def effective_expires(cookie: str, saved: float = 0.0,
+                      since: float = 0.0) -> tuple:
     """定一个能用的过期时间：真实值优先，其次已记录的，最后才估算。
+
+    since 是「这串 cookie 是什么时候存下来的」（config 里的
+    bili_cookie_ts）。有它才能封顶；没有就不封，退回原值。
 
     返回 (expires, estimated)。estimated=True 表示这个数是猜的，
     UI 上要标明，免得用户被"还剩 29 天"骗了 —— 那正是估算值露馅的样子。
     """
     real = sessdata_expires(cookie)
     if real > 0:
-        return real, False
+        return apply_cap(real, since), False
     try:
         sv = float(saved or 0)
     except Exception:
         sv = 0.0
     if sv > 0:
-        return sv, True
+        return apply_cap(sv, since), True
     return time.time() + DEFAULT_TTL_DAYS * 86400, True
 
 
@@ -141,7 +172,10 @@ def expired_info(expires: float, now: float = None) -> dict:
     """把过期时间戳变成人话。"""
     now = now or time.time()
     left = expires - now
-    days = int(left // 86400)
+    # ⚠️ 必须向上取整：向下取整时"过了 5.2 天"会被算成剩 1 天，
+    #    直接跳到推群那一档，UI 那档只在"剩恰好 2.0 天"的瞬间成立 ——
+    #    实际等于没有。向上取整后第 5 天稳在 UI、第 6 天稳在推群。
+    days = int(-((-left) // 86400)) if left > 0 else 0
     return {
         "expires_at": expires,
         "expires_str": time.strftime("%Y-%m-%d %H:%M", time.localtime(expires)),
@@ -229,6 +263,64 @@ async def refresh_cookie(cookie: str) -> dict:
     # 用 B站 真正给的过期时间；解析不出来才退回保守估计
     expires = real_exp or (time.time() + DEFAULT_TTL_DAYS * 86400)
     return {"ok": True, "cookie": cookie_str(merged), "expires": expires}
+
+
+async def renew_cookie(cookie: str, allow_browser: bool = True,
+                       on_stage=None) -> dict:
+    """续期：先用 passport 接口，换不动就开浏览器让 B 站自己换。
+
+    为什么要有第二条路：
+        /x/passport-login/web/cookie/refresh 现在经常直接失败
+        （面板上就是「续期失败：请求错误」），大多是服务端风控。
+        点一下「续期」却什么都没换到，等于这个按钮是坏的 —— 所以接口
+        换不动时退回浏览器：真实浏览器环境里 B 站前端会自己续登录态。
+
+    ⚠️ 拿到的"新 cookie"只是候选，本函数**不写盘**。
+        可信与否要由调用方用 account_info() 向 B 站求证后再决定 ——
+        历史上把好 cookie 覆盖成残的，就是因为拿"接口说成功"当了准信儿。
+    """
+    tried = []
+    res = await refresh_cookie(cookie)
+    if res.get("ok"):
+        return {"ok": True, "cookie": res["cookie"],
+                "expires": float(res.get("expires") or 0),
+                "via": "passport", "changed": True, "tried": tried}
+
+    tried.append("接口：" + (res.get("msg") or "失败"))
+    if not allow_browser:
+        return {"ok": False, "msg": res.get("msg") or "续期失败",
+                "tried": tried, "need_relogin": False}
+
+    try:
+        import bili_browser_login as BBL
+    except ImportError:
+        return {"ok": False,
+                "msg": ("接口续期失败，而且没法用浏览器续（缺少 "
+                        "bili_browser_login 模块）。请用「浏览器登录」重新登录。"),
+                "tried": tried, "need_relogin": True}
+
+    try:
+        bres = await BBL.browser_refresh(cookie, on_stage=on_stage)
+    except BBL.BrowserLoginError as e:
+        return {"ok": False,
+                "msg": f"接口和浏览器都没换成：{e}",
+                "tried": tried + ["浏览器：" + str(e)], "need_relogin": True}
+    except Exception as e:
+        return {"ok": False,
+                "msg": f"浏览器续期出错：{type(e).__name__}: {e}",
+                "tried": tried + ["浏览器：" + str(e)], "need_relogin": False}
+
+    if bres.get("need_relogin"):
+        return {"ok": False,
+                "msg": bres.get("msg") or "这串 cookie 已经不被认可，请重新登录",
+                "tried": tried, "need_relogin": True}
+    if not (bres.get("cookie_str") or ""):
+        return {"ok": False, "msg": "浏览器里没读到 cookie",
+                "tried": tried, "need_relogin": True}
+    return {"ok": True, "cookie": bres["cookie_str"],
+            "expires": float(bres.get("expires") or 0),
+            "via": "browser", "changed": bool(bres.get("changed")),
+            "tried": tried}
 
 
 def _cookie_item_expires(ck) -> float:

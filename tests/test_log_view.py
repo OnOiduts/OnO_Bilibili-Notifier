@@ -1,11 +1,12 @@
 """验证：日志不全（多文件归并）+ 群代码翻译成群名 + 翻译不再指错方向。"""
 import os, sys, time, shutil, tempfile
-sys.path.insert(0, "/data/workspace/bili-notify/src")
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+sys.path.insert(0, SRC)
 
 TMP = tempfile.mkdtemp()
 os.chdir(TMP)
 for f in ("bot.py", "webui.py", "db.py", "logtranslate.py", "security.py"):
-    shutil.copy(os.path.join("/data/workspace/bili-notify/src", f), TMP)
+    shutil.copy(os.path.join(SRC, f), TMP)
 
 import logtranslate as lt
 

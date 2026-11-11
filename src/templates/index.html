@@ -2018,7 +2018,8 @@
     font-size:14px; font-weight:600; flex:none;
   }
   .tpl-hd b { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; }
-  #tplSheetBody { padding:15px; overflow:auto; }
+  /* 滚动条轨道常驻：内容从少变多时，输入框/按钮不会被挤窄 9px */
+  #tplSheetBody { padding:15px; overflow:auto; scrollbar-gutter:stable; }
 
   /* B站账户/UP主查询结果卡：头像 + 昵称 + UID 一行 */
   .up-card {
@@ -2258,6 +2259,8 @@
             <div class="hint">
               浏览器登录会弹出一个真窗口，在里面登录完这里自动更新；
               <b>已登录也能再点一次，用来续期</b>。
+              <br>第 5 天到期提醒触发时，面板会<b>自动在后台续期一次</b>；
+              没换到新 cookie 不会把"还剩几天"往后推，提醒照常来。
               <br>第一次会装 playwright（约 1-2 分钟），也可双击 <code>获取Cookie.bat</code>
             </div>
           </div>
@@ -2286,6 +2289,9 @@
           </div>
           <div id="biliMsg" class="msg"></div>
           <div id="biliMsg2" class="msg"></div>
+          <!-- 到期提醒触发时后台会自动跑一次续期。单独一个元素，
+               避免和手动点「续期」的进度提示抢同一个 biliMsg。 -->
+          <div id="autoRenewNote" class="msg"></div>
           <div class="hint" style="margin-top:8px">当前登录状态：<b id="sessState">读取中…</b></div>
         </div>
       </div>
@@ -2409,7 +2415,11 @@
           <div class="btns" style="margin-bottom:12px">
             <button class="btn pri" data-act="lookup">🔍 查询</button>
           </div>
-          <div id="lookupInfo"></div>
+          <!-- ⚠️「开启提醒」放在查询结果**之前**：
+               以前它在结果下面，用户先看结果、再往下找开关，
+               而结果卡片里又有一个「订阅」按钮 —— 两个添加入口、
+               开关还在另一头，很容易以为自己勾的没生效。
+               现在「查询 → 看建议 → 调开关 → 订阅」一条线走下来。 -->
           <div class="row"><label>开启提醒</label>
             <div class="btns">
               <!-- ⚠️ 以前是 <label><input type=checkbox hidden>，
@@ -2426,11 +2436,17 @@
               <button class="chip-tgl" id="defTopCmt" data-act="toggle-defkind" data-kind="top_comment">💬 置顶评论</button>
             </div>
             <div class="hint">
-              先点「🔍 查询」—— 系统会根据该 UP 主的实际情况给出建议，不会无脑全勾。<br>
+              订阅时就按这里勾的类型写进去 —— <b>不会因为你查了一次就被改回默认</b>。<br>
               「置顶评论」默认不勾：它指置顶动态下的置顶评论，噪音相对大，需要的话再单独开。
             </div>
           </div>
-          <div class="btns"><button class="btn pri" data-act="add-sub">💖 添加</button></div>
+          <div id="lookupInfo"></div>
+          <!-- 查询成功后这里会隐藏：结果卡片里已经有「💖 订阅这个 UP 主」，
+               再留一个「添加」就是两个入口、容易点错。没查询时它是唯一入口，
+               所以留着（直接按上面填的 UID 添加，不查也行）。 -->
+          <div class="btns" id="addSubDirectRow">
+            <button class="btn pri" data-act="add-sub">💖 添加</button>
+          </div>
           <div id="addSubMsg" class="msg"></div>
         </div>
 
@@ -2439,12 +2455,23 @@
           <div class="note">合集和「上面的 UP 主订阅」是<b>两套独立的东西</b>：同一个 UP 主可以订阅多个合集，每个合集的文案也能单独设置。<br>
             👉 更省事的做法：先在上面「🔍 查询」，结果里会分出「👤 UP 主 / 📦 合集」两栏，<b>点哪个加哪个</b>，不用自己找合集 ID。</div>
           <div class="row"><label>目标群</label><select id="seasonGroup"></select></div>
-          <div class="row"><label>UP 主 UID</label><input id="seasonUid" placeholder="合集属于谁"></div>
+          <!-- ⚠️ 没有「UP 主 UID」这个框了：
+               以前 uid 和合集链接是两处独立的输入，于是 uid 填一个人的、
+               链接填另一个人的也能成功 —— 库里就出现
+               「写着 A 的名字、装着 B 的合集」这种二合一怪物。
+               现在作者只从**链接里解析**（纯数字 ID 时才用上面刚查过的
+               UP 主补），一处来源，不可能再对不上。 -->
           <div class="row"><label>合集链接 或 合集 ID</label>
             <input id="seasonRef" placeholder="space.bilibili.com/UID/lists/合集ID?type=season">
-            <div class="hint">长这样：<code>space.bilibili.com/UID/lists/合集ID?type=season</code><br>合集里<b>新增视频才推送</b>，首次订阅只静默记录现有内容，不会把历史视频补推一遍。</div>
+            <div class="hint">长这样：<code>space.bilibili.com/UID/lists/合集ID?type=season</code><br>
+              只填数字 ID 也行，但那时得先在上面「🔍 查询」过这位 UP 主，否则认不出合集属于谁。<br>
+              合集里<b>新增视频才推送</b>，首次订阅只静默记录现有内容，不会把历史视频补推一遍。</div>
           </div>
-          <div class="btns"><button class="btn pri" data-act="add-season">📦 订阅合集</button></div>
+          <!-- 先查询、再确认：默认按钮是「🔍 查询」，
+               查到了才会出现下面的确认卡片和「📦 确认订阅」。
+               以前填完点一下就直接入库，填错了也要等每轮轮询报错才发现。 -->
+          <div class="btns"><button class="btn pri" data-act="lookup-season">🔍 查询合集</button></div>
+          <div id="seasonPick"></div>
           <div id="seasonMsg" class="msg"></div>
         </div>
       </div>
@@ -2503,12 +2530,13 @@
         <div class="card">
           <h3>💬 登记群</h3>
           <div class="hint" style="margin-bottom:11px">新群 @ 一下机器人就会自动出现在这里</div>
-          <div class="row"><label>群 ID（openid）</label>
+          <div class="row"><label>群 openid（仅登记新群时填）</label>
             <input id="newGid" placeholder="群 openid">
           </div>
           <div class="row"><label>群名（可留空，自动向官方查询）</label>
             <input id="newGname" placeholder="留空则自动获取">
           </div>
+          <div class="hint">登记后一律显示群名，不会再把这串 ID 摆出来；没取到群名时会显示为「未命名群 N」，可在这里备注。</div>
           <div class="btns"><button class="btn pri" data-act="add-group">➕ 登记</button></div>
           <div id="addGroupMsg" class="msg"></div>
           <div id="groupNameDetail"></div>
@@ -2572,6 +2600,7 @@
           <div class="sw"><div><div class="nm">用真实数据</div><div class="ds">取测试 UID 的真实内容；关掉就是占位文字，卡片里没有封面/配图</div></div><button class="sw-btn on" data-act="toggle-testopt" data-opt="real"></button></div>
           <div class="sw"><div><div class="nm">带 🧪 测试标记</div><div class="ds">卡片最上面加一行「🧪 测试」，便于区分</div></div><button class="sw-btn on" data-act="toggle-testopt" data-opt="mark"></button></div>
           <div class="sw"><div><div class="nm">发到沙盒群</div><div class="ds">关掉后每次会让你手动选群</div></div><button class="sw-btn on" data-act="toggle-testopt" data-opt="sandbox"></button></div>
+          <div class="sw"><div><div class="nm">测试也 @全体成员</div><div class="ds">只对「开播提醒」生效；会消耗该群平台侧今天唯一 1 次额度，默认关。正式开播的 @全体 由「⚙️ 设置」里的开关控制，与这里无关</div></div><button class="sw-btn" data-act="toggle-testopt" data-opt="atall"></button></div>
         </div>
         <!-- ⚠️ 上次发送详情：「实际发出的图片行」是诊断"比例不对 / 手机看不到图"
              的唯一依据。以前只塞进 toast —— 几秒就消失，用户根本来不及看
@@ -2688,6 +2717,13 @@
             <input id="cPoll" type="number" min="8" step="1" value="12">
             <div class="hint" id="pollRangeHint">撞风控会自动放慢，平稳后自动加快；顶部心跳波形的周期跟着这个值走</div>
           </div>
+          <!-- ⚠️「最快档」= bot.py 读的 poll_interval_min。
+               以前面板只暴露「检查间隔」(基线)，这个值只能手改 config.yaml：
+               用户填了 12，平稳后照样自动掉到 8s，看着像"设定没生效"。 -->
+          <div class="row"><label>最快档（秒）</label>
+            <input id="cPollMin" type="number" min="3" max="3600" step="1" value="8">
+            <div class="hint" id="pollMinHint">平稳后自动加快到的下限。想固定不加速，就填成和「检查间隔」一样；保存后下一轮即时生效，不用重启机器人</div>
+          </div>
           <div class="row"><label>投稿/动态（每 N 轮，1=每轮）</label>
             <input id="cSlow" type="number" min="1" max="60" step="1" value="1">
             <div class="hint">直播每轮都查；投稿和动态没那么急，可以隔几轮查一次省请求。当前后台值：<b id="slowNow">1</b></div>
@@ -2770,6 +2806,14 @@
           <div class="fold-bd">
           <div class="sw"><div><div class="nm">下播也提醒</div><div class="ds">开播之外，下播时再推一条</div></div>
             <label class="sw-btn"><input type="checkbox" id="cOffline" style="display:none"></label>
+          </div>
+          <div class="sw"><div><div class="nm">开播提醒 @全体成员</div>
+            <div class="ds">只有「开播提醒」会 @；下播、投稿、动态都不 @。官方限制：机器人需为该群管理员，<b>每个群每天只能 @ 1 次</b>，当天用完后其余开播照常推送但不再 @。发送被拒会自动去掉 @ 重发，不会丢提醒</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cAtAllLive" checked style="display:none"></label>
+          </div>
+          <div class="sw"><div><div class="nm">@全体 合并进卡片</div>
+            <div class="ds">默认开：@全体成员和开播卡片合成<b>一条</b>消息。官方 2026-10-26 起 markdown 消息支持 &lt;qqbot-at-everyone /&gt;，但这条路径没在真机上验证过平台是否把标签渲染成高亮 @。<b>如果群里显示的是普通文字而不是 @</b>，关掉这里即可回到已验证生效的「单独一条纯文本 @」模式；官方每群每天仍限 1 次</div></div>
+            <label class="sw-btn"><input type="checkbox" id="cAtAllMerge" checked style="display:none"></label>
           </div>
           <div class="sw"><div><div class="nm">只推 UP 主本人的置顶评论</div><div class="ds">粉丝刷上去的不推，噪音更少</div></div>
             <label class="sw-btn"><input type="checkbox" id="cOnlyUpCmt" checked style="display:none"></label>

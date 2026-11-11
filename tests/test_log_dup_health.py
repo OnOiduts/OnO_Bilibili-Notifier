@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import tempfile
 
-BASE = "/data/workspace/bili-notify/src"
+BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, BASE)
 
 ok = 0
@@ -87,7 +87,7 @@ print("== 3. /api/log 相邻完全重复只留一条 ==")
 #    结果读的仍是源码目录里那份被测试污染的 bot.log。
 _SUB = r'''
 import os, sys, json, shutil, tempfile
-BASE = "/data/workspace/bili-notify/src"
+BASE = os.environ["BILI_TRUE_SRC"]
 W = tempfile.mkdtemp()
 for f in os.listdir(BASE):
     if f.endswith(".py"):
@@ -111,6 +111,7 @@ print("__JSON__" + json.dumps({"ok": d.get("ok"),
                                "lines": d.get("lines") or []},
                               ensure_ascii=False))
 '''
+os.environ["BILI_TRUE_SRC"] = BASE
 _p = subprocess.run([sys.executable, "-c", _SUB], capture_output=True,
                     text=True, timeout=180)
 if "__JSON__" in (_p.stdout or ""):

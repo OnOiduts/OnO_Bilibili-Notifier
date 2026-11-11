@@ -3232,14 +3232,20 @@ def t_data_file_default():
 
 
 def t_at_all_switch():
-    """@全体 已整个移除（v1.18.0），不应再有开关逻辑。
+    """v1.18.0 移除的是**旧** @全体（@everyone，当年群聊不支持）。
 
-    群聊官方不支持 @everyone（仅文字子频道），且机器人无法被设为
-    管理员，所以这个功能留着只会让人困惑，已移除。
+    官方 2026-10-26 在群聊重新开放 @全部成员，用新标签
+    <qqbot-at-everyone />（机器人需为群管理员、每群每天 1 次）。
+    v2.3.5 起按新标签接回，所以这里不再断言「无 @全体」，改为正向锁住
+    「新标签 / 只限开播 / 单独走 content 字段」，并保留对旧 db 列、
+    旧 toggle 的残留检查（那两样才是被移除的东西）。
     """
     src = io.open(os.path.join(BASE_DIR, "bot.py"), encoding="utf-8").read()
-    ck("无 @全体 分支", "全体" not in src)
-    ck("无 at_all 引用", "at_all" not in src)
+    ck("@全体 用官方群聊新标签", "atall.AT_ALL_TAG" in src
+       and "@everyone" not in src)
+    ck("@全体 只限开播提醒", 'if kind != "live":' in src)
+    ck("@全体 单独走纯文本 content 字段",
+       "await self.qq.send_text(gid, at_text)" in src)
 
     import notify as N
     ck("notify 无 at_all_text", not hasattr(N, "at_all_text"))

@@ -263,3 +263,130 @@ def run(timeout: int = 180, on_stage=None, should_cancel=None) -> dict:
     """
     return asyncio.run(browser_login(timeout=timeout, on_stage=on_stage,
                                      should_cancel=should_cancel))
+
+
+async def browser_refresh(cookie: str, timeout: int = 45,
+                          on_stage=None) -> dict:
+    """静默续期：把现有 cookie 喂进真实浏览器，让 B 站自己把登录态续上。
+
+    为什么需要这条退路：
+        passport 的 /x/passport-login/web/cookie/refresh 接口现在经常
+        直接失败（面板上看到的就是「续期失败：请求错误」），原因大多是
+        服务端风控，裸接口很难过。但在真实浏览器里访问 B 站时，登录态
+        是 B 站前端自己续的 —— 带着真实浏览器环境，成功率高得多。
+        所以接口换不动时，就退回"开个浏览器让它自己换"。
+
+    ⚠️ 前提是旧 cookie 还没彻底失效：
+        已经 -101 的话，浏览器里同样是未登录状态，谁都续不出来。那种
+        情况本函数返回 need_relogin=True，由调用方引导用户重新登录。
+        判据是「我们注入的 SESSDATA 被页面清掉了」——页面会主动删掉
+        不被认可的登录态 cookie，删了就说明它已经不被认。
+
+    返回：
+        {"cookies": {...}, "cookie_str": "...", "expires": 时间戳,
+         "changed": SESSDATA 是否被换成了新的}
+    """
+    def stage(msg):
+        if on_stage:
+            try:
+                on_stage(msg)
+            except Exception:
+                pass
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        raise BrowserLoginError(
+            "缺少 playwright，没法用浏览器续期。请执行：\n"
+            "    pip install playwright\n"
+            "或者直接用「浏览器登录」重新登录一次。")
+
+    from bili_login import parse_cookie, cookie_str, sessdata_expires
+
+    old = parse_cookie(cookie or "")
+    if not old.get("SESSDATA"):
+        raise BrowserLoginError("现有 cookie 里没有 SESSDATA，没法续期")
+    old_sess = old.get("SESSDATA", "")
+    old_exp = sessdata_expires(cookie or "")
+
+    stage("查找本机浏览器…")
+    exe = find_chromium()
+    launch_kwargs = {"headless": True}          # 续期不需要人看，静默跑
+    if exe:
+        launch_kwargs["executable_path"] = exe
+
+    deadline = time.time() + max(5, int(timeout or 45))
+    async with async_playwright() as p:
+        stage("启动浏览器…")
+        try:
+            browser = await p.chromium.launch(**launch_kwargs)
+        except Exception as e:
+            raise BrowserLoginError(f"浏览器启动失败：{str(e)[:200]}")
+
+        try:
+            ctx = await browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"))
+
+            stage("把现有登录态放进浏览器…")
+            jar = [{"name": k, "value": v, "domain": ".bilibili.com",
+                    "path": "/"} for k, v in old.items() if v]
+            try:
+                await ctx.add_cookies(jar)
+            except Exception as e:
+                raise BrowserLoginError(f"写入 cookie 失败：{str(e)[:120]}")
+
+            page = await ctx.new_page()
+            stage("访问 B 站，等它自己续登录态…")
+            for url in (HOME_URL, "https://api.bilibili.com/x/web-interface/nav"):
+                if time.time() > deadline:
+                    break
+                try:
+                    await page.goto(url, timeout=20000,
+                                    wait_until="domcontentloaded")
+                except Exception:
+                    # 打不开不一定就失败：cookie 可能已经落定，继续往下判断
+                    pass
+
+            # 轮询：B 站前端续期是异步的，多看几眼
+            cur = {}
+            cur_raw = []
+            cur_exp = 0.0
+            changed = False
+            while time.time() < deadline:
+                cur_raw = await ctx.cookies()
+                cur = _pick_from_cookies(cur_raw)
+                cur_exp = _expires_from_cookies(cur_raw)
+                if not cur.get("SESSDATA"):
+                    # 注入的登录态被页面清掉了 —— 它已经不被 B 站认可
+                    return {"need_relogin": True,
+                            "msg": ("这串 cookie 已经不被 B 站认可了（放进浏览器"
+                                    "就被清掉），续不出来。请重新登录一次。")}
+                if (cur.get("SESSDATA") != old_sess
+                        or (cur_exp and cur_exp > old_exp + 60)):
+                    changed = True
+                    break
+                await asyncio.sleep(2)
+
+            if not cur.get("SESSDATA"):
+                return {"need_relogin": True,
+                        "msg": "浏览器里读不到登录态，请重新登录一次。"}
+
+            return {
+                "cookies": cur,
+                "cookie_str": cookie_str(cur),
+                "expires": cur_exp or 0.0,
+                "changed": changed,
+            }
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+def run_refresh(cookie: str, timeout: int = 45, on_stage=None) -> dict:
+    """同步入口（同 run()：直接 await 协程是不会执行的）。"""
+    return asyncio.run(browser_refresh(cookie=cookie, timeout=timeout,
+                                       on_stage=on_stage))

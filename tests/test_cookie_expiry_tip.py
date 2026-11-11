@@ -150,8 +150,9 @@ def test_tip_text_is_clear():
     ck("列了会提前失效的几种情况",
        "别处重新登录" in tip and "强制下线" in tip)
     ck("说了不会自动续期", "自动续期" in tip or "续期" in tip)
-    ck("写了 2~5 天这一档", "2 ~ 5 天" in tip)
-    ck("写了不足 2 天这一档", "不足 2 天" in tip)
+    ck("写了第 5 天这一档", "第 5 天" in tip)
+    ck("写了第 6 天这一档", "第 6 天" in tip)
+    ck("写明只按 7 天算（不信自带值）", "7 天" in tip)
     ck("说了会员到期是另一回事", "会员到期" in tip)
 
 

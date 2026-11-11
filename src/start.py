@@ -26,6 +26,64 @@ from security import restrict_perms
 import paths
 import db
 
+
+def _refresh_user_site():
+    """Make pip --user packages importable, even on a Store Python.
+
+    site.py adds the user site at interpreter startup only, and only when
+    the directory already exists. Two separate failures are common here:
+      1. pip creates the --user directory *during this run* (first install),
+         so the current process never saw it;
+      2. the Microsoft Store build may leave user site disabled entirely or
+         redirect %APPDATA%, so EVEN A FRESH PROCESS cannot import the
+         packages that pip just reported as "Successfully installed" --
+         every launch then downloads everything again.
+    The launcher also exports PYTHONPATH for all children; this is the
+    fallback for running start.py directly.
+    """
+    cands = []
+    appdata = os.environ.get("APPDATA", "")
+    py_tag = "Python%d%d" % sys.version_info[:2]
+    if appdata:
+        cands.append(os.path.join(appdata, "Python", py_tag, "site-packages"))
+    localapp = os.environ.get("LOCALAPPDATA", "")
+    if localapp:
+        cands.append(os.path.join(
+            localapp, "Packages",
+            "PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0",
+            "LocalCache", "Roaming", "Python", py_tag, "site-packages"))
+    try:
+        import site
+        p = site.getusersitepackages()
+        cands.extend(p if isinstance(p, (list, tuple)) else [p])
+    except Exception:
+        pass
+    # project-local vendor dir, if deps were installed with --target.
+    # globals().get keeps this safe when the function body is executed
+    # standalone in a test namespace (no __file__ there).
+    _here = globals().get("__file__") or os.path.join(os.getcwd(), "src")
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(_here)),
+                              "_vendor"))
+    added = []
+    for d in cands:
+        if isinstance(d, str) and d and os.path.isdir(d):
+            d = os.path.normpath(d)
+            if d not in sys.path:
+                sys.path.append(d)
+                added.append(d)
+    if added:
+        try:
+            import importlib
+            importlib.invalidate_caches()
+        except Exception:
+            pass
+    return added
+
+
+# Run BEFORE missing_deps(): on a broken user site the check must not
+# trigger a pointless re-download of packages that are already installed.
+_refresh_user_site()
+
 # ⚠️ 这里曾经列着 ("qrcode", "qrcode") —— 它只服务于「扫码登录 B 站」这一种方式，
 #    而面板已经改成浏览器登录（playwright）为主，扫码入口都从界面上摘掉了。
 #    结果是：一个没人用的库被当成必装项，没装就直接拦住启动，装了也用不上。
@@ -45,6 +103,22 @@ def missing_deps():
     return miss
 
 
+def _deps_ok_in_fresh_process():
+    """Verify with a NEW interpreter: it re-runs site.py, so it sees a
+    just-created user site. This mirrors the next launch, which is what
+    actually matters -- start.py itself only spawns the panel and the bot.
+    """
+    mods = ",".join(m for m, _ in REQUIRED)
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", "import " + mods],
+            cwd=BASE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=60)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def ensure_deps():
     # exe 版：依赖已经编进程序里，而且机器上未必有 python/pip，
     # 再去 pip install 只会卡住甚至报错。
@@ -57,19 +131,47 @@ def ensure_deps():
         return True
     safe_print(f"[1/4] 正在安装依赖：{'、'.join(miss)}（第一次会比较慢，请等）")
     req = paths.asset("requirements.txt")
-    cmd = [sys.executable, "-m", "pip", "install", "-r", req]
-    r = subprocess.run(cmd, cwd=BASE)
+    # requirements.txt 必须保持纯 ASCII：pip 用系统 locale 解码 -r 文件，
+    # 中文 Windows 是 GBK，UTF-8 中文注释会直接抛 UnicodeDecodeError。
+    base = [sys.executable, "-m", "pip", "install", "-r", req]
+    attempts = (base, base + ["-i", MIRROR],
+                base + ["--user", "-i", MIRROR])
+    r = None
+    for i, cmd in enumerate(attempts):
+        if i == 1:
+            safe_print("       官方源失败，换用清华镜像重试…")
+        elif i == 2:
+            safe_print("       镜像也失败，改用 --user 再试一次…")
+        r = subprocess.run(cmd, cwd=BASE)
+        if r.returncode == 0:
+            break
     if r.returncode != 0:
-        safe_print("       官方源失败，换用清华镜像重试…")
-        r = subprocess.run(cmd + ["-i", MIRROR], cwd=BASE)
-    if r.returncode != 0:
-        safe_print("       仍然失败。请手动执行：")
-        safe_print(f"       {sys.executable} -m pip install --user -r requirements.txt")
-        return False
+        # 不带 -r：万一清单又被改回含中文，手动这条路仍然能走通。
+        safe_print("       仍然失败。请手动执行（不要带 -r，避免再撞编码问题）：")
+        safe_print(f'       "{sys.executable}" -m pip install --user '
+                   "qq-botpy aiohttp PyYAML Flask playwright")
+        return 4
+    # pip 装完后再补一次路径（首次 --user 安装时目录是本轮才创建的）。
+    _refresh_user_site()
     if missing_deps():
-        safe_print("       装完仍缺依赖，请手动安装后重试。")
-        return False
-    safe_print("       安装完成")
+        # 再兜一次：用新解释器验证，等价于「下一次启动能不能用」。
+        if not _deps_ok_in_fresh_process():
+            # 走到这里说明连新进程都 import 不到：商店版 Python 的 user site
+            # 没生效，重装一百次也没用。给出能直接复制的 PYTHONPATH 命令。
+            try:
+                import site as _site
+                _usp = _site.getusersitepackages()
+            except Exception:
+                _usp = os.path.join(os.environ.get("APPDATA", ""),
+                                    "Python", "Python%d%d" % sys.version_info[:2],
+                                    "site-packages")
+            safe_print("       依赖已经装好，但当前解释器加载不到它们（商店版 Python 的 user site 未生效）。")
+            safe_print("       不要反复重装。先设置下面这行，再重跑启动脚本：")
+            safe_print(f'       set "PYTHONPATH={_usp};%PYTHONPATH%"')
+            return 4
+        safe_print("       安装完成（已在新进程验证）")
+    else:
+        safe_print("       安装完成")
     return True
 
 
@@ -364,9 +466,12 @@ def main():
     safe_print(" OnOBN · 仅 Windows 桌面环境实测；服务器环境未测试，遇到问题欢迎反馈")
     safe_print("=" * 58)
 
-    if not ensure_deps():
+    dep_rc = ensure_deps()
+    if dep_rc is not True:
         pause_if_interactive()
-        return 2                        # 桌面版据此判断失败
+        # 4 = 依赖安装/加载失败。绝不能复用 2（凭据不全），
+        # 否则启动脚本会瞎提示去填 AppID / AppSecret。
+        return int(dep_rc) if dep_rc else 4
     ensure_config()
     safe_print("[2/4] 配置文件已就绪")
     # 数据目录打印出来：出问题时用户知道去哪儿找配置、订阅和日志，

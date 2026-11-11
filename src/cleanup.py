@@ -22,6 +22,197 @@ import threading
 import time
 import paths
 
+
+def _decode_out(buf):
+    """子进程输出统一解码。
+
+    Windows 中文版的 locale 是 GBK，但 `chcp 65001` / PowerShell 的
+    ConvertTo-Csv 会吐 UTF-8；subprocess 的文本模式按 locale 解码，
+    遇到 UTF-8 续字节 0x80 就抛 UnicodeDecodeError，读线程整个崩掉。
+    这里优先 UTF-8、再退回 GBK/mbcs，最后 replace 兜底：解析只认 PID
+    和数字，个别中文字符变成替换符也不影响结果。
+    """
+    if buf is None:
+        return ""
+    if isinstance(buf, str):
+        return buf
+    for enc in ("utf-8", "gbk", "mbcs"):
+        try:
+            return buf.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return buf.decode("utf-8", errors="replace")
+
+# ------------------------------------------------------------ Win32 进程工具
+#
+# ⚠️ 为什么不能再用 tasklist.exe / taskkill.exe / wmic：
+#    这三者都依赖 WMI 的 framedyn.dll。本机 framedyn 损坏或缺失时，
+#    它们启动即 0xc0000142 (STATUS_DLL_INIT_FAILED)，Windows 弹一个
+#    "tasklist.exe - Application Error" 模态框挡在启动流程前面；
+#    即便点掉「确定」，stdout 也是空的 → 残留检查误判成「没有残留」。
+#    而「进程还活着吗 / 关掉它」本来就是 kernel32 的一次 API 调用：
+#    OpenProcess + GetExitCodeProcess / TerminateProcess，微秒级、零子进程、
+#    零弹窗。PowerShell（Get-CimInstance）走的是另一条 COM 路径，实测
+#    在本机正常，故保留；它失败时也不再退回 wmic，改用纯 Python 兜底。
+# ------------------------------------------------------------
+_NT = (os.name == "nt")
+_k32 = None
+_PE32 = None
+_INVALID_HANDLE = (1 << 64) - 1
+
+if _NT:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                     wintypes.DWORD]
+        _k32.OpenProcess.restype = wintypes.HANDLE
+        _k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(wintypes.DWORD)]
+        _k32.GetExitCodeProcess.restype = wintypes.BOOL
+        _k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        _k32.TerminateProcess.restype = wintypes.BOOL
+        _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        _k32.CloseHandle.restype = wintypes.BOOL
+        _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        _k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        _k32.Process32FirstW.restype = wintypes.BOOL
+        _k32.Process32NextW.restype = wintypes.BOOL
+
+        class _PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        _PE32 = _PROCESSENTRY32W
+        _k32.Process32FirstW.argtypes = [wintypes.HANDLE,
+                                         ctypes.POINTER(_PE32)]
+        _k32.Process32NextW.argtypes = [wintypes.HANDLE,
+                                        ctypes.POINTER(_PE32)]
+    except Exception:
+        _k32 = None
+        _PE32 = None
+
+_STILL_ACTIVE = 259
+_PROC_QUERY_LIMITED = 0x1000
+_PROC_TERMINATE = 0x0001
+_TH32CS_SNAPPROCESS = 0x00000002
+
+
+def _win_pid_alive(pid: int) -> bool:
+    """进程还活着吗 —— 纯 kernel32，不启动任何外部程序。"""
+    if not _NT or _k32 is None:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except Exception:
+            return False
+    h = None
+    try:
+        h = _k32.OpenProcess(_PROC_QUERY_LIMITED, False, int(pid))
+        if not h:
+            return False
+        code = wintypes.DWORD()
+        if not _k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return False
+        return code.value == _STILL_ACTIVE
+    except Exception:
+        return False
+    finally:
+        if h:
+            try:
+                _k32.CloseHandle(h)
+            except Exception:
+                pass
+
+
+def _win_enum_procs():
+    """{pid: ppid} —— kernel32 进程快照，纯 API，零外部进程。"""
+    if not _NT or _k32 is None or _PE32 is None:
+        return {}
+    snap = None
+    try:
+        snap = _k32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if snap is None or int(snap or 0) in (0, _INVALID_HANDLE):
+            return {}
+        e = _PE32()
+        e.dwSize = ctypes.sizeof(_PE32)
+        out = {}
+        ok = _k32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            out[int(e.th32ProcessID)] = (int(e.th32ParentProcessID),
+                                         str(e.szExeFile).lower())
+            ok = _k32.Process32NextW(snap, ctypes.byref(e))
+        return out
+    except Exception:
+        return {}
+    finally:
+        if snap:
+            try:
+                _k32.CloseHandle(snap)
+            except Exception:
+                pass
+
+
+def _win_terminate(pid: int) -> bool:
+    """终止单个进程 —— 替代 taskkill /F /PID。"""
+    if not _NT or _k32 is None:
+        try:
+            os.kill(int(pid), 9)
+            return True
+        except Exception:
+            return False
+    h = None
+    try:
+        h = _k32.OpenProcess(_PROC_TERMINATE, False, int(pid))
+        if not h:
+            return False
+        return bool(_k32.TerminateProcess(h, 1))
+    except Exception:
+        return False
+    finally:
+        if h:
+            try:
+                _k32.CloseHandle(h)
+            except Exception:
+                pass
+
+
+def _win_terminate_tree(pid: int) -> bool:
+    """连子进程一起关 —— 替代 taskkill /F /T。
+
+    先子后父：父进程先死的话，子进程的 ppid 会变，树就断了。
+    """
+    procs = _win_enum_procs()
+    if not procs:
+        return _win_terminate(pid)
+    seen = set()
+
+    def _rec(p):
+        if p in seen:
+            return
+        seen.add(p)
+        for child, info in procs.items():
+            parent = info[0] if isinstance(info, tuple) else info
+            if parent == p:
+                _rec(child)
+        _win_terminate(p)
+
+    _rec(int(pid))
+    return True
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 只认这些脚本，避免误杀别的 Python 程序
@@ -40,9 +231,7 @@ def _pid_alive(pid: int) -> bool:
         if pid <= 0:
             return False
         if os.name == "nt":
-            r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
-                               capture_output=True, text=True, timeout=10)
-            return str(pid) in (r.stdout or "")
+            return _win_pid_alive(pid)
         os.kill(pid, 0)
         return True
     except Exception:
@@ -50,13 +239,13 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _alive_set(pids) -> set:
-    """批量判断一批进程号里哪些还活着 —— **只起一次子进程**。
+    """批量判断一批进程号里哪些还活着 —— Windows 上零外部进程。
 
-    ⚠️ 为什么必须批量：以前 _pid_alive() 对**每一个** pid 单独起一次
-       tasklist。Windows 上 tasklist 单次就要 0.3~1s，.bot.pids 里攒了
-       多少个就起多少次 —— 攒到 50 个就是 15~50 秒。而 all_ours() 每次
-       启动都要跑，跑一次就要这么久，"越用越慢"有一半是这么来的。
-       现在一次 tasklist 把全机 PID 取回来，剩下的在内存里比对。
+    ⚠️ 历史：最早 _pid_alive() 对每一个 pid 单独起一次 tasklist，
+       50 个 pid 就是 15~50 秒；后来改成"一次 tasklist 取全机再比对"。
+       两种都依赖 tasklist.exe，而它在本机会 0xc0000142 弹窗。
+       现在 Windows 直接逐个 OpenProcess（微秒级），不再起任何子进程；
+       非 Windows 保持 os.kill(pid, 0)，测试桩也仍替得住这一路。
     """
     ids = set()
     for p in pids or ():
@@ -69,19 +258,10 @@ def _alive_set(pids) -> set:
     if not ids:
         return set()
     if os.name == "nt":
-        try:
-            r = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
-                               capture_output=True, text=True, timeout=15)
-        except Exception:
-            # 批量拿不到就退回逐个（慢，但保证正确性）
-            return {p for p in ids if _pid_alive(p)}
-        live = set()
-        for ln in (r.stdout or "").splitlines():
-            # "python.exe","1234","Console","1","12,345 K"
-            parts = [x.strip().strip('"') for x in ln.split('","')]
-            if len(parts) >= 2 and parts[1].isdigit():
-                live.add(int(parts[1]))
-        return {p for p in ids if p in live}
+        # OpenProcess 是微秒级 API 调用，一次都不用起子进程。
+        # 以前为了少起几次 tasklist 才做"全机快照 + 内存比对"，
+        # 现在批量反而多余，且 tasklist 损坏时会弹 0xc0000142。
+        return {p for p in ids if _win_pid_alive(p)}
     # 非 Windows：os.kill(pid, 0) 本身是微秒级，批量化没有意义，
     # 这里统一走 _pid_alive —— 保持"只有一处真正判定存活"，
     # 测试替身（替 _pid_alive）也才替得住。
@@ -335,49 +515,47 @@ def is_ours(cmdline: str) -> bool:
     return False
 
 
-def _list_ps_wmic() -> list:
-    """Windows 兜底：用 wmic 拿命令行。
+def _reg_argv(pid: int) -> str:
+    """从实例登记表读回命令行（登记表本来就写了 argv 字段）。"""
+    try:
+        import json
+        with open(_reg_file(int(pid)), encoding="utf-8") as f:
+            return str(json.load(f).get("argv", "") or "")
+    except Exception:
+        return ""
 
-    ⚠️ 为什么必须加这条：PowerShell 那条路在不少机器上**根本跑不起来**
-       （执行策略受限 / PowerShell 被精简 / 家庭版策略），一旦失败
-       `list_ours()` 就返回空 —— 面板据此显示"残留 0"，清理按钮也就
-       无从下手。实际进程还活着，于是"杀了但没杀干净"。
-       wmic 在新版 Win11 上被移除，所以两条**都要试**，谁成功用谁。
+
+def _list_ps_wmic() -> list:
+    """PowerShell 失败时的兜底 —— 纯 Python，不再起 wmic。
+
+    ⚠️ wmic 和 tasklist 同样依赖 WMI/framedyn.dll，本机一样会
+       0xc0000142 弹窗；新版 Win11 还直接移除了 wmic。
+       改为 kernel32 进程快照 + 三个「已知属于本项目」的来源
+       （登记表 / PID 文件 / 面板端口）取交集，命令行从登记表读，
+       全程零外部进程。宁可漏掉没登记的旧实例，也绝不误杀别的程序。
     """
     out = []
-    try:
-        r = subprocess.run(
-            ["wmic", "process", "where",
-             " or ".join("name='%s'" % n for n in _proc_names()), "get",
-             "ProcessId,CommandLine", "/format:list"],
-            capture_output=True, text=True, timeout=25)
-    except Exception:
+    if not _NT:
         return out
-    if not (r.stdout or "").strip():
+    procs = _win_enum_procs()
+    if not procs:
         return out
-    pid = 0
-    cmd = ""
-    for raw in (r.stdout or "").splitlines():
-        line = raw.strip()
-        if not line:
-            if pid and is_ours(cmd):
-                out.append((pid, cmd))
-            pid, cmd = 0, ""
+    names = {n.lower() for n in _proc_names()}
+    known = set()
+    for src in (registry_pids, _pids_from_file, pids_on_ports):
+        try:
+            for p in src():
+                known.add(int(p))
+        except Exception:
             continue
-        if "=" not in line:
+    for pid, info in procs.items():
+        exe = info[1] if isinstance(info, tuple) else ""
+        if exe not in names or pid not in known:
             continue
-        k, v = line.split("=", 1)
-        k = k.strip().lower()
-        if k == "processid":
-            try:
-                pid = int(v.strip())
-            except (TypeError, ValueError):
-                pid = 0
-        elif k == "commandline":
-            cmd = v.strip()
-    if pid and is_ours(cmd):
-        out.append((pid, cmd))
-    return out
+        cmd = _reg_argv(pid)
+        if cmd and is_ours(cmd):
+            out.append((pid, cmd))
+    return sorted(out)
 
 
 def list_ours() -> list:
@@ -392,8 +570,8 @@ def list_ours() -> list:
                 "| ConvertTo-Csv -NoTypeInformation"
             )
             r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                               capture_output=True, text=True, timeout=25)
-            for line in (r.stdout or "").splitlines()[1:]:
+                               capture_output=True, timeout=25)
+            for line in _decode_out(r.stdout).splitlines()[1:]:
                 parts = [x.strip().strip('"') for x in line.split('","')]
                 if len(parts) >= 2 and parts[0].isdigit():
                     pid, cmd = int(parts[0]), parts[1] if len(parts) > 1 else ""
@@ -408,8 +586,8 @@ def list_ours() -> list:
 
     try:
         r = subprocess.run(["ps", "-eo", "pid=,args="],
-                           capture_output=True, text=True, timeout=15)
-        for line in (r.stdout or "").splitlines():
+                           capture_output=True, timeout=15)
+        for line in _decode_out(r.stdout).splitlines():
             m = re.match(r"\s*(\d+)\s+(.*)", line)
             if m and is_ours(m.group(2)):
                 out.append((int(m.group(1)), m.group(2)))
@@ -433,16 +611,14 @@ def pids_on_ports(ports=(8088, 8089, 8090, 8091, 8092, 8093, 8094,
     try:
         if os.name == "nt":
             r = subprocess.run(["netstat", "-ano", "-p", "TCP"],
-                               capture_output=True, text=True, timeout=20)
-            lines = (r.stdout or "").splitlines()
+                               capture_output=True, timeout=20)
+            lines = _decode_out(r.stdout).splitlines()
         else:
-            r = subprocess.run(["ss", "-ltnp"], capture_output=True,
-                               text=True, timeout=15)
-            lines = (r.stdout or "").splitlines()
+            r = subprocess.run(["ss", "-ltnp"], capture_output=True, timeout=15)
+            lines = _decode_out(r.stdout).splitlines()
             if not lines:
-                r = subprocess.run(["netstat", "-ltnp"], capture_output=True,
-                                   text=True, timeout=15)
-                lines = (r.stdout or "").splitlines()
+                r = subprocess.run(["netstat", "-ltnp"], capture_output=True, timeout=15)
+                lines = _decode_out(r.stdout).splitlines()
     except Exception:
         return out
 
@@ -502,12 +678,12 @@ def _cmdline_of(pid: int) -> str:
                 % pid
             )
             r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                               capture_output=True, text=True, timeout=20)
-            rows = (r.stdout or "").splitlines()[1:]
+                               capture_output=True, timeout=20)
+            rows = _decode_out(r.stdout).splitlines()[1:]
             return rows[0].strip().strip('"') if rows else ""
         r = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
-                           capture_output=True, text=True, timeout=10)
-        return (r.stdout or "").strip()
+                           capture_output=True, timeout=10)
+        return _decode_out(r.stdout).strip()
     except Exception:
         return ""
 
@@ -603,15 +779,14 @@ def kill_ours(dry: bool = False, keep=None) -> int:
     for pid in pids:
         try:
             if os.name == "nt":
-                # /T 连子进程一起杀，否则孙进程（bot/webui）会留下来
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                               capture_output=True, timeout=15)
+                # 连子进程一起关，否则孙进程（bot/webui）会留下来
+                _win_terminate_tree(pid)
             else:
                 os.kill(pid, 9)
         except Exception:
             pass
 
-    # ⚠️ 杀完必须**复查**：taskkill 可能因权限/僵尸状态没真杀掉，
+    # ⚠️ 杀完必须**复查**：终止可能因权限/僵尸状态没真生效，
     #    不复查的话返回的永远是"我发过命令了"，而不是"真的没了"。
     time.sleep(0.4)
     still = [p for p in pids if p in _alive_set(pids)]
@@ -620,8 +795,7 @@ def kill_ours(dry: bool = False, keep=None) -> int:
         for pid in still:
             try:
                 if os.name == "nt":
-                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                                   capture_output=True, timeout=10)
+                    _win_terminate(pid)
                 else:
                     os.kill(pid, 9)
             except Exception:

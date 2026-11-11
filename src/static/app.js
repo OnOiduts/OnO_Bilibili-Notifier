@@ -581,6 +581,12 @@ function afterSecOpen() { safe('reveal', initReveal); }
 
 /* ---------- 全局状态 ---------- */
 let STATE = { groups: [], kinds: [], config: {}, templates: {} };
+/* 群显示名统一口径：后端 /api/state 每个群都带 label（有群名用群名，
+   没有则是「未命名群 N」）。group_openid 只作内部键（option value、
+   data-gid、API 参数），不再出现在任何给人看的文字里。 */
+function gLabel(g) {
+  return (g && (g.label || g.name)) || '未命名群';
+}
 // 文案模板：输入框 id -> 配置键。9 项要和 notify.DEFAULT_TEMPLATES 对上，
 // 之前只有 6 项，下播和置顶评论改不了；后来补到 8 项又漏了 season，
 // 于是 #tSeason 输入框虽然在页面上显示，却既不回填也存不进去。
@@ -592,6 +598,13 @@ const TPL_FIELDS = [
   ['tTopCmt', 'top_comment'], ['tSeason', 'season'],
 ];
 let LOOKUP = null;
+/* 上面「🔍 查询」查到的 UP 主 uid。
+   下面订阅合集只填了纯数字 ID 时，用它补出"这个合集属于谁"
+   （不再有手填 UID 的框，避免两处来源对不上）。 */
+let LAST_LOOKUP_UID = '';
+/* 合集查询的结果。查到了才有值，点「确认订阅」时直接用它，
+   保证"看到的是什么"和"写进去的是什么"是同一个东西。 */
+let SEASON_PICK = null;
 /* 查询结果里顺带带回来的合集清单：
    「点 UP 主加 UP 主、点合集加合集」用的就是它。
    单独存一份，群下拉框换了要重画时不用再查一次。 */
@@ -605,11 +618,14 @@ const CFG_FIELDS = ['cAppid', 'cSecret', 'cPoll', 'cSlow',
                     'cSandbox', 'cSandbox2', 'cOffline', 'cImage', 'cImgMode',
                     'cSizeHint', 'cHintW', 'cHintH', 'cHintMaxH', 'cHintCell', 'cGridMode',
                     'cImgMax',
-                    'cPlainMsg', 'cOnlyUpCmt', 'cSandboxGroup',
+                    'cPlainMsg', 'cOnlyUpCmt', 'cSandboxGroup', 'cAtAllLive',
+                    'cAtAllMerge',
                     'cTimeout', 'cDedupe',
                     // ⚠️ 这几个以前**没登记**，后果是：改了不进 FORM_DIRTY，
                     //    loadState() 一刷就用后台值把输入框覆盖回去（用户正在填也会被冲掉）。
-                    'cMinReqInt', 'cPollMax', 'cLogTrans', 'cDebugLog',
+                    // ⚠️ cPollMin 同样必须登记：不登记就不会进 FORM_DIRTY，
+                    //    loadState() 每 15 秒一刷把刚填的最快档冲回后台旧值。
+                    'cMinReqInt', 'cPollMax', 'cPollMin', 'cLogTrans', 'cDebugLog',
                     // ⚠️ cGraceOn / cGraceRounds 以前没登记：改完不进 FORM_DIRTY，
                     //    loadState() 每 15 秒一刷就用后台值把框覆盖回去，
                     //    看着就是"改了不保存、刷新又变回原样"。
@@ -675,7 +691,7 @@ async function loadState() {
   fillCfg();
   // v1.31.0：顶部状态条 / 沙盒群 / 健康度 / 待办 / 最近动态 / 测试 UID
   GROUP_NAME = {};
-  (d.groups || []).forEach(function (g) { GROUP_NAME[g.gid] = g.name || g.gid; });
+  (d.groups || []).forEach(function (g) { GROUP_NAME[g.gid] = gLabel(g); });
   safe('topbar', renderTopBar);
   safe('sandbox', syncSandbox);
   safe('health', renderHealth);
@@ -689,7 +705,48 @@ async function loadState() {
   safe('backup', loadBackupInfo);
   safe('about', loadAbout);
   safe('expiry', renderExpiryBanner);
+  safe('expiry', renderAuthBadBanner);
   return d;
+}
+
+/* ---------- B 站登录态"实际失效"横幅 ----------
+   与上面的到期横幅是两回事：到期看的是 cookie 上写的到期时间，
+   这里看的是 B站 当轮的实际回答。被风控踢下线（-352/-403）时，
+   剩余天数可能还有 179 天，到期横幅永远不会亮，只能靠这个。
+   机器人连续 N 次（默认 5）被拦才认定，所以不会一抖动就弹。
+   认定后同时往沙盒群推一条 —— 面板不开着也收得到。 */
+function renderAuthBadBanner() {
+  try {
+    var box = (STATE && STATE.config && STATE.config.bili_auth_bad) || null;
+    var bad = box && box.bad;
+    var old = document.getElementById('authBadBanner');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    /* 恢复后（bad 为 false）不显示——横幅自己会在下一轮刷新时消失，
+       机器人那边也会记一条「登录态已恢复」。 */
+    if (!bad) return;
+    var txt = box.text || 'B 站登录态已失效，投稿/动态查不动了';
+    var el = document.createElement('div');
+    el.id = 'authBadBanner';
+    el.style.cssText = 'position:fixed;left:50%;top:14px;transform:translateX(-50%);'
+      + 'z-index:9998;max-width:92vw;padding:10px 16px;border-radius:10px;'
+      + 'font-size:13px;line-height:1.5;box-shadow:0 6px 24px rgba(0,0,0,.35);'
+      + 'background:rgba(180,40,40,.95);color:#fff;border:1px solid #ff6b6b;';
+    el.textContent = '🔴 ' + txt;
+    var btn = document.createElement('a');
+    btn.href = '#';
+    btn.textContent = '去处理';
+    btn.style.cssText = 'margin-left:10px;color:#fff;text-decoration:underline;'
+      + 'cursor:pointer;font-weight:600;';
+    btn.onclick = function (e) {
+      e.preventDefault();
+      try { showSec('cred'); showTab('cred', 'bili'); } catch (_) { }
+      var t = document.getElementById('biliCard');
+      if (t) { try { t.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) { } }
+      return false;
+    };
+    el.appendChild(btn);
+    document.body.appendChild(el);
+  } catch (_) { /* 横幅不能把整页刷新带崩 */ }
 }
 
 /* ---------- B 站登录态到期横幅 ----------
@@ -1037,7 +1094,7 @@ function renderGuide() {
 function fillSelects() {
   const opts = (STATE.groups || []).map(g => {
     // 没拿到名字时别只显示一截 ID —— 标成"未命名"更好认
-    const label = g.name ? g.name : ('未命名群 ' + g.gid.slice(0, 8));
+    const label = gLabel(g);
     const n = (g.subs || []).length;
     return '<option value="' + esc(g.gid) + '">' + esc(label) +
            (n ? ' · 已订 ' + n : '') + '</option>';
@@ -1080,6 +1137,13 @@ function fillSelects() {
         if (MIG_SCOPE === 'part') renderMigPick();
       });
     }
+    // 换**目标群**也要重画：哪些算"目标群已有"变了，划线置灰得跟着变
+    if (id === 'migDst' && !el._migBound) {
+      el._migBound = true;
+      el.addEventListener('change', () => {
+        if (MIG_SCOPE === 'part') renderMigPick();
+      });
+    }
   });
   /* ⚠️ loadState 会周期性跑，无条件重画会把用户刚勾好的东西清掉
      —— 只在源群真的变了时才重画。 */
@@ -1097,7 +1161,7 @@ function fillSelects() {
     const cur = sg.value || ((STATE.config || {}).sandbox_group || '');
     sg.innerHTML = '<option value="">不启用（测试时手动选群）</option>' +
       (STATE.groups || []).map(g => {
-        const label = g.name ? g.name : ('未命名群 ' + g.gid.slice(0, 8));
+        const label = gLabel(g);
         return '<option value="' + esc(g.gid) + '">' + esc(label) + '</option>';
       }).join('');
     sg.value = cur;
@@ -1114,6 +1178,32 @@ function migSrcGroup() {
   var gid = el && el.value;
   if (!gid) return null;
   return (STATE.groups || []).find(function (g) { return g.gid === gid; }) || null;
+}
+function migDstGroup() {
+  var el = $('migDst');
+  var gid = el && el.value;
+  if (!gid) return null;
+  return (STATE.groups || []).find(function (g) { return g.gid === gid; }) || null;
+}
+/* 目标群已经订过的 UP 主 / 合集。
+   这些搬过去只是覆盖一遍同样的东西，没有意义 —— 界面上直接划掉、置灰，
+   让用户一眼看出"剩下来这些才是真的要搬的"。
+   ⚠️ 不只是视觉提示：**禁止勾选**（点了会提示，选不上）。
+      以前"留着覆盖的口子"看着贴心，实际是坑：目标群那边的提醒设置会被
+      源群悄悄盖掉，而界面上看不出自己改了什么。真要覆盖，就去目标群那
+      边改，别借迁移的手。 */
+function migDupSet() {
+  var g = migDstGroup();
+  if (!g || g.gid === (migSrcGroup() || {}).gid) return { ups: {}, seas: {} };
+  var ups = {};
+  ((g && g.subs) || []).forEach(function (s) {
+    ups[String(s.uid)] = 1;
+  });
+  var seas = {};
+  ((g && g.seasons) || []).forEach(function (s) {
+    seas[String(s.uid) + ':' + String(s.season_id)] = 1;
+  });
+  return { ups: ups, seas: seas };
 }
 function migKindName(k) {
   return ({ live: '直播', video: '投稿', dynamic: '动态',
@@ -1147,13 +1237,16 @@ function renderMigPick() {
     updateMigStat();
     return;
   }
+  var dup = migDupSet();
   box.innerHTML = subs.map(function (s) {
     var nSea = seas.filter(function (x) {
       return String(x.uid) === String(s.uid);
     }).length;
-    var any = ['live', 'video', 'dynamic', 'top_comment'].some(function (k) {
-      return !!(s.kinds && s.kinds[k] && s.kinds[k].on);
-    });
+    // ⚠️ 默认**一律不选**（以前是"源群开着就预先勾上"）。
+    // 迁移是破坏性操作，默认全勾等于把"确认"这一步省掉了 ——
+    // 手滑点一下「全体迁移」就整个搬走。宁可让用户自己勾。
+    // 「只选已开启的」那个按钮仍然可以一键勾上想搬的。
+    var isDup = !!dup.ups[String(s.uid)];
     var chips = ['live', 'video', 'dynamic', 'top_comment'].map(function (k) {
       var on = !!(s.kinds && s.kinds[k] && s.kinds[k].on);
       return '<button class="chip-tgl' + (on ? ' on' : '') +
@@ -1161,13 +1254,15 @@ function renderMigPick() {
         '" data-kind="' + k + '" data-tip="' + escAttr(kindTip(k)) +
         '">' + esc(migKindName(k)) + '</button>';
     }).join('');
-    // 默认选中：源群里这位 UP 至少开着一类提醒，才预先选上
-    return '<div class="mig-card' + (any ? ' on' : '') + '"' +
-      ' data-act="mig-card" data-uid="' + esc(s.uid) + '">' +
+    return '<div class="mig-card' + (isDup ? ' dup' : '') + '"' +
+      ' data-act="mig-card" data-uid="' + esc(s.uid) + '"' +
+      (isDup ? ' data-tip="目标群已经订过这位 UP 主，不允许重复迁移"' : '') +
+      '>' +
       '<div class="li">' +
       '<div class="av" data-name="' + esc(s.uname || '?') + '"' +
         (s.face ? ' data-face="' + esc(s.face) + '"' : '') + '></div>' +
       '<div class="bd"><div class="t1">' + esc(s.uname || ('UID ' + s.uid)) +
+        (isDup ? '<span class="dup-tag">目标群已有</span>' : '') +
         '</div><div class="t2">UID ' + esc(String(s.uid)) +
         (nSea ? ' · 该 UP 有 ' + nSea + ' 个合集' : '') + '</div></div>' +
       '</div>' +
@@ -1196,16 +1291,23 @@ function renderMigSea() {
       '打开之后才能在这里挑要搬哪几个合集。</div>';
     return;
   }
+  var dup = migDupSet();
   box.innerHTML = seas.map(function (s) {
     var nm = s.uname || ('UID ' + s.uid);
-    return '<div class="mig-card on" data-act="mig-sea-card"' +
-      ' data-uid="' + esc(s.uid) + '" data-sid="' + esc(s.season_id) + '">' +
+    // 同 UP 主卡片：默认不选；目标群已订过的划掉、置灰、禁止勾选
+    var isDup = !!dup.seas[String(s.uid) + ':' + String(s.season_id)];
+    return '<div class="mig-card' + (isDup ? ' dup' : '') +
+      '" data-act="mig-sea-card"' +
+      ' data-uid="' + esc(s.uid) + '" data-sid="' + esc(s.season_id) + '"' +
+      (isDup ? ' data-tip="目标群已经订过这个合集，不允许重复迁移"' : '') +
+      '>' +
       '<div class="li">' +
       '<div class="av season-av" data-name="📦"' +
       (seasonFace(s)
         ? ' data-face="' + esc(proxyImg(seasonFace(s))) + '"' : '') + '></div>' +
       '<div class="bd"><div class="t1">📦 ' +
-        esc(s.title || ('合集 ' + s.season_id)) + '</div>' +
+        esc(s.title || ('合集 ' + s.season_id)) +
+        (isDup ? '<span class="dup-tag">目标群已有</span>' : '') + '</div>' +
       '<div class="t2">' + esc(nm) + ' · 合集 ID ' + esc(String(s.season_id)) +
       '</div></div></div>' +
       '</div>';
@@ -1225,7 +1327,10 @@ function updateMigStat() {
 }
 function collectMigPicks() {
   var map = {};
-  var cards = document.querySelectorAll('#migPickList .mig-card.on');
+  /* ⚠️ :not(.dup) 是最后一道闸：点击入口已经不给勾了，但万一某张卡片
+       同时带着 on 和 dup（换目标群后的残留、脚本改的），收集时也得滤掉，
+       否则请求里会混进目标群已有的条目。 */
+  var cards = document.querySelectorAll('#migPickList .mig-card.on:not(.dup)');
   for (var i = 0; i < cards.length; i++) {
     var uid = cards[i].getAttribute('data-uid');
     if (!uid) continue;
@@ -1245,7 +1350,7 @@ function collectMigPicks() {
 function collectMigSeasons() {
   if (!MIG_SEASONS) return [];
   var out = [];
-  var cards = document.querySelectorAll('#migSeaList .mig-card.on');
+  var cards = document.querySelectorAll('#migSeaList .mig-card.on:not(.dup)');
   for (var i = 0; i < cards.length; i++) {
     var sid = cards[i].getAttribute('data-sid');
     if (sid) out.push(sid);
@@ -1296,9 +1401,13 @@ function defKindOn(id, def) {
   return !!def;
 }
 
-function setDefKind(id, on) {
+/* 用户亲手拨过的提醒类型 → 查询完之后不许自动改回去。
+   只认"手动拨过"：没动过的项仍然按 UP 主的实际情况给建议。 */
+const DEFKIND_TOUCHED = {};
+function setDefKind(id, on, kind) {
   const el = $(id);
   if (!el || el._missing) return;
+  if (kind && DEFKIND_TOUCHED[kind]) return;   // 手动定过的，别覆盖
   if (el.classList) el.classList.toggle('on', !!on);
   if (typeof el.checked === 'boolean') el.checked = !!on;
 }
@@ -1330,7 +1439,7 @@ function renderGrpList() {
     return;
   }
   box.innerHTML = gs.map(g => {
-    const label = g.name || ('未命名群 ' + String(g.gid).slice(0, 8));
+    const label = gLabel(g);
     const _f = grpFaceOf(g);
     const face = _f ? proxyImg(_f) : '';
     const nUp = (g.subs || []).length;
@@ -1339,7 +1448,7 @@ function renderGrpList() {
       '<div class="av grp-av" data-name="' + esc(label) + '"' +
       (face ? ' data-face="' + esc(face) + '"' : '') + '></div>' +
       '<div class="bd"><div class="t1">' + esc(label) + '</div>' +
-      '<div class="t2">' + esc(String(g.gid).slice(0, 16)) + '…</div></div>' +
+      '<div class="t2">点卡片展开订阅</div></div>' +
       '<span class="gl-tag">' + nUp + ' UP · ' + nSea + ' 合集</span>' +
       '<span class="gl-ok">正常</span>' +
       '<button class="btn dg" data-act="remove-group" data-gid="'
@@ -1612,11 +1721,16 @@ function cookieTip(d) {
   L.push('');
   if (d && d.expires_estimated) {
     L.push('没能从 SESSDATA 里解出真实到期时间，');
-    L.push('所以按登录时刻往后推 30 天估算，仅供参考。');
+    L.push('所以按登录时刻往后推 7 天估算，仅供参考。');
     L.push('重新登录一次就能拿到真实值。');
   } else {
     L.push('它是从 SESSDATA 自身读出来的真实到期时刻，');
     L.push('不是拍脑袋写的固定值。');
+    L.push('');
+    L.push('⚠️ 但只按 7 天算，不再信它自己写的 179 天：');
+    L.push('实测这类 cookie 往往第 7 天就掉，按自带值算的话');
+    L.push('面板会一直显示"还剩一百多天"，提醒就永远不触发。');
+    L.push('宁可早提醒一两天，也不要等它静默失效。');
   }
   L.push('');
   L.push('❗ 但「有效期到那天」不等于「能用那么久」：');
@@ -1627,9 +1741,10 @@ function cookieTip(d) {
   L.push('本程序是拿 cookie 直接调接口，不像浏览器那样');
   L.push('每次访问会自动续期，所以走完这条期限就是到期。');
   L.push('');
-  L.push('🔔 到期提醒（自动的，不用管）：');
-  L.push('· 还剩 2 ~ 5 天 → 面板顶部橙色提醒');
-  L.push('· 还剩不足 2 天 / 已失效 → 面板红色告警 + 推沙盒群');
+  L.push('🔔 到期提醒（自动的，不用管，按第几天算）：');
+  L.push('· 第 1 ~ 4 天 → 安静');
+  L.push('· 第 5 天 → 面板顶部橙色提醒');
+  L.push('· 第 6 天起 / 已失效 → 面板红色告警 + 推沙盒群');
   L.push('');
   L.push('同一行的「会员到期」是大会员到期日，');
   L.push('跟 cookie 有效期是两回事，互不影响。');
@@ -1723,7 +1838,7 @@ function renderGroups(force) {
   box._idsKey = _idsKey;
   box.innerHTML = gs.map(g => {
     const gid = esc(g.gid);
-    const label = g.name || ('未命名群 ' + g.gid.slice(0, 8));
+    const label = gLabel(g);
     const nUp = (g.subs || []).length;
     const nSea = (g.seasons || []).length;
     const open = EXPANDED.has(g.gid);
@@ -1808,7 +1923,7 @@ function renderGroups(force) {
       '<div class="grp-head" data-act="toggle-group" data-gid="' + gid + '">' +
       '<span class="chev"></span>' +
       '<div class="grp-meta"><h3>💖 ' + esc(label) + '</h3>' +
-      '<div class="grp-sub">' + esc(g.gid.slice(0, 8)) + '… · ' + nUp +
+      '<div class="grp-sub">' + nUp +
       ' 位 UP 主 · ' + nSea + ' 个合集</div></div>' +
       '<span class="tag">' + nUp + ' UP</span>' +
       '<span class="tag">' + nSea + ' 合集</span>' +
@@ -2049,7 +2164,9 @@ function setSelectValue(el, val, fallback) {
 function syncSwCardSum() {
   const el = $('swCardSum');
   if (!el || el._missing) return;
-  const ids = [['cOffline', '下播'], ['cOnlyUpCmt', '只推本人置顶'],
+  const ids = [['cOffline', '下播'], ['cAtAllLive', '@全体'],
+               ['cAtAllMerge', '合并@'],
+               ['cOnlyUpCmt', '只推本人置顶'],
                ['cPlainMsg', '纯文本'], ['cLogTrans', '中文翻译']];
   const on = ids.filter(x => {
     const e = $(x[0]);
@@ -2093,8 +2210,9 @@ function fillCfg() {
   const c = STATE.config || {};
   [['cAppid', c.appid], ['cPoll', c.poll_interval], ['cSlow', c.slow_check_every],
    ['cTimeout', c.request_timeout], ['cDedupe', c.dedupe_window],
-   // ⚠️ 这两项真实生效但以前面板没有入口，只能手改 yaml
-   ['cMinReqInt', c.min_request_interval], ['cPollMax', c.poll_interval_max]]
+   // ⚠️ 这三项真实生效但以前面板没有入口，只能手改 yaml
+   ['cMinReqInt', c.min_request_interval], ['cPollMax', c.poll_interval_max],
+   ['cPollMin', c.poll_interval_min]]
     .forEach(([id, v]) => {
       if (FORM_DIRTY[id]) return;
       const el = $(id);
@@ -2129,6 +2247,14 @@ function fillCfg() {
   // 纯文本开关：Markdown 没申请权限时勾上
   if ($('cPlainMsg') && !FORM_DIRTY.cPlainMsg) {
     $('cPlainMsg').checked = String(c.message_style || 'markdown') === 'text';
+  }
+  // 开播提醒 @全体：默认开（用户没设过就是开）
+  if ($('cAtAllLive') && !FORM_DIRTY.cAtAllLive) {
+    $('cAtAllLive').checked = c.at_all_on_live !== false;
+  }
+  // @全体 合成模式：默认开（用户没设过就是合成一条）
+  if ($('cAtAllMerge') && !FORM_DIRTY.cAtAllMerge) {
+    $('cAtAllMerge').checked = c.at_all_merge !== false;
   }
   // 权限：只推 UP 主本人的置顶评论（群主/管理员限制不可配，固定生效）
   if ($('cOnlyUpCmt') && !FORM_DIRTY.cOnlyUpCmt) {
@@ -2196,17 +2322,21 @@ function fillCfg() {
   }
   syncGraceOn();
   /* 检查间隔的范围按**后台真实上下限**渲染，不写死 8~120。
-     改了「轮询上限」之后这里的数字会跟着变 —— 用户报的就是
-     "数值应该是多少到多少，并且会变化"。 */
+     改了「轮询上限」或「最快档」之后这里的数字会跟着变。 */
   var _pmin = Number(c.poll_interval_min || 8);
   var _pmax = Number(c.poll_interval_max || 120);
   var _pe = $('cPoll');
   if (_pe && !_pe._missing) { _pe.min = _pmin; _pe.max = _pmax; }
+  var _pme = $('cPollMin');
+  if (_pme && !_pme._missing) { _pme.min = 3; _pme.max = _pmax; }
   var _rh = $('pollRangeHint');
   if (_rh && !_rh._missing) {
-    _rh.textContent = '可填 ' + _pmin + '~' + _pmax +
-      ' 秒；撞风控自动放慢（最慢 ' + _pmax + 's），平稳后自动加快（最快 ' +
-      _pmin + 's）；顶部心跳波形的周期跟着这个值走';
+    /* ⚠️ 必须写清这是「基线」：以前只说会"平稳后自动加快"、并把最快档写死成 8s，
+       用户把检查间隔填成 12，以为那就是最快，结果稳下来还是掉到 8s。
+       现在最快档自己有一个可改的框，文案指向那个框。 */
+    _rh.textContent = '这是「基线」：可填 ' + _pmin + '~' + _pmax +
+      ' 秒；撞风控自动放慢（最慢 ' + _pmax + 's），平稳后加快到下面「最快档」' +
+      '（当前 ' + _pmin + 's），不会更快；顶部心跳波形的周期跟着这个值走';
   }
   // 投稿/动态：显示后台真实值，让用户一眼知道现在到底几轮查一次
   var _sn = $('slowNow');
@@ -2275,13 +2405,14 @@ function initFormDirty() {
       // ⚠️ 下拉框（cImgMode / cSandboxGroup）以前也不在列表里：
       //    选完得靠别的字段改动才顺带提交，看着就是"选了不保存"。
       if (['cSandbox', 'cSandbox2', 'cOffline', 'cImage', 'cPlainMsg',
-           'cOnlyUpCmt', 'cLogTrans', 'cDebugLog',
+           'cOnlyUpCmt', 'cLogTrans', 'cDebugLog', 'cAtAllLive', 'cAtAllMerge',
            'cImgMode', 'cSandboxGroup', 'cSizeHint', 'cHintW',
            'cHintH', 'cHintMaxH', 'cHintCell', 'cGridMode', 'cImgMax',
            // 启动后首轮静默：开关 / 轮数改完立刻存，不用再点「保存」
            'cGraceOn', 'cGraceRounds'].includes(id)) saveCfg(true);
       // 折叠卡片的摘要跟着变（「提醒开关」折着时也能看出开了几项）
-      if (['cOffline', 'cPlainMsg', 'cOnlyUpCmt', 'cLogTrans'].includes(id)) {
+      if (['cOffline', 'cAtAllLive', 'cAtAllMerge', 'cPlainMsg',
+           'cOnlyUpCmt', 'cLogTrans'].includes(id)) {
         syncSwCardSum();
       }
     });
@@ -2293,7 +2424,7 @@ function initFormDirty() {
   });
   // 文本类自动保存（防抖）
   let timer = null;
-  ['cAppid', 'cPoll', 'cSlow', 'cTimeout', 'cDedupe'].forEach(id => {
+  ['cAppid', 'cPoll', 'cPollMin', 'cSlow', 'cTimeout', 'cDedupe'].forEach(id => {
     const el = $(id);
     if (!el || el._missing) return;
     el.addEventListener('input', () => {
@@ -2329,7 +2460,7 @@ const SW_IDS = ['cSandbox', 'cSandbox2', 'cImage', 'cOffline', 'cOnlyUpCmt',
                    paintSwitches 不给 label 加 .on、initSwitches 不绑 change
                    → 点了没动画、外观纹丝不动、也不会自动保存。
                    tests/test_sw_ids.py 会扫 HTML 兜住这类漏登记。 */
-                'cGraceOn'];
+                'cGraceOn', 'cAtAllLive', 'cAtAllMerge'];
 
 /* ⚠️「沙箱环境」一对开关（凭据页 cSandbox + 设置→高级 cSandbox2）事故复盘：
    initFormDirty / initSwitches 的 change 监听在 DOMContentLoaded 里注册，
@@ -2396,6 +2527,9 @@ async function saveCfg(silent) {
     dedupe_window: $('cDedupe') ? $('cDedupe').value : 900,
     min_request_interval: $('cMinReqInt') ? $('cMinReqInt').value : 2.0,
     poll_interval_max: $('cPollMax') ? $('cPollMax').value : 120,
+    // ⚠️ 以前根本没进 body：面板没有这个框，后端也就收不到。
+    //    设了 12 却仍自动加快到 8s，根因就在这一行缺失。
+    poll_interval_min: $('cPollMin') ? $('cPollMin').value : 8,
     // 两个「沙箱环境」开关是同一个配置，取任意一个（已互相同步）
     is_sandbox: sandboxOn(),
     message_style: $('cPlainMsg') && $('cPlainMsg').checked ? 'text' : 'markdown',
@@ -2416,6 +2550,9 @@ async function saveCfg(silent) {
     top_comment_only_up: !$('cOnlyUpCmt') || $('cOnlyUpCmt').checked,
 
     notify_offline: $('cOffline').checked,
+    // 开播提醒 @全体（官方每群每天 1 次，由 bot 侧配额控制）
+    at_all_on_live: !$('cAtAllLive') || $('cAtAllLive').checked,
+    at_all_merge: !$('cAtAllMerge') || $('cAtAllMerge').checked,
     send_image: $('cImage').checked,
     // ⚠️ image_send_mode 以前**根本没进 body**：
     //    下拉框改了不提交，后端收不到 → "选了不保存"的直接原因。
@@ -2625,6 +2762,67 @@ async function loadBili() {
 
 
 let BROWSER_TIMER = null;
+let REFRESH_TIMER = null;
+
+/* 续期进度轮询。
+   ⚠️ 这里不走 showMsg —— 每 2 秒调一次会把提示音效也跟着响一遍。
+      轮询期间直接改文本，只有出结果时才走 showMsg（顺带出声）。 */
+async function pollRefresh() {
+  let d;
+  try {
+    d = await api('/api/bili/refresh/status');
+  } catch (e) {
+    return;  // 网络抖动下一次再查，不要中断轮询
+  }
+  if (!d || !d.ok) return;
+  const el = $('biliMsg');
+  if (d.running) {
+    if (el && !el._missing) {
+      el.className = 'msg show';
+      el.textContent = (d.stage || '正在续期…') +
+        '（已等 ' + (d.waited || 0) + 's' +
+        ((d.waited || 0) > 25 ? '，首次要装 playwright / 启动浏览器，请稍候' : '') +
+        '）';
+    }
+    return;
+  }
+  if (d.done) {
+    clearInterval(REFRESH_TIMER); REFRESH_TIMER = null;
+    showMsg('biliMsg', d.success ? (d.msg || '已续期 ✅') : (d.msg || '续期失败'),
+            d.success ? 'ok' : 'err');
+    if (d.success) loadBili();
+  }
+}
+
+/* 自动续期回显。
+   ⚠️ 提醒触发时是面板后台线程自己跑的，用户一个按钮都没点。不给回显，
+      就完全不知道跑没跑、换没换到。用独立元素而不是 biliMsg，
+      免得和手动续期的进度/结果互相覆盖；只在文案变化时更新，
+      否则 15 秒一次的轮询会反复重画（还会重放提示音）。 */
+let AUTO_RENEW_LAST = '';
+async function checkAutoRenew() {
+  let d;
+  try {
+    d = await api('/api/bili/refresh/status');
+  } catch (e) {
+    return;  // 面板刚起或网络抖动，下一次再查
+  }
+  if (!d || !d.ok) return;
+  const auto = d.auto || '';
+  if (auto !== AUTO_RENEW_LAST) {
+    AUTO_RENEW_LAST = auto;
+    const el = $('autoRenewNote');
+    if (el && !el._missing) {
+      el.className = auto ? 'msg show' : 'msg';
+      el.textContent = auto ? ('🤖 ' + auto) : '';
+    }
+  }
+  // 自动任务正在跑、又没有手动轮询时，挂一个 2s 轮询看进度
+  if (d.running && !REFRESH_TIMER) {
+    REFRESH_TIMER = setInterval(pollRefresh, 2000);
+  }
+}
+
 async function pollBrowser() {
   const d = await api('/api/bili/browser-status');
   const box = $('browserBox');
@@ -3259,9 +3457,15 @@ function renderLookupPick() {
     '<div class="mini-view' + (lkOn === 'lk-season' ? ' on' : '') +
     '" id="lk-season">' + seaBody + '</div>' +
     '<div class="hint" style="margin-top:8px">订阅到：<b>' +
-    esc(g ? (g.name || ('未命名群 ' + g.gid.slice(0, 8))) : '（先选一个群）') +
-    '</b> · 换群就重画一次，已订过的会标出来</div>' +
+    esc(g ? gLabel(g) : '（先选一个群）') +
+    '</b> · 换群就重画一次，已订过的会标出来' +
+    '<br>提醒类型按上面「开启提醒」勾的来，查完不会被改回默认' +
+    '</div>' +
     '</div>');
+  // 结果卡片里已经有「💖 订阅这个 UP 主」，底下那个「💖 添加」就藏起来，
+  // 免得同一件事两个入口、不知道该点哪个。
+  const direct = $('addSubDirectRow');
+  if (direct && !direct._missing) direct.hidden = true;
   initAvatars();
 }
 
@@ -3488,7 +3692,7 @@ const ACTIONS = {
             const same = String(base) === String(raw);
             let blTxt;
             if (bls.length > 1) {
-              blTxt = bls.map(b => (b.name ? esc(b.name) : esc((b.gid || '').slice(0, 8)))
+              blTxt = bls.map(b => esc(b.label || b.name || '未命名群')
                 + ' ' + esc(b.value === '' ? '（空）' : b.value)).join('、');
             } else {
               /* 已记的直播基线也可能存着 0/1/2，同样翻成中文再显示 */
@@ -3524,7 +3728,8 @@ const ACTIONS = {
       const bad = (d.detail || []).filter(x => x && x.reason);
       box.innerHTML = bad.length
         ? '<div class="diag-row">' + bad.map(x =>
-            '群 ' + esc(String(x.gid).slice(0, 8)) + '… → ' + esc(x.reason)
+            esc(x.label || (x.gid === '-' ? '全局' : '未命名群'))
+             + ' → ' + esc(x.reason)
           ).join('</div><div class="diag-row">') + '</div>'
         : '';
     }
@@ -3556,11 +3761,21 @@ const ACTIONS = {
   // 勾/取消某个「UP 主 × 提醒类型」
   // 外层大卡片：点整块切换"要不要搬"（未选中 → 整块变灰）
   'mig-card'(el) {
+    // 目标群已经订过的：不给勾。搬过去只会把目标群的设置盖掉，
+    // 而界面上看不出自己改了什么 —— 要改就去目标群那边改。
+    if (el.classList.contains('dup')) {
+      toast('目标群已经订过这位 UP 主了，不能重复迁移', 'err');
+      return;
+    }
     el.classList.toggle('on', !el.classList.contains('on'));
     updateMigStat();
   },
   // 合集的大卡片：按住 data-sid，选中 = 搬这个合集
   'mig-sea-card'(el) {
+    if (el.classList.contains('dup')) {
+      toast('目标群已经订过这个合集了，不能重复迁移', 'err');
+      return;
+    }
     el.classList.toggle('on', !el.classList.contains('on'));
     updateMigStat();
   },
@@ -3569,6 +3784,10 @@ const ACTIONS = {
        以前只凭 .chip-tgl.on 收集，卡片选没选中跟小卡片是两回事 ——
        于是会出现"整块看着是灰的，里面的提醒却已经勾上了"。 */
     const card = el.closest('.mig-card');
+    if (card && card.classList.contains('dup')) {
+      toast('目标群已经订过这位 UP 主了，不能重复迁移', 'err');
+      return;
+    }
     if (card && !card.classList.contains('on')) {
       toast('先在卡片上点一下选中它，再挑要搬哪些提醒', 'err');
       return;
@@ -3579,11 +3798,16 @@ const ACTIONS = {
   'mig-pick'(el) {
     const mode = el.getAttribute('data-all');
     const g = migSrcGroup();
+    const dup = migDupSet();
     const seaMode = (migActiveTab() === 'season');
     if (seaMode) {
       // 合集那一栏：只有"选中/不选中"，没有提醒类型可分
       document.querySelectorAll('#migSeaList .mig-card').forEach(c => {
-        c.classList.toggle('on', mode === '1');
+        // 「只选已开启的」= 挑出目标群还没有的（目标群已有的划掉了，不必再搬）
+        const want = (mode === 'on')
+          ? !c.classList.contains('dup')
+          : (mode === '1' ? !c.classList.contains('dup') : false);
+        c.classList.toggle('on', !!want);
       });
       updateMigStat();
       return;
@@ -3592,13 +3816,17 @@ const ACTIONS = {
       const uid = card.getAttribute('data-uid');
       const s = ((g && g.subs) || [])
         .find(x => String(x.uid) === String(uid));
-      // 「只选已开启的」：源群里这位 UP 一类都没开 → 整块不选
+      // 「只选已开启的」：源群里这位 UP 一类都没开 → 整块不选；
+      // 目标群已经订过的也跳过 —— 搬过去只是覆盖一遍同样的东西。
       const any = ['live', 'video', 'dynamic', 'top_comment']
         .some(k => !!(s && s.kinds && s.kinds[k] && s.kinds[k].on));
+      const isDup = !!dup.ups[String(uid)];
       let want;
-      if (mode === '1') want = true;
+      // 目标群已经订过的一律不给勾（含「全选」），不然全选会把目标群的
+      // 提醒设置整片盖掉，而界面上完全看不出来。
+      if (mode === '1') want = !isDup;
       else if (mode === '0') want = false;
-      else want = any;
+      else want = any && !isDup;
       card.classList.toggle('on', !!want);
       card.querySelectorAll('.chip-tgl').forEach(c => {
         let kon;
@@ -3642,8 +3870,8 @@ const ACTIONS = {
     if (!src || !dst) { showMsg('migMsg', '先选好源群和目标群', 'err'); return; }
     if (src === dst) { showMsg('migMsg', '源群和目标群不能是同一个', 'err'); return; }
     const gs = STATE.groups || [];
-    const sn = (gs.find(g => g.gid === src) || {}).name || ('群 ' + src.slice(0, 8));
-    const dn = (gs.find(g => g.gid === dst) || {}).name || ('群 ' + dst.slice(0, 8));
+    const sn = gLabel(gs.find(g => g.gid === src) || {});
+    const dn = gLabel(gs.find(g => g.gid === dst) || {});
     const extra = migExtra();
     if (extra === null) return;
     let tip;
@@ -3678,16 +3906,73 @@ const ACTIONS = {
   async 'clear-utpl'(el) {
     await saveUpTpl(el.dataset.gid, el.dataset.uid, true);
   },
+  /* 合集订阅改成两步：先查、再确认。
+
+     以前是「填 uid + 填 ID → 点一下直接入库」，于是出现
+     **uid 填 A、合集链接填 B 也能成功** —— 库里记着 A 的名字却装着 B 的
+     合集，界面上完全看不出错，只有等它永远推不出东西才会被发现。
+     现在先查一次，把「这个合集归谁、叫什么、多少个视频」摆出来给用户看，
+     确认了才写库。 */
+  async 'lookup-season'() {
+    const ref = ($('seasonRef') && $('seasonRef').value || '').trim();
+    const box = $('seasonPick');
+    if (!ref) { showMsg('seasonMsg', '先填合集链接或合集 ID', 'err'); return; }
+    if (box && !box._missing) {
+      box.innerHTML = '<div class="hint"><span class="spinner"></span> 查询中…</div>';
+    }
+    showMsg('seasonMsg', '');
+    const d = await post('/api/season/lookup', {
+      ref: ref, uid: LAST_LOOKUP_UID || '' });
+    if (!d.ok) {
+      if (box && !box._missing) box.innerHTML = '';
+      SEASON_PICK = null;
+      showMsg('seasonMsg', d.msg || '没查到这个合集', 'err');
+      return;
+    }
+    SEASON_PICK = d;
+    // 作者跟"上面查过的那位"对不上时明着说一声 —— 这正是二合一的症状，
+    // 说清楚了用户自己就能发现填错，而不是等订阅完才发现。
+    const warn = d.owner_fixed
+      ? '<div class="hint" style="margin-top:6px">⚠️ 这个合集不属于你上面查的那位 UP 主，' +
+        '已按<b>链接里的作者</b>「' + esc(d.uname || ('UID ' + d.uid)) +
+        '」记录。</div>'
+      : '';
+    box.innerHTML =
+      '<div class="li">' +
+      '<div class="av season-av" data-name="📦"' +
+      (d.cover ? ' data-face="' + esc(proxyImg(d.cover)) + '"' : '') + '></div>' +
+      '<div class="bd"><div class="t1">📦 ' +
+      esc(d.title || ('合集 ' + d.season_id)) + '</div>' +
+      '<div class="t2">' + esc(d.uname || ('UID ' + d.uid)) +
+      ' · 合集 ID ' + esc(String(d.season_id)) +
+      (d.total ? ' · ' + d.total + ' 个视频' : '') + '</div></div>' +
+      '<button class="btn pri" data-act="add-season">📦 确认订阅</button>' +
+      '</div>' + warn;
+    try { initAvatars(); } catch (e) { /* 画不出头像不影响订阅 */ }
+    showMsg('seasonMsg', '确认是这个合集再点「确认订阅」', 'ok');
+  },
   async 'add-season'() {
     const gid = $('seasonGroup') && $('seasonGroup').value;
-    const uid = ($('seasonUid') && $('seasonUid').value || '').trim();
     const ref = ($('seasonRef') && $('seasonRef').value || '').trim();
     if (!gid) { showMsg('seasonMsg', '先选目标群', 'err'); return; }
-    if (!ref) { showMsg('seasonMsg', '填合集链接或合集 ID', 'err'); return; }
+    if (!ref) { showMsg('seasonMsg', '先填合集链接或合集 ID', 'err'); return; }
+    if (!SEASON_PICK) {
+      showMsg('seasonMsg', '先点「🔍 查询合集」，确认之后再订阅', 'err');
+      return;
+    }
     showMsg('seasonMsg', '正在订阅…');
-    const d = await post('/api/season/add', { gid: gid, uid: uid, ref: ref });
+    // uid 只在"只填了纯数字 ID"时作为补充；链接里有作者时以后端为准
+    const d = await post('/api/season/add', {
+      gid: gid, uid: LAST_LOOKUP_UID || '', ref: ref,
+      title: SEASON_PICK.title || '', uname: SEASON_PICK.uname || '' });
     showMsg('seasonMsg', d.msg || (d.ok ? '已订阅' : '订阅失败'), d.ok ? 'ok' : 'err');
-    if (d.ok) { toast(d.msg || '已订阅'); loadState(); }
+    if (d.ok) {
+      toast(d.msg || '已订阅');
+      SEASON_PICK = null;
+      const box = $('seasonPick');
+      if (box && !box._missing) box.innerHTML = '';
+      loadState();
+    }
   },
   async 'toggle-season'(el) {
     const on = !el.classList.contains('on');
@@ -3717,7 +4002,7 @@ const ACTIONS = {
   },
   async 'add-group'() {
     const gid = $('newGid').value.trim();
-    if (!gid) { showMsg('addGroupMsg', '先填群 ID', 'err'); return; }
+    if (!gid) { showMsg('addGroupMsg', '先填群 openid', 'err'); return; }
     const d = await post('/api/group/add', { gid: gid, name: $('newGname').value.trim() });
     showMsg('addGroupMsg', d.ok ? '已登记 ✅' : (d.msg || '失败'), d.ok ? 'ok' : 'err');
     if (d.ok) { $('newGid').value = ''; $('newGname').value = ''; loadState(); }
@@ -3727,7 +4012,7 @@ const ACTIONS = {
     if (!gid) { toast('没认出是哪个群，请刷新页面重试', 'err'); return; }
     const gs = STATE.groups || [];
     const g = gs.find(x => x.gid === gid) || {};
-    const nm = g.name || (String(gid).slice(0, 8) + '…');
+    const nm = gLabel(g);
     const n = (g.subs || []).length;
     if (!confirm('确定移除群「' + nm + '」？\n它的 ' + n
       + ' 条订阅和专属文案会一起删掉。')) return;
@@ -3745,6 +4030,12 @@ const ACTIONS = {
     const kind = el.getAttribute('data-kind') || '';
     const on = !el.classList.contains('on');
     el.classList.toggle('on', on);
+    // ⚠️ 记下"用户亲手改过这一类"。
+    // 以前查完 UP 主会无条件把四项重设为「三类开 + 置顶评论关」，
+    // 于是用户先只勾「直播」、再点查询 → 查询把投稿和动态又勾回去
+    // → 点订阅出来三项全开。看着就是"指定提醒没用"。
+    // 现在：手动动过的项，查询不再覆盖。
+    DEFKIND_TOUCHED[kind] = true;
     try { toast((on ? '已开启「' : '已关闭「')
       + (KIND_NAME[kind] || kind) + '」提醒'); } catch (e) { /* 提示失败无所谓 */ }
   },
@@ -3765,6 +4056,9 @@ const ACTIONS = {
     const d = await api('/api/up/search?uid=' + encodeURIComponent(uid));
     if (!d.ok) {
       $('lookupInfo').innerHTML = '';
+      // 查询没成，底下那个「💖 添加」还是唯一入口，露出来
+      const dr = $('addSubDirectRow');
+      if (dr && !dr._missing) dr.hidden = false;
       showMsg('addSubMsg', d.msg || '查询失败', 'err');
       return;
     }
@@ -3782,11 +4076,9 @@ const ACTIONS = {
         ? ' · 直播间 ' + esc(roomText(u.room_id, u.short_room_id)) : '') +
       '</div></div></div>';
     renderLookupPick();
-    // 顺手把下面「订阅视频合集」的 UID 也填上：查都查了，别让用户再填一遍
-    const su = $('seasonUid');
-    if (su && !su._missing && !String(su.value || '').trim()) {
-      su.value = String(u.uid || '');
-    }
+    // 记下刚查过的 UP 主：下面「订阅视频合集」只填纯数字 ID 时，
+    // 用它补出作者是谁（不再有手填 UID 的框了）。
+    LAST_LOOKUP_UID = String(u.uid || '');
 
     // 按查询到的实际情况决定默认勾选，不无脑全开。
     // ⚠️ 之前只信 card 接口的 live_room，UP 没在播时那个字段经常是 null
@@ -3796,11 +4088,13 @@ const ACTIONS = {
     //   没查到       → 也勾上，但提示"没查到，开播时会自动反查"
     //   （勾了最多暂时不触发，不勾就完全没机会）
     // ⚠️ 现在是按钮不是 checkbox：改 .on 类，别再动 .checked
-    setDefKind('defLive', true);
-    setDefKind('defVideo', true);
-    setDefKind('defDyn', true);
+    // ⚠️ 只给"用户没亲手拨过"的项建议值 —— 手动定过的保持原样，
+    //    否则勾完直播再查一次，投稿和动态又被勾回来（历史 bug）。
+    setDefKind('defLive', true, 'live');
+    setDefKind('defVideo', true, 'video');
+    setDefKind('defDyn', true, 'dynamic');
     // 置顶评论默认不勾：噪音相对大，要的话用户自己开
-    setDefKind('defTopCmt', false);
+    setDefKind('defTopCmt', false, 'top_comment');
     const tip = u.room_id
       ? '查询到了（直播间 ' + roomText(u.room_id, u.short_room_id)
         + '），默认开启三类'
@@ -3912,9 +4206,15 @@ const ACTIONS = {
     BROWSER_TIMER = setInterval(pollBrowser, 2000);
   },
   async 'bili-refresh'() {
+    /* ⚠️ 续期改后台任务了：接口换不动时会开浏览器，动辄几十秒，
+       以前同步等结果必然撞上前端 30 秒超时，只弹出「请求超时」。
+       现在 POST 只负责启动，随后轮询进度。 */
     const d = await post('/api/bili/refresh', {});
-    showMsg('biliMsg', d.ok ? '已续期 ✅' : (d.msg || '续期失败'), d.ok ? 'ok' : 'err');
-    if (d.ok) loadBili();
+    if (!d.ok) { showMsg('biliMsg', d.msg || '续期失败', 'err'); return; }
+    if (d.already) { showMsg('biliMsg', d.msg || '已经在续期中'); return; }
+    if (REFRESH_TIMER) clearInterval(REFRESH_TIMER);
+    REFRESH_TIMER = setInterval(pollRefresh, 2000);
+    pollRefresh();
   },
   async 'bili-logout'() {
     const d = await post('/api/bili/logout', {});
@@ -4116,6 +4416,7 @@ const ACT_WAIT = {
   'diagnose': '正在诊断…',
   'add-sub': '正在添加订阅…',
   'add-season': '正在添加合集…',
+  'lookup-season': '正在查合集…',
   'add-group': '正在登记群…',
   'lookup': '正在查询…',
   'test-push': '正在发送测试…',
@@ -4134,7 +4435,7 @@ const ACT_WAIT = {
   'dump-debug': '正在导出排查包…',
   'unban-ip': '正在解封…',
   'bili-browser': '正在打开浏览器登录…',
-  'bili-refresh': '正在刷新登录态…',
+  'bili-refresh': '正在续期…（接口换不动时会自动开一下浏览器，请稍候）',
   'bili-logout': '正在退出登录…',
   'legacy-import': '正在导入旧版数据…',
   'selfcheck': '正在自检…',
@@ -4675,8 +4976,11 @@ window.addEventListener('DOMContentLoaded', () => {
   safe('log', loadLog);
   safe('run', loadRun);
   safe('version', loadVersion);
+  // 自动续期是后台线程跑的，打开页面先查一次，之后跟着状态一起刷
+  safe('autoRenew', () => { checkAutoRenew().catch(() => {}); });
 
   setInterval(loadState, 15000);
+  setInterval(() => { checkAutoRenew().catch(() => {}); }, 15000);
   setInterval(() => { safe('log', loadLog); }, 10000);
   // 运行状态里的「实际轮询间隔 / 已推送今日 / 心跳」都会变，
   // 跟着状态一起刷，不然页面上永远是打开那一刻的快照
@@ -4708,7 +5012,10 @@ window.addEventListener('DOMContentLoaded', () => {
    ④ 未运行 → **红色直线**；运行 → **绿色波形**（颜色由 .hb.bad 切换）。 */
 var HB_Y = 12;            // 基线 y
 var HB_VIEW = 54;         // 可视区宽(px)，与 .hb-frame 一致
-/* ⚠️ 钳制范围 = 真实配置：poll_interval_min=8 / max=120。
+/* 波形「视觉」钳制范围，固定 8~120，只影响动画疏密，不影响轮询。
+   ⚠️ 这**不是**配置里的 poll_interval_min / poll_interval_max：
+      那两个现在面板可改、上限能到 3600。超出 8~120 的极端值在这里
+      只会被画成边界值（读数文字仍显示真实秒数），轮询本身不受影响。
    之前写 15~600，真实默认 12s 被钳成 15s，和设置里的数字自相矛盾。 */
 var HB_MIN = 8, HB_MAX = 120;
 
@@ -4881,8 +5188,11 @@ function renderTopBar() {
 function biliEff() {
   var hb = STATE.heartbeat || {};
   var st = BILI_STATE.state || (BILI_STATE.has_login ? 'logged' : 'none');
-  var bl = hb.bili_login || null;
-  if (hb.alive && bl && bl.ok === false) st = 'invalid';
+  /* ⚠️ 瞬时 bili_login 只代表「这一轮某个接口被拦」，风控抖动也会触发；
+     不能让它覆盖当场求证的结果 —— 那正是「刚扫码却显示未生效」。
+     只有连续确认的 bili_auth_bad 才认定 cookie 真的挂了。 */
+  var ab = hb.bili_auth_bad || null;
+  if (hb.alive && ab && ab.bad === true) st = 'invalid';
   if (st === 'logged' && BILI_STATE.expired) st = 'invalid';
   return st;                       // logged / invalid / unknown / none
 }
@@ -5235,7 +5545,8 @@ async function pushTest(btn, kind) {
     try {
     for (var i = 0; i < PUSH_KINDS.length; i++) {
       var r = await post('/api/test', { gid: gid, kind: PUSH_KINDS[i].key,
-        real: testOpt('real', true), mark: testOpt('mark', true) });
+        real: testOpt('real', true), mark: testOpt('mark', true),
+        at_all: testOpt('atall', false) });
       if (r) { last = r; }
       var ls = ((r && r.img_lines) || []);
       rows.push('<div class="hint" style="margin-top:6px">'
@@ -5263,7 +5574,8 @@ async function pushTest(btn, kind) {
     return;
   }
   var d = await post('/api/test', { gid: gid, kind: kind,
-    real: testOpt('real', true), mark: testOpt('mark', true) });
+    real: testOpt('real', true), mark: testOpt('mark', true),
+    at_all: testOpt('atall', false) });
   if (d && d.ok) {
     if (btn) { restartFx(btn, 'push-ok', 1800); }
     /* ⚠️ 详情写进「上次发送详情」卡片，不再只靠 toast ——
@@ -5981,7 +6293,7 @@ function initTips() {
   document.addEventListener('click', tipHide);
 }
 
-/* ---------- 测试选项：从 localStorage 恢复三个开关 ---------- */
+/* ---------- 测试选项：从 localStorage 恢复四个开关 ---------- */
 function testOpt(k, def) {
   try {
     const o = JSON.parse(localStorage.getItem('biliTestOpt') || '{}');
@@ -5991,7 +6303,7 @@ function testOpt(k, def) {
 function restoreTestOpt() {
   // ⚠️ real 默认 true：占位数据里 pic/images 全是空，卡片内嵌不到图，
   //    测试就看不出图片链路通不通；默认取测试 UID 的真实封面/配图。
-  const DEF = { real: true, mark: true, sandbox: true };
+  const DEF = { real: true, mark: true, sandbox: true, atall: false };
   document.querySelectorAll('[data-act="toggle-testopt"]').forEach(el => {
     const k = el.getAttribute('data-opt');
     el.classList.toggle('on', testOpt(k, DEF[k] !== false));

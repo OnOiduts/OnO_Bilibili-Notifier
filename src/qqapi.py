@@ -187,7 +187,12 @@ class QQClient:
     # ---------- 群消息 ----------
     async def send_text(self, group_openid: str, content: str,
                         msg_id: str = None, event_id: str = None) -> dict:
-        """纯文本。内嵌格式（如 <@everyone>）只在 content 里生效。"""
+        """纯文本。@全体用官方群聊标签 <qqbot-at-everyone />（见 atall.py）。
+
+        ⚠️ 旧注释写的 `@everyone` / `<@!all>` 是**文字子频道**的写法，
+          群聊从来不支持 —— 这正是 v1.18.0 把 @全体 整块删掉的原因。
+          官方 2026-10-26 才在群聊开放 <qqbot-at-everyone />。
+        """
         body = {"msg_type": 0, "content": content}
         if msg_id:
             body["msg_id"] = msg_id
@@ -198,7 +203,12 @@ class QQClient:
     async def send_markdown(self, group_openid: str, markdown: str,
                             keyboard: dict = None, msg_id: str = None,
                             event_id: str = None) -> dict:
-        """Markdown 消息（msg_type=2），可挂载按钮。传 markdown 时 content 必须为空。"""
+        """Markdown 消息（msg_type=2），可挂载按钮。传 markdown 时 content 必须为空。
+
+        @全体 合成模式由调用方把 <qqbot-at-everyone /> 拼在 markdown.content
+        最前面传进来（官方 2026-10-26 起 markdown 消息支持该标签）；
+        本方法只负责原样透传，不改写、不转义。
+        """
         body = {"msg_type": 2, "markdown": {"content": markdown}}
         if keyboard:
             body["keyboard"] = keyboard

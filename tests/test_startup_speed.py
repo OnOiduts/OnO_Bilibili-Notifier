@@ -77,15 +77,22 @@ def test_no_duplicated_cleanup_block():
 # ──────────────────────────────────────────────────────────────
 
 def test_alive_set_exists_and_is_batch():
-    """_alive_set 必须存在，且 Windows 分支只用一次子进程取回全部 PID。"""
+    """_alive_set 必须存在，且 Windows 分支不再起任何子进程。
+
+    ⚠️ 旧断言锁的是「一次 tasklist 取全机」这个写法。后来 tasklist.exe
+       在本机弹 0xc0000142（framedyn.dll 初始化失败），改成 ctypes 直接
+       调 OpenProcess，零外部进程。要钉住的是「零子进程」，不是某条
+       tasklist 命令的参数。
+    """
     import cleanup
     assert hasattr(cleanup, "_alive_set")
     src = _src("cleanup.py")
     fn = src.split("def _alive_set", 1)[1].split("\ndef ", 1)[0]
-    # 批量：一条 tasklist 拿全部，而不是 /FI "PID eq X" 逐个问
-    assert "tasklist" in fn
-    assert '"/FO", "CSV", "/NH"' in fn
-    assert 'PID eq' not in fn, "批量函数里不该再出现逐个查询的 /FI PID eq"
+    code = _strip_comments(fn)
+    code = re.sub(r'""".*?"""', "", code, flags=re.S)  # 剥掉说明文字
+    assert "_win_pid_alive" in code, "Windows 分支应走 Win32 API"
+    assert "subprocess" not in code, "_alive_set 里不应起任何子进程"
+    assert "tasklist" not in code, "不应再依赖 tasklist.exe"
 
 
 def test_pids_from_file_uses_batch():

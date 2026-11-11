@@ -1,6 +1,5 @@
 import io,os
-BASE=os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else '/data/workspace/bili-notify'
-BASE='/data/workspace/bili-notify'
+BASE=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY="没做完的不算数"
 def read(p): return io.open(os.path.join(BASE,p),encoding="utf-8").read()
 def check():

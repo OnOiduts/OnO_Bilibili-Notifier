@@ -202,13 +202,25 @@ def test_sync_bili_auth():
             captured.get("bili_login", {}).get("ok") is False)
         chk("心跳带上失败原因",
             "-352" in str(captured.get("bili_login", {}).get("reason") or ""))
-        chk("第一次会告警（根因要说清楚）", len(warns) == 1)
+        # ⚠️ 这里锁的是"连续 N 次才认定"的新行为（用户定的规则）。
+        #    旧断言是"第一次就告警"，那会把偶发抖动也刷成告警。
+        try:
+            import bili_auth_alert as _AA
+            N = int(_AA.DEFAULT_STREAK)
+        except Exception:
+            N = 5
+        chk("未达阈值时不告警（避免偶发抖动刷屏）", len(warns) == 0,
+            f"实际 {len(warns)} 条")
+        for _ in range(N - 1):
+            b._sync_bili_auth()
+        chk(f"连续 {N} 次才告警（根因要说清楚）", len(warns) == 1,
+            f"实际 {len(warns)} 条")
         chk("告警里点明要重新登录", any("重新登录" in w or "重新扫码" in w
                                         for w in warns))
 
         b._sync_bili_auth()
         b._sync_bili_auth()
-        chk("10 分钟内不重复告警", len(warns) == 1, f"实际 {len(warns)} 条")
+        chk("提醒过后不再重复告警", len(warns) == 1, f"实际 {len(warns)} 条")
 
         # 5 个 UP 同时失败时，逐条告警必须降级，别刷屏
         dbg, wn = [], []

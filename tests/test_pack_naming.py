@@ -31,44 +31,69 @@ def test_topdir_is_fixed():
 
 
 def test_name_fmt_has_bracket_version():
-    """压缩包名是 OnO_Bilibili-Notifier[v2.3.4].zip 这种方括号写法。"""
-    name = V.PACK_NAME_FMT % ("2.3.4", "")
-    assert name == "OnO_Bilibili-Notifier[v2.3.4].zip", name
-    gh = V.PACK_NAME_FMT % ("2.3.4", "_github")
+    """压缩包名是 OnO_Bilibili-Notifier[v2.3.5].zip 这种方括号写法。"""
+    v = _read("src/VERSION").strip()
+    name = V.PACK_NAME_FMT % (v, "")
+    assert name == "OnO_Bilibili-Notifier[v%s].zip" % v, name
+    gh = V.PACK_NAME_FMT % (v, "_github")
     assert "[" in gh and "]" in gh, "版本号得用方括号包住：%s" % gh
 
 
-def test_readme_rules_severe_fix():
-    """README 版本号规则表：严重 bug 修复 = +0.1.0 且带 fix 后缀。"""
-    s = _read("README.md")
+def _cur_version():
+    """当前版本号（README 里的严重修复举例要跟它一致）。"""
+    return _read("src/VERSION").strip()
+
+
+def _severe_row(fname):
+    s = _read(fname)
     m = re.search(r"\| 严重 bug 修复 \|(.+?)\|", s)
-    assert m, "README 里找不到「严重 bug 修复」那一行"
-    row = m.group(1)
-    assert "+0.1.0" in row, "严重修复应为 +0.1.0，现在是：%s" % row.strip()
+    assert m, "%s 里找不到「严重 bug 修复」那一行" % fname
+    return m.group(1)
+
+
+def test_readme_rules_severe_fix():
+    """README 版本号规则表：严重 bug 修复 = 版本号不涨，只加 fix 后缀。
+
+    ⚠️ 这条规则改过一次：最初是「+0.1.0 且带 fix」（v2.3.4 → v2.4.0fix），
+    后来改成「三位数字不动，只加 fix」（v2.3.5 → v2.3.5fix）—— 修 bug
+    不该让人以为出了新功能。断言随之改成守「不涨」而不是守「+0.1.0」。
+    """
+    row = _severe_row("README.md")
     assert "fix" in row, "严重修复版本号要带 fix 后缀，现在是：%s" % row.strip()
+    assert "+0.1.0" not in row, \
+        "严重修复不该再涨次版本号（已改成不涨号），现在是：%s" % row.strip()
+    assert "不涨" in row or "不动" in row, \
+        "严重修复要写明「版本号不涨」，现在是：%s" % row.strip()
 
 
 def test_docs_readme_in_sync():
     """docs/README.md 与根 README 的规则保持一致。"""
-    s = _read("docs/README.md")
-    m = re.search(r"\| 严重 bug 修复 \|(.+?)\|", s)
-    assert m, "docs/README.md 里找不到「严重 bug 修复」那一行"
-    row = m.group(1)
-    assert "+0.1.0" in row and "fix" in row, row.strip()
+    row = _severe_row("docs/README.md")
+    assert "fix" in row, row.strip()
+    assert "+0.1.0" not in row, \
+        "docs/README 的严重修复不该再涨次版本号，现在是：%s" % row.strip()
+    assert "不涨" in row or "不动" in row, row.strip()
 
 
 def test_version_docstring_rules():
     """version.py 顶部的规则注释也要跟上（改表格容易漏掉注释）。"""
     s = _read("src/version.py")
-    assert "+0.1.0" in s and "fix" in s, \
-        "version.py 规则注释里没有「+0.1.0 + fix」的严重修复说明"
+    assert "严重修复" in s and "fix" in s, \
+        "version.py 规则注释里没有严重修复的说明"
+    assert "不涨" in s, \
+        "version.py 规则注释没写明严重修复「版本号不涨」"
 
 
 def test_severe_fix_example_present():
-    """规则要给出举例，否则「+0.1.0 再加 fix」容易被理解成别的算法。"""
+    """规则要给出举例，否则「不涨号只加 fix」容易被理解成别的算法。
+
+    ⚠️ 举例必须跟当前版本一致：版本一涨，文档里的旧举例就过期了
+    （test_release_rule_dedup 也在盯着这一点）。
+    """
+    v = _cur_version()
     s = _read("README.md")
-    assert re.search(r"v2\.3\.4.*v2\.4\.0fix", s, re.S), \
-        "README 缺举例（v2.3.4 → v2.4.0fix）"
+    assert re.search(re.escape("v%s" % v) + r".*v" + re.escape(v) + r"fix", s, re.S), \
+        "README 缺与当前版本一致的举例（v%s → v%sfix）" % (v, v)
 
 
 if __name__ == "__main__":

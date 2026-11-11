@@ -325,7 +325,8 @@ def main():
                 "解决：面板「🍮 B站登录」→ 打开浏览器登录")
         else:
             exp, _est = bili_login.effective_expires(
-                cookie, float(cfg.get("bili_cookie_expires") or 0))
+                cookie, float(cfg.get("bili_cookie_expires") or 0),
+                float(cfg.get("bili_cookie_ts") or 0))
             info = bili_login.expired_info(exp) if exp else {"text": "未知", "expired": False, "soon": False}
             if _est and info.get("text"):
                 info = dict(info, text=info["text"] + "（估算）")

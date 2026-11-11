@@ -10,9 +10,11 @@
      —— 这是消息挤成一坨的真正原因。
   4. 「列表前是普通文本，则需要在列表前用空行隔开，否则无法识别」。
   5. 图片必须是公网可访问的 URL，平台会下载转存。
-  6. 内嵌格式（<@everyone> 等）只在纯文本 content 里生效，markdown 里不生效。
-     ⚠️ 且 @everyone 官方仅「文字子频道」可用，群聊不支持 —— 本项目的
-        @全体 功能已在 v1.18.0 整个移除。
+  6. ⚠️ 旧结论「@everyone 仅文字子频道可用、群聊不支持、v1.18.0 已移除
+     @全体」**已过时**：官方 2026-10-26 变更记录在群聊开放了新标签
+     `<qqbot-at-everyone />`，文本消息和 markdown 消息都支持。
+     条件是机器人为该群管理员、每个群每天仅 1 次（自然日）。
+     开播提醒的 @全体 由 bot._push + atall.py 负责，不写进文案模板。
 
 参考：https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/type/markdown.html
 """

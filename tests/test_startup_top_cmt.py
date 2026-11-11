@@ -293,6 +293,12 @@ def t_init_baseline_rejects_fan_comment():
         ck("粉丝的置顶评论不写基线", not base.get("id"))
 
         # 换成 UP 主本人的 → 必须正常建基线
+        # ⚠️ 上一步「不是本人的评论」会进暂缓表（防每轮白发请求），
+        #    所以要先把冷却时间拨过去 —— 现实里 UP 主换置顶评论不会
+        #    发生在同一秒，这正是暂缓表该挡住的那种高频重试。
+        import time as _time
+        for _k in list(bot._bl_pending):
+            bot._bl_pending[_k] = (_time.time() - 1, "测试推进时间")
         bot.bili.pinned_cmt[uid] = {
             "id": "CMT_SELF", "content": "UP 自己置顶的", "mid": str(uid)}
         run(bot._init_baseline(uid))
@@ -312,9 +318,12 @@ def t_init_baseline_source_has_owner_check():
     src = _strip_comments(_src("bot.py"))
     i = src.find("async def _init_baseline(")
     assert i > 0, "找不到 _init_baseline"
-    body = src[i:i + 5000]
-    j = body.find("if g_live or g_video or g_dyn or g_top_cmt:")
-    ck("_init_baseline 里识别出收尾日志（分支截止点）", j > 0)
+    # ⚠️ 截止点是**下一个函数**，不是写死 5000 字符：函数体会随着修复
+    #    变长，窗口截短了就把置顶评论分支切在窗外 —— 表现为莫名其妙的
+    #    假失败（本轮就踩到了一次）。
+    body = src[i:i + 12000]
+    j = body.find("async def _fetch_group_name(")
+    ck("_init_baseline 里识别出下一个函数（分支截止点）", j > 0)
     body = body[:j]
 
     ck("置顶评论分支存在", "g_top_cmt" in body)

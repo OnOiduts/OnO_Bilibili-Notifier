@@ -172,7 +172,13 @@ def main():
     chk("app.js 登记 CFG_FIELDS", "'cGridMode'" in js)
     chk("app.js 回填", "setSelectValue($('cGridMode')" in js)
     chk("app.js 提交", "image_grid_mode" in js)
-    chk("app.js 改完即存", "'cGridMode', 'cImgMax'].includes(id)" in js)
+    # ⚠️ 不能按"紧挨着的字面量"断言 —— 后来往这个列表尾部追加了
+    #    cGraceOn / cGraceRounds，原字样就对不上了，但行为是对的。
+    #    （这条是过时断言：锁的是旧排版，不是旧行为。）
+    _m = re.search(r"\[([^\]]*?)\]\.includes\(id\)\s*\)\s*saveCfg", js, re.S)
+    _lst = _m.group(1) if _m else ""
+    chk("app.js 改完即存", "'cGridMode'" in _lst and "'cImgMax'" in _lst,
+        _lst[-80:])
     chk("webui state 回传", '"image_grid_mode"' in web)
     chk("webui 保存时归一化", "_norm_grid_mode(d.get" in web)
     chk("webui 热更新传入", 'c.get("image_grid_mode")' in web)
